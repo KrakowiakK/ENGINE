@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Engine Studio</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div id="brand">
+      <span id="status-dot" class="dot dot-off"></span>
+      <span id="brand-name">Engine Studio</span>
+    </div>
+    <button id="new-chat">+ New chat</button>
+    <div id="conv-list"></div>
+    <div id="sidebar-footer">
+      <button id="open-settings">Server &amp; settings</button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <header id="topbar">
+      <div id="model-label">no model loaded</div>
+      <div id="live-stats">
+        <span id="stat-ttft" title="time to first token">TTFT —</span>
+        <span id="stat-decode" title="decode tokens/second">decode —</span>
+        <span id="stat-prefill" title="prefill tokens/second">prefill —</span>
+        <span id="stat-cache" title="prompt cache reuse on this request">cache —</span>
+      </div>
+    </header>
+
+    <div id="messages"></div>
+
+    <div id="attachments" class="hidden"></div>
+    <form id="composer">
+      <button id="attach-btn" type="button" title="Attach a file (txt, md, csv, pdf, docx, xlsx…)">📎</button>
+      <input id="file-input" type="file" multiple hidden
+             accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.xml,.log,.py,.js,.ts,.jsx,.tsx,.swift,.c,.h,.cpp,.hpp,.java,.go,.rs,.sh,.rb,.php,.sql,.ini,.cfg,.toml,.rst,.html,.htm,.pdf,.docx,.xlsx" />
+      <button id="attach-url-btn" type="button" title="Attach a web page by URL">🔗</button>
+      <textarea id="input" placeholder="Message the model… (Shift+Enter for newline)" rows="1"></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </main>
+
+  <aside id="stats-panel">
+    <h3>All sessions <span id="es-sub" class="muted"></span>
+      <button id="es-reset" type="button" title="Zero the counters from now. The engine keeps running and keeps its cache.">Reset</button>
+      <a id="es-dash" href="/engine" target="_blank" rel="noopener" title="Everything about the engine: limits, flags, environment, scheduler, raw counters">Dashboard ↗</a></h3>
+    <div id="es-aggregate"></div>
+    <div id="es-active"></div>
+    <details id="es-recent-box">
+      <summary>Recently finished <span id="es-recent-count" class="muted"></span></summary>
+      <div id="es-recent"></div>
+    </details>
+    <h3 class="section-gap">This app</h3>
+    <dl id="cumulative-stats">
+      <dt>Requests</dt><dd id="c-requests">0</dd>
+      <dt>Prompt tokens</dt><dd id="c-prompt">0</dd>
+      <dt>Completion tokens</dt><dd id="c-completion">0</dd>
+      <dt>Cache hit</dt><dd id="c-cache">0%</dd>
+      <dt>Avg decode</dt><dd id="c-avg-decode">0 tok/s</dd>
+      <dt>Peak GPU memory</dt><dd id="c-peak-mem">—</dd>
+      <dt>Server uptime</dt><dd id="c-uptime">—</dd>
+    </dl>
+
+    <h3 id="traffic-heading">Recent traffic <span id="traffic-total" class="muted"></span></h3>
+    <div id="traffic-log"></div>
+  </aside>
+</div>
+
+<div id="settings-overlay" class="hidden">
+  <div id="settings-modal">
+    <h2>Server &amp; settings</h2>
+    <form id="settings-form">
+      <label>Model directory
+        <input type="text" id="s-model" />
+      </label>
+      <div class="row">
+        <label>Port
+          <input type="number" id="s-port" />
+        </label>
+        <label>Max tokens
+          <input type="number" id="s-tokens" />
+        </label>
+      </div>
+      <label>Reasoning effort
+        <select id="s-effort">
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="xhigh">xhigh (maximum; the soft stop closes the thinking by ~14k tokens)</option>
+        </select>
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" id="s-cache" /> Prompt cache (reuse KV state across turns / repeated prefixes)
+      </label>
+      <div class="row">
+        <label>Cache rung size (tokens)
+          <input type="number" id="s-cache-step" />
+        </label>
+        <label>MTP draft depth (0 = serial)
+          <input type="number" id="s-mtp" min="0" max="8" />
+        </label>
+      </div>
+      <div class="row">
+        <label>Soft stop strength (0 = off)
+          <input type="number" id="s-bias-max" min="0" max="40" step="1" />
+        </label>
+        <label>Ramp start (thinking tokens)
+          <input type="number" id="s-bias-start" min="0" />
+        </label>
+      </div>
+      <div class="row">
+        <label>Ramp full at (tokens)
+          <input type="number" id="s-bias-full" min="0" />
+        </label>
+        <label>Hard deadline (0 = none)
+          <input type="number" id="s-bias-deadline" min="0" />
+        </label>
+      </div>
+      <p class="hint">The soft stop nudges <code>&lt;/think&gt;</code> upward as the reasoning grows, so the
+        model closes at its own sentence boundary instead of being cut. The deadline guarantees it closes,
+        which is what keeps an agent loop from stalling. Thinking budget below is the old hard cut — leave it
+        at 0.</p>
+      <div class="row">
+        <label>Thinking budget (tokens, 0 = off)
+          <input type="number" id="s-think-budget" min="0" />
+        </label>
+        <label>Loop guard (repeats, 0 = off)
+          <input type="number" id="s-loop-guard" min="0" max="20" />
+        </label>
+      </div>
+      <div class="row">
+        <label>Temperature
+          <input type="number" id="s-temp" min="0" max="2" step="0.05" />
+        </label>
+        <label>top_p
+          <input type="number" id="s-top-p" min="0" max="1" step="0.01" />
+        </label>
+        <label>top_k (0 = off)
+          <input type="number" id="s-top-k" min="0" />
+        </label>
+      </div>
+      <label class="checkbox">
+        <input type="checkbox" id="s-external" /> Allow connections from other devices on this network
+      </label>
+      <p id="api-url-line" class="muted"></p>
+      <div id="settings-actions">
+        <button type="button" id="save-settings">Save</button>
+        <button type="button" id="start-server">Start server</button>
+        <button type="button" id="stop-server">Stop server</button>
+        <button type="button" id="close-settings">Close</button>
+      </div>
+      <p id="settings-error" class="error"></p>
+
+      <hr class="sep" />
+      <h3>Public tunnel</h3>
+      <p class="muted">A free Cloudflare "quick tunnel" -- no account, HTTPS, a random address that
+        expires when stopped. Exposes this Studio server (both the app and the token-gated
+        <code>/v1/*</code> API) at that address.</p>
+      <p id="tunnel-status-line" class="muted">Tunnel: stopped.</p>
+      <div id="tunnel-actions" class="row">
+        <button type="button" id="start-tunnel">Start tunnel</button>
+        <button type="button" id="stop-tunnel">Stop tunnel</button>
+      </div>
+      <label>API token (send as <code>Authorization: Bearer &lt;token&gt;</code> on <code>/v1/*</code>)
+        <div class="copy-row">
+          <input type="text" id="s-token" readonly />
+          <button type="button" id="copy-token" title="Copy">⧉</button>
+        </div>
+      </label>
+      <p id="tunnel-error" class="error"></p>
+    </form>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

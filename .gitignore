@@ -1,0 +1,27 @@
+# build trees (SwiftPM) and the AOT metallib built by tools/build-mlx-metallib.sh
+.build/
+.build-*/
+.swiftpm/
+*.metallib
+*.metallib.fingerprint
+.source-fingerprint
+.build-id
+# model weights never live in the repository: download E9 into weights/e9 (see README.md)
+weights/
+# local caches and outputs
+.cache/
+.research/
+.mlxfast-*/
+runs/
+*.log
+# Engine Studio runtime state (conversations, config with its API token, logs)
+apps/engine-studio/data/
+apps/engine-studio/.venv/
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+__pycache__/
+*.pyc
+.venv/

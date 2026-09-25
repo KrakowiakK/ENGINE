@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Engine Dashboard</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body class="dash">
+<header id="dash-top">
+  <div class="dash-title">
+    <span id="d-dot" class="dot dot-off"></span>
+    <h1>Engine</h1>
+    <span id="d-model" class="dash-model"></span>
+  </div>
+  <div id="d-pills" class="dash-pills"></div>
+  <div class="dash-actions">
+    <span id="d-updated" class="dash-updated"></span>
+    <label class="dash-toggle" title="Freeze the page (to read or copy); the engine keeps running">
+      <input type="checkbox" id="d-pause" /> pause</label>
+    <button id="d-reset" type="button" title="Zero the since-reset counters from now. The engine keeps running and keeps its cache.">Reset</button>
+    <a href="/" class="dash-link">Chat</a>
+  </div>
+</header>
+
+<div id="d-banner" class="dash-banner hidden"></div>
+
+<main id="dash">
+  <section class="card">
+    <h2>Live</h2>
+    <div class="subgrid">
+      <div><h3>Requests now</h3><div id="d-now" class="tiles"></div></div>
+      <div><h3>Memory</h3><div id="d-mem"></div></div>
+      <div><h3>Hot prefix cache</h3><div id="d-hot"></div></div>
+      <div><h3>RAM budget</h3><div id="d-ram"></div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Totals</h2>
+    <div id="d-totals" class="tbl-wrap"></div>
+  </section>
+
+  <section class="card">
+    <h2>Limits <span class="h2-sub">derived from the runtime block, the process flags and serve's defaults</span></h2>
+    <div id="d-limits"></div>
+  </section>
+
+  <section class="card">
+    <h2>Active requests <span id="d-active-n" class="h2-sub"></span></h2>
+    <div id="d-active" class="tbl-wrap"></div>
+  </section>
+
+  <section class="card">
+    <h2>Recently finished <span id="d-recent-n" class="h2-sub"></span>
+      <label class="dash-toggle h2-toggle"><input type="checkbox" id="d-include-old" /> include before reset</label></h2>
+    <div id="d-recent" class="tbl-wrap"></div>
+  </section>
+
+  <section class="card">
+    <h2>Scheduler</h2>
+    <div id="d-sched"></div>
+  </section>
+
+  <section class="card">
+    <h2>Configuration</h2>
+    <div id="d-config" class="subgrid"></div>
+  </section>
+
+  <section class="card">
+    <details id="d-raw-box">
+      <summary><h2>Everything else <span class="h2-sub">the full raw GET /v1/engine/sessions payload</span></h2></summary>
+      <div id="d-raw" class="tree"></div>
+    </details>
+  </section>
+</main>
+
+<script src="/engine.js"></script>
+</body>
+</html>
