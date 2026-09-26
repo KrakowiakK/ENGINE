@@ -72,4 +72,5 @@ exec "$BIN" serve --model "${ENGINE_MODEL:-$PWD/weights/e9}" \
   --tokens 0 --max-tokens-clamp 1 --mtp 3 --batch-mtp 3 --think-bias-max 12 --think-bias-start 2000 \
   --think-bias-full 8000 --think-bias-deadline 14000 --max-concurrent 8 \
   --reasoning-effort xhigh --hot-cache-gb 128 --hot-keep-rungs 2 \
-  --batch-min 4 --batch-max-rows 8 --batch-window-ms 25 --prefill-chunk 0 --state-cache-step 512 ${DISK_ARGS[@]+"${DISK_ARGS[@]}"} "$@"
+  --batch-min 4 --batch-max-rows 8 --batch-window-ms 25 --prefill-chunk 0 --state-cache-step 512 \
+  --queue-max 32 --queue-timeout-s 1500 ${DISK_ARGS[@]+"${DISK_ARGS[@]}"} "$@"

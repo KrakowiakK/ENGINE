@@ -176,6 +176,10 @@ func serve(_ o: Options) async throws {
     let maxConcurrent = try o.int("--max-concurrent", 8)
     guard (1...64).contains(maxConcurrent) else { throw EngineError.invalid("--max-concurrent must be 1...64") }
     serveMaxConcurrent = maxConcurrent
+    // P116: when every slot is taken, wait in a bounded FIFO queue (RequestGate.swift) instead of an immediate 503;
+    // 0 keeps the old immediate refusal.
+    serveQueueMax = try o.nonNegativeInt("--queue-max", 0)
+    serveQueueTimeout = Double(try o.nonNegativeInt("--queue-timeout-s", 1800))
     _ = liveSessions.startedAt                  // a lazy global: touch it so the sessions view's uptime starts here
     // P088/P089/P092: how many concurrent, batch-eligible requests before their decode steps are
     // BATCHED into one forward. 0 = off. DEFAULT 4, and the number is the measured crossover:
@@ -336,6 +340,8 @@ func serve(_ o: Options) async throws {
     }
     serveRuntime["h8_boundary_probe"] = h8BoundaryProbe
     serveRuntime["default_max_tokens"] = defaultMaxTokens
+    serveRuntime["queue_max"] = serveQueueMax
+    serveRuntime["queue_timeout_s"] = Int(serveQueueTimeout)
     serveRuntime["max_tokens_clamp"] = serveMaxTokensClamp
     serveRuntime["reasoning_effort_default"] = serveReasoningEffort
     serveRuntime["h8_cold_split_positions"] = [Int]()
@@ -512,7 +518,7 @@ func serve(_ o: Options) async throws {
     // socket -- and nothing else. Every model call and every MLXArray belongs to the model thread.
     let connectionCache = stateCache
     let connections = ActiveCount()
-    let connectionLimit = max(16, maxConcurrent * 2 + 8)
+    let connectionLimit = max(16, maxConcurrent * 2 + 8) + serveQueueMax   // a waiting request holds its connection
     if let data = try? JSONSerialization.data(withJSONObject: serveRuntime, options: [.sortedKeys]), let line = String(data: data, encoding: .utf8) {
         FileHandle.standardError.write(Data("engine runtime: \(line)\n".utf8))
     }
@@ -535,6 +541,8 @@ func serve(_ o: Options) async throws {
 }
 
 nonisolated(unsafe) var serveMaxConcurrent = 8
+nonisolated(unsafe) var serveQueueMax = 0
+nonisolated(unsafe) var serveQueueTimeout = 1800.0
 nonisolated(unsafe) var serveAdmission: AdmissionBudget!
 nonisolated(unsafe) private var serveSharedRAMBudget = false
 nonisolated(unsafe) private var serveRAMLiveLimitBytes = 0.0
@@ -1758,7 +1766,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             "reordered_dispatches": ps.reorderedDispatches, "forced_oldest_dispatches": ps.forcedOldestDispatches]
         let obj = liveSessions.snapshot(extra: ["model": modelId, "max_concurrent": serveMaxConcurrent, "mtp_depth": mtpDepth, "runtime": runtimeView, "reserved_sequences": serveAdmission.active,
             "scheduler_phases": phases, "prefill_scheduling": prefillScheduling,
-            "max_tokens_decisions": serveMaxTokensWitness.snapshot(), "reasoning_effort_decisions": serveEffortWitness.snapshot(),
+            "queue": activeRequests.snapshot(), "max_tokens_decisions": serveMaxTokensWitness.snapshot(), "reasoning_effort_decisions": serveEffortWitness.snapshot(),
             "cache_layout": serveMemoryWitness.cacheLayoutSnapshot(),
             "pooled_private_history": serveMemoryWitness.pooledPrivateHistorySnapshot(),
             "ram_budget": serveMemoryWitness.ramBudgetSnapshot(), "hot_cache": serveMemoryWitness.hotCacheSnapshot(),
@@ -1778,10 +1786,17 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                            body: jsonErrorBody("method not allowed"))
         return
     }
-    guard activeRequests.enter(max: serveMaxConcurrent) else {
-        // refuse rather than queue without bound: an agent fleet gets a retry, not a timeout
+    // P116: wait in a bounded FIFO queue for a free slot (--queue-max), or with no queue refuse at once. A client that
+    // got an immediate 503 backed off exponentially (aider: up to 4096 s) while slots sat free. The queue stays bounded:
+    // past --queue-max waiting requests, or --queue-timeout-s of waiting, the answer is still a 503.
+    let gate: (outcome: RequestGate.Outcome, waited: Double) = serveQueueMax > 0
+        ? activeRequests.acquire(max: serveMaxConcurrent, maxWaiting: serveQueueMax, timeout: serveQueueTimeout,
+                                 gone: { HTTPTransport.peerClosed(fd) })
+        : (activeRequests.enter(max: serveMaxConcurrent) ? .admitted : .queueFull, 0)
+    guard gate.outcome == .admitted else {
+        if gate.outcome == .clientGone { return }
         writeHTTPResponse(fd, status: 503, statusText: "Service Unavailable", contentType: "application/json",
-                           body: jsonErrorBody("server at capacity (\(serveMaxConcurrent) concurrent requests); retry shortly", type: "overloaded"))
+                           body: jsonErrorBody("server at capacity (\(serveMaxConcurrent) running, \(activeRequests.waiting) waiting); retry shortly", type: "overloaded"))
         return
     }
     var releaseReservation: (() -> Void)?

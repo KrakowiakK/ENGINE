@@ -101,12 +101,13 @@ curl http://127.0.0.1:8099/v1/models
 ```
 
 `tools/serve.sh` is the production launcher. It runs one foreground process and pins the tested profile: MTP K = 3
-(batched rows up to K = 3, adaptively), up to 8 concurrent requests, batching from 4 ready rows up to 8 rows with a 25 ms gather window,
+(batched rows up to K = 3, adaptively), up to 8 concurrent requests with up to 32 more waiting in a first-in-first-out
+queue (at most 1,500 s each), batching from 4 ready rows up to 8 rows with a 25 ms gather window,
 phase scheduling with native batched prefill, a shared RAM budget with a 128 GB hot-cache ceiling, the thinking
 soft stop, `reasoning_effort` default `xhigh`, no default `max_tokens` cap, and oversized `max_tokens` clamped. It
 refuses overrides of the batching, prefill, hot-cache, concurrency, MTP and state-cache flags and of the scheduler
-environment. Other trailing arguments (for example reasoning effort, the soft-stop settings or the `max_tokens`
-policy) are passed through and override the defaults, as do `ENGINE_CACHE_LIMIT_GB` and `ENGINE_WIRED_LIMIT_GB`.
+environment. Other trailing arguments (for example reasoning effort, the soft-stop settings, the `max_tokens`
+policy or the request queue's `--queue-max` / `--queue-timeout-s`) are passed through and override the defaults, as do `ENGINE_CACHE_LIMIT_GB` and `ENGINE_WIRED_LIMIT_GB`.
 Run `.build/release/engine serve ...` directly for anything else. It also refuses to start while another `engine`
 process is running: run one engine per machine.
 
@@ -154,8 +155,12 @@ Request defaults (production launcher):
   map to `low`. `medium` and `low` are used as given, and anything else gets the default.
 - **Sampling**: `temperature` defaults to 0 (greedy) when omitted. The checkpoint's own generation config
   recommends `temperature 1.0, top_p 0.95, top_k 20`, and Engine Studio sends those values.
-- Limits: HTTP headers 64 KiB, body 32 MiB. Over 8 concurrent requests, or without memory for the reservation,
-  the answer is `503` with `Retry-After: 1`.
+- Limits: HTTP headers 64 KiB, body 32 MiB. A request that finds all 8 slots busy waits in a first-in-first-out queue
+  and starts as soon as a slot frees (`tools/serve.sh`: `--queue-max 32 --queue-timeout-s 1500`). A full queue, a wait
+  past the limit, or no memory for the request's reservation answers `503` with `Retry-After: 1`. Run directly
+  without `--queue-max` (the binary's default is 0; its default `--queue-timeout-s` is 1800), `engine serve` answers
+  the 9th concurrent request with the `503` at once. The live queue counters are in `GET /v1/engine/sessions` under
+  `queue`.
 
 ## Engine Studio and the dashboard
 

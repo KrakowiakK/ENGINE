@@ -709,4 +709,4 @@ public final class ActiveCount: @unchecked Sendable {
     public func leave() { lock.lock(); n -= 1; lock.unlock() }
     public var current: Int { lock.lock(); defer { lock.unlock() }; return n }
 }
-nonisolated(unsafe) public let activeRequests = ActiveCount()
+nonisolated(unsafe) public let activeRequests = RequestGate()   // P116: FIFO wait when --queue-max > 0

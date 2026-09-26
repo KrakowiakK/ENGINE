@@ -1532,12 +1532,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 return self._error(400, "invalid JSON body")
             stream = bool(req_obj.get("stream"))
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+            # P116: the engine may hold a request in its FIFO queue (up to --queue-timeout-s, 1500 s) before the first byte;
+            # a 600 s socket timeout here cut such requests off. 3600 s covers the queue plus a long prefill.
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
             ua = (self.headers.get("User-Agent") or "client")[:40]
             conn.request("POST", "/v1/chat/completions", body=data,
                          headers={"Content-Type": "application/json", "X-Engine-Client": f"studio /v1 proxy ({ua})"})
             r = conn.getresponse()
-            if stream:
+            retry_after = r.getheader("Retry-After")        # P116: an engine 503 keeps its Retry-After for the client
+            if stream and r.status == 200:
                 self.send_response(r.status)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -1550,10 +1553,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(("%x\r\n" % len(chunk)).encode() + chunk + b"\r\n")
                 self.wfile.write(b"0\r\n\r\n")
             else:
-                body = r.read()
+                body = r.read()                               # a JSON answer, or any error even on a stream request
                 self.send_response(r.status)
                 self.send_header("Content-Type", r.getheader("Content-Type", "application/json"))
                 self.send_header("Content-Length", str(len(body)))
+                if retry_after:
+                    self.send_header("Retry-After", retry_after)
                 self.end_headers()
                 self.wfile.write(body)
             conn.close()
@@ -1690,6 +1695,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+    # P116: the default listen backlog (5) reset connections when a client fleet opened 12 at once (measured: aider-style
+    # burst through the /v1 proxy -> ConnectionResetError); the engine queues requests now, so the proxy must accept them.
+    request_queue_size = 128
     allow_reuse_address = True
 
     def server_bind(self):
