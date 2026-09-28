@@ -64,6 +64,22 @@ public final class AdmissionBudget: @unchecked Sendable {
 
     private let lock = NSLock()
     private var lengths: [Int: Int] = [:]
+    /// P120: the length each reservation has grown to so far, which is what the hot-store target is computed from.
+    /// Admission itself still prices `lengths` (the full prompt + max_tokens + lookahead), so which requests are admitted
+    /// or refused is unchanged; only the reclaimable cache may use the part a row has not grown into yet, and gets it
+    /// back through `grow` before the row reaches it. growthWindow 0 = committed == length (B53 exactly).
+    private var committed: [Int: Int] = [:]
+    public let growthWindow: Int
+    private var growths = 0, growthsRefused = 0
+    /// P125: the memory guard's hold on the hot cache (its ceiling x this factor) and on new admissions.
+    private var pressureFactor = 1.0
+    private var paused = false
+    private var pausedRefusals = 0
+    public func setPressure(ceilingFactor: Double, admissionsPaused: Bool) {
+        lock.lock(); pressureFactor = max(0, min(1, ceilingFactor)); paused = admissionsPaused; lock.unlock()
+    }
+    public var admissionsPaused: Bool { lock.lock(); defer { lock.unlock() }; return paused }
+    private var effectiveCeiling: Double? { hotCacheCeilingBytes.map { $0 * pressureFactor } }
     private var next = 0
     public let maxContext: Int
     public let maxChoices: Int
@@ -77,8 +93,10 @@ public final class AdmissionBudget: @unchecked Sendable {
     public init(maxContext: Int, maxChoices: Int = 8, capacityBytes: Double,
                 bytesPerToken: Double, fixedBytesPerSequence: Double = 384e6,
                 historyCapacityBytes: (@Sendable (Int) -> Double)? = nil,
-                hotCacheCeilingBytes: Double? = nil) {
+                hotCacheCeilingBytes: Double? = nil, growthWindow: Int = 0) {
         precondition(maxContext > 0 && maxChoices > 0 && capacityBytes > 0 && bytesPerToken > 0)
+        precondition(growthWindow >= 0)
+        self.growthWindow = growthWindow
         precondition(hotCacheCeilingBytes == nil || (hotCacheCeilingBytes!.isFinite && hotCacheCeilingBytes! >= 0))
         self.hotCacheCeilingBytes = hotCacheCeilingBytes
         self.maxContext = maxContext; self.maxChoices = maxChoices
@@ -100,35 +118,71 @@ public final class AdmissionBudget: @unchecked Sendable {
     /// the prospective hot target and increase in the unchanged active bound. It must
     /// not call this AdmissionBudget recursively, and must return false if cache
     /// reclamation/physical readback cannot cover the increase. No MLX escapes here.
-    public func reserve(length: Int, prepareCache: ((Double, Double) -> Bool)? = nil) -> Int? {
+    public func reserve(length: Int, current: Int? = nil, prepareCache: ((Double, Double) -> Bool)? = nil) -> Int? {
         lock.lock(); defer { lock.unlock() }
         guard length > 0 && length <= maxContext else { return nil }
+        if paused { pausedRefusals += 1; return nil }                 // P125: the machine is critically short of memory
         let paddedLength = max(length, lengths.values.max() ?? 0)
         let history = historyBytes(paddedLength)
         guard history.isFinite, history > 0 else { return nil }
         let estimate = Double(lengths.count + 1) * (3 * (history + 512 * bytesPerToken) + fixedBytesPerSequence)
         guard estimate <= capacityBytes else { return nil }
-        if let ceiling = hotCacheCeilingBytes {
+        let start = committedStart(length: length, current: current)
+        if let ceiling = effectiveCeiling {
+            let bound = boundLocked(count: lengths.count + 1, longest: max(start, committed.values.max() ?? 0))
             guard let prepareCache,
-                  prepareCache(min(ceiling, max(0, capacityBytes - estimate)),
-                               max(0, estimate - activeBytesLocked())) else { return nil }
+                  prepareCache(min(ceiling, max(0, capacityBytes - bound)),
+                               max(0, bound - activeCommittedBytesLocked())) else { return nil }
         }
-        next += 1; lengths[next] = length; return next
+        next += 1; lengths[next] = length; committed[next] = start; return next
     }
-    public func release(_ id: Int) { lock.lock(); lengths[id] = nil; lock.unlock() }
+    /// P120: raise reservation `id`'s committed length to cover `current` plus a growth window (never past its admitted
+    /// length). Returns nil when nothing changed; otherwise the prepare callback ran with the smaller hot target and the
+    /// increase, exactly as in `reserve`, and its answer is returned. A running row is never refused: the admitted length
+    /// already fit the capacity at admission, so the new committed length is recorded either way (a refused physical
+    /// readback is counted in `admission_growths_refused`).
+    public func grow(_ id: Int, current: Int, prepareCache: ((Double, Double) -> Bool)? = nil) -> Bool? {
+        lock.lock(); defer { lock.unlock() }
+        guard growthWindow > 0, let length = lengths[id], let was = committed[id],
+              current + growthWindow / 2 > was, was < length else { return nil }
+        let before = activeCommittedBytesLocked()
+        committed[id] = committedStart(length: length, current: current)
+        growths += 1
+        guard let ceiling = effectiveCeiling, let prepareCache else { return true }
+        let bound = activeCommittedBytesLocked()
+        let ok = prepareCache(min(ceiling, max(0, capacityBytes - bound)), max(0, bound - before))
+        if !ok { growthsRefused += 1 }
+        return ok
+    }
+    /// The committed length of a reservation (its admitted length when the growth window is off); 0 if released.
+    public func committedLength(_ id: Int) -> Int { lock.lock(); defer { lock.unlock() }; return committed[id] ?? 0 }
+    private func committedStart(length: Int, current: Int?) -> Int {
+        guard growthWindow > 0, let current else { return length }
+        return min(length, max(1, current) + growthWindow)
+    }
+    private func boundLocked(count: Int, longest: Int) -> Double {
+        guard count > 0, longest > 0 else { return 0 }
+        return Double(count) * (3 * (historyBytes(longest) + 512 * bytesPerToken) + fixedBytesPerSequence)
+    }
+    public func release(_ id: Int) { lock.lock(); lengths[id] = nil; committed[id] = nil; lock.unlock() }
     public var active: Int { lock.lock(); defer { lock.unlock() }; return lengths.count }
-    private func activeBytesLocked() -> Double {
-        guard let longest = lengths.values.max() else { return 0 }
-        return Double(lengths.count) * (3 * (historyBytes(longest) + 512 * bytesPerToken) + fixedBytesPerSequence)
+    private func activeBytesLocked() -> Double { boundLocked(count: lengths.count, longest: lengths.values.max() ?? 0) }
+    private func activeCommittedBytesLocked() -> Double {
+        boundLocked(count: committed.count, longest: committed.values.max() ?? 0)
     }
     /// Plain values only; safe for publication after an owner transaction has returned.
     public func snapshot() -> [String: Double] {
         lock.lock(); defer { lock.unlock() }
-        let activeBytes = activeBytesLocked()
+        let activeBytes = activeBytesLocked(), committedBytes = activeCommittedBytesLocked()
         return ["shared": hotCacheCeilingBytes == nil ? 0 : 1,
                 "capacity_bytes": capacityBytes, "active_reservation_bytes": activeBytes,
                 "active_reservations": Double(lengths.count), "max_length": Double(lengths.values.max() ?? 0),
                 "hot_ceiling_bytes": hotCacheCeilingBytes ?? 0,
-                "hot_target_bytes": hotCacheCeilingBytes.map { min($0, max(0, capacityBytes - activeBytes)) } ?? 0]
+                "hot_target_bytes": effectiveCeiling.map { min($0, max(0, capacityBytes - committedBytes)) } ?? 0,
+                "pressure_ceiling_factor": pressureFactor, "admissions_paused": paused ? 1 : 0,
+                "pressure_refusals": Double(pausedRefusals),
+                "admission_growth_window": Double(growthWindow), "active_committed_bytes": committedBytes,
+                "max_committed_length": Double(committed.values.max() ?? 0),
+                "admission_growths": Double(growths), "admission_growths_refused": Double(growthsRefused)]
     }
 }

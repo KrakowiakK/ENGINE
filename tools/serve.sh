@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # P106 E9/OMP profile (the production serving profile). One foreground process; no implicit disk cache.
+# Profile b54 (tools/gates/gate.py LAUNCHER_PROFILE) = b53 + the P119 shared-prefix rung (ENGINE_SHARED_PREFIX_RUNG=1024)
+# + the P120 admission growth window (ENGINE_ADMISSION_GROWTH_WINDOW=32768).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN="${ENGINE_BINARY:-$PWD/.build/release/engine}"
@@ -15,10 +17,20 @@ for ARG in "$@"; do
   esac
 done
 if [[ "${ENGINE_SCHEDULER:-phase}" != phase || "${ENGINE_BATCH_PREFILL:-1}" != 1 || "${ENGINE_PREFILL_ROW_PROJECTIONS:-all}" != all || "${ENGINE_SHARED_RAM_BUDGET:-1}" != 1 || "${ENGINE_MTP:-1}" != 1 || "${ENGINE_BATCH_MTP_POLICY:-auto}" != auto || "${ENGINE_H25_CANONICAL_PREFIX:-0}" != 0 || "${ENGINE_RELEASE_POOLED_PRIVATE_HISTORY:-1}" != 1 \
-      || "${ENGINE_PREFILL_WIDTH_CANONICAL:-1024}" != 1024 || "${ENGINE_PREFILL_CHUNK_ALONE:-4096}" != 4096 || "${ENGINE_PREFILL_BUDGET_CUT:-1}" != 1 ]]; then
-  echo 'The tested OMP profile requires phase scheduling, native prefill with all row projections, shared RAM budgeting, MTP auto, decode-origin prefix reuse, pooled release and the B40 prefill widths. Use a separate diagnostic invocation for overrides.' >&2
+      || "${ENGINE_PREFILL_WIDTH_CANONICAL:-1024}" != 1024 || "${ENGINE_PREFILL_CHUNK_ALONE:-4096}" != 4096 || "${ENGINE_PREFILL_BUDGET_CUT:-1}" != 1 \
+      || "${ENGINE_SHARED_PREFIX_RUNG:-1024}" != 1024 || "${ENGINE_SHARED_PREFIX_RUNG_MAX:-4}" != 4 \
+      || "${ENGINE_ADMISSION_GROWTH_WINDOW:-32768}" != 32768 ]]; then
+  echo 'The tested OMP profile requires phase scheduling, native prefill with all row projections, shared RAM budgeting, MTP auto, decode-origin prefix reuse, pooled release, the B40 prefill widths and the P119 shared-prefix rung at 1024 (at most 4 heads) and the P120 admission growth window 32768. Use a separate diagnostic invocation for overrides.' >&2
   exit 2
 fi
+# P119 (B54, tools/gates profile b54 = p119): a cold prompt whose 1024-token head was already seen cold once ends its
+# first chunk at 1024; that state is kept once per distinct head (at most 4, 1/8 of the hot budget) and resumed by later
+# cold prompts with the head (aider's 1321-token system prompt). Pinned, not a default: a shell value other than these
+# is refused above (an unparsable one would make the binary refuse to start).
+export ENGINE_SHARED_PREFIX_RUNG=1024 ENGINE_SHARED_PREFIX_RUNG_MAX=4
+# P120 (B54): the hot store's share of the RAM budget follows each row's committed length (prompt + 32768, grown ahead of
+# the row) instead of prompt + max_tokens; admission decisions are unchanged (they still price prompt + max_tokens).
+export ENGINE_ADMISSION_GROWTH_WINDOW=32768
 export ENGINE_SCHEDULER=phase ENGINE_BATCH_PREFILL=1 ENGINE_PREFILL_ROW_PROJECTIONS=all
 export ENGINE_SHARED_RAM_BUDGET=1 ENGINE_MTP=1 ENGINE_BATCH_MTP_POLICY=auto
 # P106 B40 (operator 2026-09-23): prefix reuse from the LIVE decode state too (canonical-only B27 reuse OFF: a hot
@@ -66,6 +78,12 @@ export MLXFAST_MLX_METALLIB="${MLXFAST_MLX_METALLIB:-$BIN_DIR/mlx.metallib}"
 if pgrep -x engine >/dev/null; then
   echo 'An engine process is already running; drain and stop it before starting another.' >&2
   exit 95
+fi
+# P121: macOS's GPU wired collector (on by default, back on after every reboot) unwires the model within about a minute and
+# decode then decays request by request to single-digit tok/s (measured here on macOS 27.0, 2026-09-21; a third party's
+# llm_context_benchmarks run looked exactly like it). Only a warning: changing it needs sudo, and production must still start.
+if [[ "$(/usr/sbin/sysctl -n iogpu.disable_wired_collector 2>/dev/null || echo unknown)" != 1 ]]; then
+  echo 'WARNING: iogpu.disable_wired_collector is not 1 -- macOS will unwire the model and decode will slow to single-digit tok/s. Run: sudo sysctl iogpu.disable_wired_collector=1, or once for every boot: sudo tools/install_wired_collector_boot.sh. Without sudo, ENGINE_WIRED_LIMIT_GB=200 avoids the decode stalls but prefill stays about 25 % slower (P123).' >&2
 fi
 exec "$BIN" serve --model "${ENGINE_MODEL:-$PWD/weights/e9}" \
   --host "${ENGINE_HOST:-127.0.0.1}" --port "${ENGINE_PORT:-8099}" \

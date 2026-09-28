@@ -54,6 +54,7 @@ private final class ServeMemoryWitness: @unchecked Sendable {
     private var ramBudget: [String: Double] = [:]
     private var hotCache: [String: Int] = [:]
     private var pooledPrivateHistory: [String: Any] = [:]
+    private var sharedPrefix: [String: Int] = [:]
     func publish() {
         precondition(modelThreadShared.isOwner)
         let next = ["at": Date().timeIntervalSince1970, "active_bytes": Double(Memory.activeMemory),
@@ -94,8 +95,11 @@ private final class ServeMemoryWitness: @unchecked Sendable {
         let privateHistory: [String: Any] = ["observed": true,
             "rows_installed": pooledPrivateHistoryRowsInstalled,
             "pool_installs": pooledPrivateHistoryPoolInstalls]
+        // P119 witness: the store's shared-prefix counters plus the server's own (split chunks, native-batch skips)
+        var shared = hotStoreShared?.sharedPrefixSnapshot() ?? [:]
+        shared["splits"] = sharedPrefixSplits; shared["native_skips"] = sharedPrefixNativeSkips
         lock.lock(); value = next; prefill = batches; indexer = routes; restack = restacks
-        ramBudget = budget; hotCache = hot; pooledPrivateHistory = privateHistory
+        ramBudget = budget; hotCache = hot; pooledPrivateHistory = privateHistory; sharedPrefix = shared
         if let layout { cacheLayout = layout }
         lock.unlock()
     }
@@ -107,6 +111,7 @@ private final class ServeMemoryWitness: @unchecked Sendable {
     func ramBudgetSnapshot() -> [String: Double] { lock.lock(); defer { lock.unlock() }; return ramBudget }
     func hotCacheSnapshot() -> [String: Int] { lock.lock(); defer { lock.unlock() }; return hotCache }
     func pooledPrivateHistorySnapshot() -> [String: Any] { lock.lock(); defer { lock.unlock() }; return pooledPrivateHistory }
+    func sharedPrefixSnapshot() -> [String: Int] { lock.lock(); defer { lock.unlock() }; return sharedPrefix }
 }
 private let serveMemoryWitness = ServeMemoryWitness()
 nonisolated(unsafe) private var nativePrefillSizes: [Int: Int] = [:] // owner only
@@ -131,6 +136,30 @@ private let pooledHotRungs = ProcessInfo.processInfo.environment["ENGINE_POOLED_
 /// P106 B41: prompt-prefix rung spacing for a prefill from position 0 (0 = none, as B40).
 private let prefixRungStep = Int(ProcessInfo.processInfo.environment["ENGINE_PREFIX_RUNG_STEP"] ?? "8192") ?? 8192
 nonisolated(unsafe) private var hotRungPooledCaptures = 0
+/// P119: ENGINE_SHARED_PREFIX_RUNG (tokens; 0 = off, the default = the pre-P119 server exactly). A cold prompt (prefilled
+/// from 0, at least the rung + `sharedPrefixRungMargin` tokens long) whose head was already seen cold once (the store's
+/// admission: no split or copy for a head nobody reuses) ends its first chunk EXACTLY at the rung and the state there is
+/// stored once per distinct prompt head as a shared-prefix rung (HotPrefixStore, P119), which every later cold prompt with
+/// the same head resumes from -- aider's 1321-token system prompt. Not
+/// ENGINE_PREFIX_RUNG_STEP=1024: that would be 32 anchors per 32k window (the D52 class) and move OMP's rungs. Only 1024
+/// is admitted: the width-canonical boundary (H50b, H57), so the split and the resume leave the state a cold prefill has
+/// (the startup guard admits only the geometries that law covers). An unparsable value is refused, not read as 0.
+private let sharedPrefixRung = ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG"].map { Int($0) ?? -1 } ?? 0
+/// P119: at most this many distinct shared-prefix rungs (LRU among them; ENGINE_SHARED_PREFIX_RUNG_MAX, default 4, at most
+/// 8: with the protected share -- 1/8 of the hot store's budget -- they can never crowd out the conversations, review F2).
+private let sharedPrefixRungMax = ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG_MAX"].map { Int($0) ?? -1 } ?? 4
+/// P120: the hot store's share of the shared RAM budget is computed from each row's COMMITTED length -- its prompt plus
+/// this many tokens, raised again (`AdmissionBudget.grow`, a control job on the owner that shrinks the hot store first)
+/// whenever the row comes within half a window of it -- instead of its admitted prompt + max_tokens. Admission still
+/// prices the admitted length, so which requests are admitted is unchanged; a client sending max_tokens = the context
+/// (aider: 262144; every request without max_tokens since B52) no longer squeezes the hot store at 8 rows from ~128 GB to
+/// ~12.9 GB for tokens it has not generated. 0 = off (B53 exactly). Refused unless 0 or a multiple of 1024 in
+/// 4096...262144 with ENGINE_SHARED_RAM_BUDGET=1.
+private let admissionGrowthWindow = ProcessInfo.processInfo.environment["ENGINE_ADMISSION_GROWTH_WINDOW"].map { Int($0) ?? -1 } ?? 0
+/// P119: a prompt shorter than rung + margin keeps its unsplit first chunk: below it the chunk after the rung would cross
+/// MLX's row-count kernel thresholds (PrefillChunkPlan.sharedPrefixMargin says which).
+private let sharedPrefixRungMargin = PrefillChunkPlan.sharedPrefixMargin
+nonisolated(unsafe) private var sharedPrefixSplits = 0, sharedPrefixNativeSkips = 0   // owner only
 
 func serve(_ o: Options) async throws {
     // A client that disconnects mid-request (a timeout, a cancelled stream) makes the eventual
@@ -280,6 +309,18 @@ func serve(_ o: Options) async throws {
           hotCacheGB.isFinite, hotCacheGB >= 0, stateCacheMaxGB.isFinite, stateCacheMaxGB >= 0,
           batchWindowMs.isFinite, batchWindowMs >= 0, sharedChunk > 0, aloneChunk > 0,
           mtpDepth <= 16, batchMTPDepth <= 16 else { throw EngineError.invalid("invalid serving limits") }
+    // P125: what the machine has free BEFORE the weights load. A Mac already busy with another model server cannot hold E9;
+    // refusing here with the numbers beats loading 195 GB into swap (or being killed by the kernel with no message).
+    serveMemoryGuardEnabled = ProcessInfo.processInfo.environment["ENGINE_MEMORY_GUARD"] != "0"
+    serveLaunchAvailableBytes = SystemMemory.availableBytes()
+    if serveMemoryGuardEnabled, let avail = serveLaunchAvailableBytes {
+        let weights = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey]))?
+            .filter { $0.pathExtension == "safetensors" }
+            .reduce(Int64(0)) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) } ?? 0
+        if Double(avail) - serveMemoryGuardLaunchMarginBytes < Double(weights) * 1.02 {
+            throw EngineError.invalid(String(format: "only %.1f GB of memory is free (other processes use the rest); the weights alone need %.1f GB plus a %.0f GB margin. Close other model servers, or set ENGINE_MEMORY_GUARD=0 to start anyway", Double(avail) / 1e9, Double(weights) / 1e9, serveMemoryGuardLaunchMarginBytes / 1e9))
+        }
+    }
     let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
     eval(context.model)
     let layers = textConfig["num_hidden_layers"] as? Int ?? 1
@@ -287,6 +328,7 @@ func serve(_ o: Options) async throws {
     let kvHeads = textConfig["num_key_value_heads"] as? Int ?? (textConfig["num_attention_heads"] as? Int ?? 1)
     let headDim = textConfig["head_dim"] as? Int ?? ((textConfig["hidden_size"] as? Int ?? 4096) / max(1, textConfig["num_attention_heads"] as? Int ?? 1))
     let qwenConfig = (context.model as? Qwen4ExpModel)?.configuration.text
+    serveVocabularySize = qwenConfig?.vocabularySize
     let bytesPerToken: Double
     if let qwenConfig {
         bytesPerToken = AdmissionBudget.perTokenBytes(
@@ -338,6 +380,36 @@ func serve(_ o: Options) async throws {
             throw EngineError.invalid("H25 policy/probe requires Qwen MTP3 auto, phase, CB4/max8/window25, native ON/all, RAM20/shared, coalesce ON, disk OFF, C1024 (or C0 + shared1024 + alone<=2048 + ENGINE_PREFILL_WIDTH_CANONICAL=1024), rung512/keep2")
         }
     }
+    // P119: the shared-prefix rung is admitted only where the width-canonical law covers both the split and the resume:
+    // R = 1024 with 1024-row blocked projections; every configured chunk width a multiple of 1024 and either at most 2048
+    // (H50b: 2048 == 2 x 1024) or cut at a 2048 QSA budget (H57), so a cold prompt's first chunk is [0, 2048) at the
+    // widest and [0, 1024) + [1024, ...) is what the law measured; no H25/H8/H26 diagnostic (their own chunk/rung rules);
+    // a hot store to hold it, under the shared RAM budget (review F1: the legacy fixed cap would let the rungs sit on top
+    // of the RAM the admission set aside for it); disk rungs (if any) on a spacing that divides the rung; not the fp32
+    // router diagnostic (review F5: its matmul takes the steel split-K for a <= 992-row tail but not for the cold chunk's
+    // 1279+ rows, so the cut would change the state for prompts up to 2017 tokens).
+    if sharedPrefixRung != 0 {
+        let configuredChunk = prefillChunk > 0 ? prefillChunk
+            : (Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CHUNK"] ?? "") ?? 0)
+        let widths = configuredChunk > 0 ? [configuredChunk] : [aloneChunk, sharedChunk]
+        let budget = qwenConfig?.indexerBudget ?? 0
+        guard sharedPrefixRung == h25CanonicalWidth, (1 ... 8).contains(sharedPrefixRungMax), qwenConfig != nil,
+              hotCacheGB > 0, serveSharedRAMBudget, ProcessInfo.processInfo.environment["ENGINE_ROUTER_FP32"] == nil,
+              h50WidthCanonical, widths.allSatisfy({ $0 % h25CanonicalWidth == 0 }),
+              widths.allSatisfy({ $0 <= h50MaxCanonicalChunk }) || (h57BudgetCut && budget == h50MaxCanonicalChunk),
+              !h25CanonicalPrefix, !h25Metadata, !h8BoundarySplit,
+              stateCacheDir == nil || h25CanonicalWidth % stateCacheStep == 0 else {
+            throw EngineError.invalid("ENGINE_SHARED_PREFIX_RUNG=\(ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG"] ?? "") requires 1024, ENGINE_SHARED_PREFIX_RUNG_MAX 1...8, a Qwen model, --hot-cache-gb > 0, ENGINE_SHARED_RAM_BUDGET=1, no ENGINE_ROUTER_FP32, ENGINE_PREFILL_WIDTH_CANONICAL=1024, chunk widths multiples of 1024 and <= 2048 or cut at a 2048 QSA budget (ENGINE_PREFILL_BUDGET_CUT on), no H25/H8/H26 diagnostic, and a disk rung step dividing 1024")
+        }
+    }
+    serveRuntime["shared_prefix_rung"] = sharedPrefixRung
+    guard admissionGrowthWindow == 0 || (serveSharedRAMBudget && admissionGrowthWindow % 1024 == 0
+                                         && (4096 ... 262_144).contains(admissionGrowthWindow)) else {
+        throw EngineError.invalid("ENGINE_ADMISSION_GROWTH_WINDOW=\(ProcessInfo.processInfo.environment["ENGINE_ADMISSION_GROWTH_WINDOW"] ?? "") requires 0, or a multiple of 1024 in 4096...262144 with ENGINE_SHARED_RAM_BUDGET=1")
+    }
+    serveRuntime["admission_growth_window"] = admissionGrowthWindow
+    serveRuntime["shared_prefix_rung_max"] = sharedPrefixRung > 0 ? sharedPrefixRungMax : 0
+    serveRuntime["shared_prefix_rung_margin"] = sharedPrefixRungMargin
     serveRuntime["h8_boundary_probe"] = h8BoundaryProbe
     serveRuntime["default_max_tokens"] = defaultMaxTokens
     serveRuntime["queue_max"] = serveQueueMax
@@ -393,6 +465,15 @@ func serve(_ o: Options) async throws {
     hotStoreShared.anchorWindow = Int(ProcessInfo.processInfo.environment["ENGINE_HOT_ANCHOR_WINDOW"] ?? "") ?? 32768
     serveRuntime["hot_anchor_window"] = hotStoreShared.anchorWindow
     hotStoreShared.evictAffinity = ProcessInfo.processInfo.environment["ENGINE_HOT_EVICT"] != "lru"
+    // P119 (validated above; 0 leaves the store exactly as before: no shared entry can exist, no sighting is recorded)
+    if sharedPrefixRung > 0 {
+        hotStoreShared.sharedPrefixLength = sharedPrefixRung
+        hotStoreShared.sharedPrefixCapacity = sharedPrefixRungMax
+        hotStoreShared.sharedPrefixMinPrompt = sharedPrefixRung + sharedPrefixRungMargin   // = PrefillChunkPlan's eligibility
+    }
+    // the store's P119 policy constants, read back (0 with the knob off; every key starts `shared_prefix_rung`)
+    serveRuntime["shared_prefix_rung_share_divisor"] = sharedPrefixRung > 0 ? hotStoreShared.sharedPrefixShareDivisor : 0
+    serveRuntime["shared_prefix_rung_sightings"] = sharedPrefixRung > 0 ? hotStoreShared.sharedPrefixSightingCapacity : 0
     if hotStoreShared.enabled {
         FileHandle.standardError.write(String(format: "engine serve: hot prefix store cap %.0f GB, rung every %d tokens\n", hotCacheGB, stateCacheStep).data(using: .utf8)!)
     }
@@ -453,6 +534,15 @@ func serve(_ o: Options) async throws {
     // the remainder between the SAME active bound and reclaimable cache storage.
     serveRAMLiveLimitBytes = Double(ProcessInfo.processInfo.physicalMemory) * 0.90
         - (max(32, allocatorGB) + 48) * 1e9
+    // P125: never plan for more than the machine had free at launch (less a margin for everything else): the physical formula
+    // above assumes the engine owns the Mac.
+    let physicalLiveLimit = serveRAMLiveLimitBytes
+    if serveMemoryGuardEnabled, let avail = serveLaunchAvailableBytes {
+        serveRAMLiveLimitBytes = min(serveRAMLiveLimitBytes, Double(avail) - serveMemoryGuardLaunchMarginBytes)
+    }
+    serveRuntime["memory_guard"] = serveMemoryGuardEnabled
+    serveRuntime["launch_available_bytes"] = serveLaunchAvailableBytes.map { Double($0) } ?? -1
+    serveRuntime["physical_live_limit_bytes"] = physicalLiveLimit
     let available = serveRAMLiveLimitBytes - Double(residentModelBytes)
         - (serveSharedRAMBudget ? 0 : hotCacheGB * 1e9)
     let requestedBudget = Double(o.values["--kv-budget-gb"] ?? "").map { $0 * 1e9 } ?? available
@@ -491,7 +581,8 @@ func serve(_ o: Options) async throws {
     }
     serveAdmission = AdmissionBudget(maxContext: contextLimit, capacityBytes: requestedBudget,
         bytesPerToken: bytesPerToken, fixedBytesPerSequence: fixedBytesPerSequence,
-        historyCapacityBytes: historyCapacity, hotCacheCeilingBytes: serveSharedRAMBudget ? hotCacheGB * 1e9 : nil)
+        historyCapacityBytes: historyCapacity, hotCacheCeilingBytes: serveSharedRAMBudget ? hotCacheGB * 1e9 : nil,
+        growthWindow: admissionGrowthWindow)
     serveRuntime["shared_ram_budget"] = serveSharedRAMBudget
     serveRuntime["ram_live_limit_bytes"] = serveRAMLiveLimitBytes
     modelThreadShared.exclusive {
@@ -504,6 +595,7 @@ func serve(_ o: Options) async throws {
         }
         serveMemoryWitness.publish()
     }
+    if serveMemoryGuardEnabled && serveSharedRAMBudget { startMemoryGuard() }
     serveRuntime["fixed_bytes_per_sequence"] = fixedBytesPerSequence
     serveRuntime["full_context_history_capacity_bytes_per_row_derived"] = historyCapacity?(contextLimit)
         ?? AdmissionBudget.historyCapacityLengths(length: contextLimit, kvStep: 1024).kv * bytesPerToken
@@ -544,9 +636,97 @@ nonisolated(unsafe) var serveMaxConcurrent = 8
 nonisolated(unsafe) var serveQueueMax = 0
 nonisolated(unsafe) var serveQueueTimeout = 1800.0
 nonisolated(unsafe) var serveAdmission: AdmissionBudget!
+nonisolated(unsafe) var serveVocabularySize: Int? = nil     // P124: bounds logit_bias token ids
+nonisolated(unsafe) var serveMemoryGuardEnabled = true
+nonisolated(unsafe) var serveLaunchAvailableBytes: Int64? = nil
+let serveMemoryGuardLaunchMarginBytes = 16e9
+nonisolated(unsafe) private var serveMemoryGuardState: MemoryGuardPolicy? = nil       // under serveMemoryGuardLock
+private let serveMemoryGuardLock = NSLock()
+private let serveMemoryGuardQueue = DispatchQueue(label: "engine.memory-guard")
+nonisolated(unsafe) private var serveMemoryGuardSources: [any DispatchSourceProtocol] = []
+nonisolated(unsafe) private var serveMemoryGuardCacheLimit = 0
+
+/// P125: follow the kernel's memory-pressure events and the free memory (every 2 s). Warning: the hot cache may use half its
+/// ceiling and the MLX buffer cache is capped at 4 GB and emptied; critical: the hot cache is emptied and new requests get a
+/// 503 (running ones finish); back to normal after 30 s of better readings. Nothing changes while the machine has room.
+private func startMemoryGuard() {
+    let env = ProcessInfo.processInfo.environment
+    var policy = MemoryGuardPolicy.defaults(physical: Int64(ProcessInfo.processInfo.physicalMemory))
+    if let low = env["ENGINE_MEMORY_GUARD_LOW_GB"].flatMap(Double.init),
+       let crit = env["ENGINE_MEMORY_GUARD_CRITICAL_GB"].flatMap(Double.init), low >= crit, crit >= 0 {
+        policy = MemoryGuardPolicy(lowBytes: Int64(low * 1e9), criticalBytes: Int64(crit * 1e9),
+                                   recoverSeconds: env["ENGINE_MEMORY_GUARD_RECOVER_S"].flatMap(Double.init) ?? 30)
+    }
+    serveMemoryGuardState = policy
+    serveMemoryGuardCacheLimit = Memory.cacheLimit
+    serveRuntime["memory_guard_low_bytes"] = Double(policy.lowBytes)
+    serveRuntime["memory_guard_critical_bytes"] = Double(policy.criticalBytes)
+    let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: serveMemoryGuardQueue)
+    pressure.setEventHandler {
+        let e = pressure.data
+        memoryGuardTick(event: e.contains(.critical) ? .critical : e.contains(.warning) ? .warning : .normal)
+    }
+    pressure.resume()
+    let timer = DispatchSource.makeTimerSource(queue: serveMemoryGuardQueue)
+    timer.schedule(deadline: .now() + 2, repeating: 2)
+    timer.setEventHandler { memoryGuardTick(event: nil) }
+    timer.resume()
+    serveMemoryGuardSources = [pressure, timer]
+    memoryGuardTick(event: nil)
+}
+
+private func memoryGuardTick(event: MemoryPressureLevel?) {
+    let avail = SystemMemory.availableBytes()
+    serveMemoryGuardLock.lock()
+    guard var p = serveMemoryGuardState else { serveMemoryGuardLock.unlock(); return }
+    let changed = p.observe(event: event, available: avail, now: Date().timeIntervalSince1970)
+    serveMemoryGuardState = p
+    serveMemoryGuardLock.unlock()
+    guard changed else { return }
+    FileHandle.standardError.write(String(format: "engine: memory guard -> %@ (free %.1f GB, kernel %@; hot cache ceiling x%.1f, new requests %@)\n",
+        p.level.name, Double(avail ?? -1) / 1e9, p.eventLevel.name, p.hotCeilingFactor, p.admitNew ? "admitted" : "refused").data(using: .utf8)!)
+    serveAdmission.setPressure(ceilingFactor: p.hotCeilingFactor, admissionsPaused: !p.admitNew)
+    let level = p.level
+    modelThreadShared.exclusive {
+        _ = hotStoreShared.setBudgetBytes(Int(serveAdmission.snapshot()["hot_target_bytes"]!))
+        if level > .normal {
+            Memory.cacheLimit = min(serveMemoryGuardCacheLimit, 4_000_000_000)
+            Memory.clearCache()
+        } else {
+            Memory.cacheLimit = serveMemoryGuardCacheLimit
+        }
+        serveMemoryWitness.publish()
+    }
+}
+
+/// The guard's plain readback for /v1/engine/sessions.
+func memoryGuardSnapshot() -> [String: Any] {
+    serveMemoryGuardLock.lock(); defer { serveMemoryGuardLock.unlock() }
+    guard let p = serveMemoryGuardState else { return ["enabled": serveMemoryGuardEnabled, "running": false] }
+    return ["enabled": true, "running": true, "level": p.level.name, "kernel_level": p.eventLevel.name,
+            "available_bytes": p.lastAvailable ?? -1, "low_bytes": p.lowBytes, "critical_bytes": p.criticalBytes,
+            "transitions": p.transitions, "warnings": p.warnings, "criticals": p.criticals,
+            "hot_ceiling_factor": p.hotCeilingFactor, "admitting": p.admitNew]
+}
 nonisolated(unsafe) private var serveSharedRAMBudget = false
 nonisolated(unsafe) private var serveRAMLiveLimitBytes = 0.0
 nonisolated(unsafe) private var serveRAMReclaimWitness: [String: Double] = [:] // owner only
+/// The shared-budget prepare callback of `AdmissionBudget.reserve` / `grow`, on the model owner: shrink the hot store to the
+/// prospective target and check the physical readback covers the reservation increase.
+private func serveReclaim(_ target: Double, _ growth: Double) -> Bool {
+    precondition(modelThreadShared.isOwner)
+    let before = Double(Memory.activeMemory)
+    let reclaimed = hotStoreShared.setBudgetBytes(Int(target))
+    let after = Double(Memory.activeMemory)
+    // Deleted entries may still have pending backend references. Refuse
+    // instead of crediting presumed release. This additional guard is
+    // conservative: it reserves full workspace even if some is live now.
+    let fits = reclaimed && after + growth <= serveRAMLiveLimitBytes
+    serveRAMReclaimWitness = ["reclaim_before_active_bytes": before, "reclaim_after_active_bytes": after,
+        "prospective_reservation_growth_bytes": growth, "reclaim_accepted": fits ? 1 : 0,
+        "live_limit_bytes": serveRAMLiveLimitBytes]
+    return fits
+}
 nonisolated(unsafe) var serveBearerToken: String?
 nonisolated(unsafe) var serveRuntime: [String: Any] = [:]
 nonisolated(unsafe) var serveMaxTokensClamp = false
@@ -611,6 +791,12 @@ private struct ChatRequest {
     var toolChoice: ToolChoiceMode
     var parallelToolCalls: Bool
     var jsonInstruction: String?
+    /// P124: min_p, presence / frequency / repetition penalties, logit_bias (parsed and validated; an error -> 400)
+    var logitParams = ServeSamplingParams()
+    var samplingError: String? = nil
+    /// A request whose sampling needs the per-step processor: it runs serially without MTP (like logprobs), never in a
+    /// batched round, whose shared argmax / top-k block and draft acceptance know nothing of per-row histories.
+    var needsLogitProcessing: Bool { logitParams.adjustsLogits || (logitParams.minP > 0 && temperature > 0) }
 }
 
 private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defaultEffort: String = "medium", keepReasoning: Bool = true) -> ChatRequest? {
@@ -667,6 +853,7 @@ private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defau
     let temp = (obj["temperature"] as? Double).map(Float.init) ?? 0
     let topP = (obj["top_p"] as? Double).map(Float.init) ?? 1
     let topK = max(0, (obj["top_k"] as? Int) ?? 0)   // P068: the checkpoint asks for top_k 20 with sampling
+    let (logitParams, samplingError) = ServeSamplingParams.parse(obj, vocabularySize: serveVocabularySize)   // P124
     let thinkingBudget = obj["thinking_budget"] as? Int
     let loopGuardReq = obj["loop_guard"] as? Int
     let thinkBiasReq = (obj["think_bias_max"] as? Double).map { Float($0) }
@@ -723,7 +910,8 @@ private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defau
         messages: messages, maxTokens: maxTokens, requestedMaxTokens: requestedMaxTokens, temperature: temp, topP: topP, topK: topK, thinkingBudget: thinkingBudget, loopGuard: loopGuardReq, thinkBiasMax: thinkBiasReq, thinkBiasDeadline: thinkBiasDeadlineReq, n: n, stream: stream,
         streamIncludeUsage: streamIncludeUsage, stopStrings: stopStrings, seed: seed, reasoningEffort: reasoningEffort,
         preserveThinking: preserveThinking, logprobsRequested: logprobsRequested, topLogprobsCount: topLogprobsCount, rawTools: rawTools, toolChoice: toolChoice,
-        parallelToolCalls: parallelToolCalls, jsonInstruction: jsonInstruction)
+        parallelToolCalls: parallelToolCalls, jsonInstruction: jsonInstruction,
+        logitParams: logitParams, samplingError: samplingError)
 }
 
 // MARK: - tool-call parsing (THIS checkpoint's XML form, from chat_template.jinja)
@@ -1068,6 +1256,10 @@ final class SeqState {
     // and the MTP cache a batch handover retired -- still valid to its own length, so the stored
     // entry can arm MTP up to there.
     var hotRungs: [HotPrefixStore.Rung] = []
+    /// P119 per-request witness (owner only): the length a shared-prefix rung resumed this request at (0: none), and
+    /// what this request's own capture did ("none" = no capture attempted).
+    var sharedPrefixHit = 0
+    var sharedPrefixCapture = "none"
     private(set) var hotRungLogicalBytes = 0, hotRungRollbackLogicalBytes = 0
     private var hotRungsValid = true
     var retiredMTPCache: KVCache? = nil
@@ -1770,6 +1962,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             "cache_layout": serveMemoryWitness.cacheLayoutSnapshot(),
             "pooled_private_history": serveMemoryWitness.pooledPrivateHistorySnapshot(),
             "ram_budget": serveMemoryWitness.ramBudgetSnapshot(), "hot_cache": serveMemoryWitness.hotCacheSnapshot(),
+            "memory_guard": memoryGuardSnapshot(),
+            "shared_prefix_rung": serveMemoryWitness.sharedPrefixSnapshot(),
             "indexer_graph_construction": serveMemoryWitness.indexerSnapshot(), "restack": serveMemoryWitness.restackSnapshot(), "memory": serveMemoryWitness.snapshot(), "native_prefill_sizes": serveMemoryWitness.prefillSnapshot(),
             "batch_steps": modelThreadShared.stepCount, "batch_sizes": Dictionary(uniqueKeysWithValues: modelThreadShared.sizeHistogram.map { (String($0.key), $0.value) })])
         writeHTTPResponse(fd, status: 200, statusText: "OK", contentType: "application/json",
@@ -1823,6 +2017,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
     guard var chatReq = parseChatRequest(obj, defaultMaxTokens: defaultMaxTokens, defaultEffort: serveReasoningEffort, keepReasoning: keepReasoning) else {
         writeHTTPResponse(fd, status: 400, statusText: "Bad Request", contentType: "application/json",
                            body: jsonErrorBody("'messages' is required"))
+        return
+    }
+    if let e = chatReq.samplingError {                // P124: an out-of-range sampling parameter is refused, not ignored
+        writeHTTPResponse(fd, status: 400, statusText: "Bad Request", contentType: "application/json", body: jsonErrorBody(e))
         return
     }
 
@@ -1904,20 +2102,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
     let pendingReservation: Int?
     if serveSharedRAMBudget {
         pendingReservation = modelThreadShared.exclusive {
-            let result = serveAdmission.reserve(length: ids.count + chatReq.maxTokens + lookahead) { target, growth in
-                precondition(modelThreadShared.isOwner)
-                let before = Double(Memory.activeMemory)
-                let reclaimed = hotStoreShared.setBudgetBytes(Int(target))
-                let after = Double(Memory.activeMemory)
-                // Deleted entries may still have pending backend references. Refuse
-                // instead of crediting presumed release. This additional guard is
-                // conservative: it reserves full workspace even if some is live now.
-                let fits = reclaimed && after + growth <= serveRAMLiveLimitBytes
-                serveRAMReclaimWitness = ["reclaim_before_active_bytes": before, "reclaim_after_active_bytes": after,
-                    "prospective_reservation_growth_bytes": growth, "reclaim_accepted": fits ? 1 : 0,
-                    "live_limit_bytes": serveRAMLiveLimitBytes]
-                return fits
-            }
+            let result = serveAdmission.reserve(length: ids.count + chatReq.maxTokens + lookahead,
+                                                current: ids.count + lookahead, prepareCache: serveReclaim)
             serveRAMReclaimWitness["last_admission_committed"] = result == nil ? 0 : 1
             if result == nil {
                 _ = hotStoreShared.setBudgetBytes(Int(serveAdmission.snapshot()["hot_target_bytes"]!))
@@ -1927,7 +2113,9 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         }
     } else { pendingReservation = serveAdmission.reserve(length: ids.count + chatReq.maxTokens + lookahead) }
     guard let reservation = pendingReservation else {
-        writeHTTPResponse(fd, status: 503, statusText: "Service Unavailable", contentType: "application/json", body: jsonErrorBody("KV memory budget exhausted; retry after active requests finish", type: "overloaded"))
+        let why = serveAdmission.admissionsPaused ? "the machine is critically short of memory (memory guard); retry shortly"
+                                                  : "KV memory budget exhausted; retry after active requests finish"
+        writeHTTPResponse(fd, status: 503, statusText: "Service Unavailable", contentType: "application/json", body: jsonErrorBody(why, type: "overloaded"))
         return
     }
     releaseReservation = {
@@ -1940,6 +2128,19 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 serveMemoryWitness.publish()
             }
         } else { serveAdmission.release(reservation) }
+    }
+    // P120: keep this row's committed reservation half a growth window ahead of its length. A control job on the owner:
+    // it ends a decode gather (ModelThread.takeFrontLocked) and never waits for one; once per half window per row.
+    let admittedLength = ids.count + chatReq.maxTokens + lookahead
+    var committedLength = serveAdmission.committedLength(reservation)
+    func growReservation(_ current: Int) {
+        guard serveSharedRAMBudget, admissionGrowthWindow > 0, committedLength < admittedLength,
+              current + admissionGrowthWindow / 2 > committedLength else { return }
+        modelThreadShared.exclusive {
+            _ = serveAdmission.grow(reservation, current: current, prepareCache: serveReclaim)
+            serveMemoryWitness.publish()
+        }
+        committedLength = serveAdmission.committedLength(reservation)
     }
     guard !cancelled() else { return }
     let stateCache = stateCache?.indexed(for: ids)
@@ -2036,14 +2237,22 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         func chunkEnd(_ from: Int) -> Int {
             // H57: a chunk ends on a multiple of its own width (after the budget cut at 2048 a 4096 schedule runs
             // 2048, 4096, 8192, 12288, ...), so the prefix-step rungs (every 8192) and the H54 anchors are still captured.
-            let w = max(1, chunkWidth())
-            let aligned = (((w > rungAlign ? ((from + w) / w) * w : from + w)) / rungAlign) * rungAlign
-            var end = min(ids.count, max(aligned, from + 1))
-            if qsaBudgetCut > 0, from < qsaBudgetCut, end > qsaBudgetCut { end = qsaBudgetCut }
-            // H50: a wide chunk must end ON the target rather than step over it, or no certified rung is captured.
-            if h25CanonicalPrefix, h50WidthCanonical, from < canonicalTarget, end > canonicalTarget { end = canonicalTarget }
-            if hotReserve > 0, end == ids.count, from < ids.count - hotReserve { return ids.count - hotReserve }
-            return end
+            // H50: a wide chunk must end ON the canonical target rather than step over it (diagnostic mode only).
+            // P119: the arithmetic lives in EngineServeSupport/PrefillChunkPlan.swift (unchanged) so it is tested.
+            PrefillChunkPlan.end(from: from, width: chunkWidth(), rungAlign: rungAlign, promptCount: ids.count,
+                                 qsaBudgetCut: qsaBudgetCut, canonicalTarget: h25CanonicalPrefix && h50WidthCanonical ? canonicalTarget : nil,
+                                 hotReserve: hotReserve)
+        }
+        // P119: a cold prompt at least rung + margin long whose head has EARNED a shared rung (`sharedRung` below: the
+        // store's admission, a second cold sighting) ends its FIRST chunk (from 0) exactly at the rung, where the rung is
+        // captured. `split` marks a boundary that exists only because of this cut (alone: the first chunk would have been
+        // [0, 2048)); in the shared regime [0, 1024) is the natural first chunk and nothing is cut. The rest of the
+        // schedule is chunkEnd's, unchanged: from 1024 the next end is the QSA budget 2048, then width multiples.
+        // Knob off (0), not eligible or not admitted: `rung` is 0 and every plan is chunkEnd's.
+        let sharedSplit = PrefillChunkPlan.sharedSplitEligible(promptCount: ids.count, rung: sharedPrefixRung, margin: sharedPrefixRungMargin)
+        func chunkPlan(_ from: Int, rung: Int) -> (end: Int, split: Bool) {
+            PrefillChunkPlan.withSharedSplit(from: from, end: chunkEnd(from), promptCount: ids.count,
+                                             rung: rung, margin: sharedPrefixRungMargin)
         }
         // P089 U10: the sampler, the cache and the prompt are MLX-typed, so they are built on the
         // model thread and this thread keeps only `seqId`. A seeded request is reproducible because
@@ -2052,6 +2261,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let seqId: Int = mt.exclusive {
             guard !cancelled() else { return -1 }
             var sampler = EngineSampler(temp: chatReq.temperature, topP: chatReq.topP, topK: chatReq.topK)
+            if chatReq.needsLogitProcessing { sampler.processor = ServeLogitProcessor(params: chatReq.logitParams, promptIds: ids) }
             if !sampler.isGreedy {
                 let seed: UInt64 = chatReq.seed.map { UInt64(truncatingIfNeeded: $0) } ?? UInt64.random(in: 0 ..< UInt64(UInt32.max))
                 sampler.key = MLXRandom.key(seed)
@@ -2125,15 +2335,20 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let guardBudget = chatReq.thinkingBudget ?? thinkBudget
         let guardRepeats = chatReq.loopGuard ?? loopGuard
         let hardThinkingGuard = thinkOpenInitially && (guardBudget > 0 || guardRepeats > 0)
-        let mtpEligible = mtpDepth > 0 && (qm?.mtp != nil) && !chatReq.logprobsRequested
+        let mtpEligible = mtpDepth > 0 && (qm?.mtp != nil) && !chatReq.logprobsRequested && !chatReq.needsLogitProcessing
         let wantMTP = mtpEligible && !hardThinkingGuard
         let mtpPolicyReason = mtpEligible ? (hardThinkingGuard ? "hard_guard" : "eligible") : "ineligible"
+        var sharedAdmitted = false
         if let qm, hotStoreShared.enabled {
-            let hot: Int = mt.prefill {
-                guard !cancelled() else { return 0 }
+            let (hot, admitted): (Int, Bool) = mt.prefill {
+                guard !cancelled() else { return (0, false) }
                 let st = seqRegistry[seqId]
+                // P119 (review F2): a request that starts cold is a sighting of its prompt's head; the head earns the split
+                // and the capture only once it has been seen before (or a shared entry of its ids exists). Knob off or
+                // ineligible: false, nothing recorded.
+                let coldMiss = { () -> (Int, Bool) in (0, sharedSplit && hotStoreShared.admitSharedPrefix(prompt: ids)) }
                 if h25Metadata { st.h25Witness["initial_entries"] = hotStoreShared.count; st.h25Count("initial_lookup_attempts") }
-                guard let h = st.h25Lookup(ids, mtp: wantMTP, kind: 0) else { return 0 }
+                guard let h = st.h25Lookup(ids, mtp: wantMTP, kind: 0) else { return coldMiss() }
                 if h25Metadata {
                     st.h25Witness["initial_hit_length"] = h.length
                     st.h25Witness["initial_hit_has_mtp"] = h.hasMTP ? 1 : 0
@@ -2143,11 +2358,12 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 var mtpCache: KVCache? = nil
                 if wantMTP, h.hasMTP, let mtp = qm.mtp { mtpCache = mtp.newCache() }
                 st.h25Count("materialize_attempts")
-                guard hotStoreShared.materialize(h, into: st.cache, mtp: mtpCache, model: qm) else { return 0 }
+                guard hotStoreShared.materialize(h, into: st.cache, mtp: mtpCache, model: qm) else { return coldMiss() }
                 st.h25Count("materialize_successes")
                 if let mtpCache { st.primeMTPCache = mtpCache; eval(mtpCache.state) }
                 eval(st.cache.flatMap { $0.state })
                 st.h25Adopt(h)
+                if h.isSharedPrefix { st.sharedPrefixHit = h.length }
                 if h25Metadata {
                     st.h25Witness["restore_after_eval_trunk_offset"] = (st.cache.first { $0 is CacheList } as? CacheList)
                         .map { ($0[0] as! KVCacheSimple).offset } ?? -1
@@ -2160,9 +2376,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 if !h25CanonicalPrefix, hotReserve > 0, h.length == ids.count - hotReserve {
                     st.captureHotRung(length: h.length, model: qm)
                 }
-                return h.length
+                return (h.length, false)
             }
             if hot > 0 { gc0 = hot; cacheHitTokens = hot; cacheHitSource = "hot" }
+            sharedAdmitted = admitted
             if hotStoreShared.debug {
                 // where does each stored sequence part from this prompt? (ENGINE_HOT_DEBUG)
                 // D50: `lastDebug` is shared; another request's lookup may have replaced it since ours (the B40 H50d
@@ -2205,6 +2422,9 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         liveSessions.update(sessionId) { [gc0, cacheHitTokens, cacheHitSource] e in
             e.phase = "prefill"; e.cachedTokens = cacheHitTokens; e.cacheSource = cacheHitSource; e.prefilledTo = gc0
         }
+        // P119: the rung this request's cold schedule is cut at and captures (0: none -- knob off, not eligible, not
+        // admitted, or resumed: a split and a capture happen only from position 0)
+        let sharedRung = sharedAdmitted && gc0 == 0 ? sharedPrefixRung : 0
         let tPrefill0 = Date()
         // P067: speculative decode when the server runs --mtp K, the head is loaded, the request wants
         // no logprobs, and (with a state cache) the hit entry carries the MTP cache -- entries written
@@ -2244,9 +2464,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let mtpArmed = specActive           // initial per-choice arming, before handover/invalidation
         liveSessions.update(sessionId) { [specActive] e in e.mtp = specActive }
         let prefillBatchEnabled = (serveRuntime["batch_prefill"] as? Bool) == true
-        func prefillJob<T: Sendable>(from: Int, to: Int, mtp: Bool, _ body: () -> T) -> T {
+        func prefillJob<T: Sendable>(from: Int, to: Int, mtp: Bool, solo: Bool = false, _ body: () -> T) -> T {
             // Other tail/resume geometries keep their validated solo path.
-            guard prefillBatchEnabled, let qm, [512, 1024].contains(to - from) else { return mt.prefill(body) }
+            // P119 (`solo`): a chunk cut by the shared-prefix split did not exist before; it runs solo (B1, the geometry
+            // the shared rung needs) rather than becoming a native-batch candidate that the uncut [0, 2048) never was.
+            guard prefillBatchEnabled, !solo, let qm, [512, 1024].contains(to - from) else { return mt.prefill(body) }
             return mt.prefill(key: seqId, position: from, group: "qwen:\(from):\(to):\(mtp)", tokens: to - from, prepare: {
                 guard !cancelled() else { return false }
                 if hotCoalesce, hotStoreShared.enabled,
@@ -2260,11 +2482,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             var c0 = gc0
             while c0 < ids.count {
                 guard !cancelled() else { return }
-                let c1 = chunkEnd(c0)
+                let (c1, splitHere) = chunkPlan(c0, rung: sharedRung)
                 let isLast = (c1 == ids.count)
                 // one chunk per job: a 128k prime yields the model thread between chunks instead of
                 // owning it for two minutes (P087's fairness property, kept)
-                let (tok, jump): (Int, Int) = prefillJob(from: c0, to: c1, mtp: true) {
+                let (tok, jump): (Int, Int) = prefillJob(from: c0, to: c1, mtp: true, solo: splitHere) {
                     defer { serveMemoryWitness.publish() }
                     guard !cancelled() else { return (0, -2) }
                     let st = seqRegistry[seqId]
@@ -2279,6 +2501,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                         eval(st.cache.flatMap { $0.state }); eval(mtpCache.state)
                         if c0 > 0 { hotStoreShared.coalescedIntoNonFresh += 1 }
                         st.h25Count("coalesced_imports"); st.h25Adopt(h)
+                        if h.isSharedPrefix { st.sharedPrefixHit = h.length }
                         if !h25CanonicalPrefix, hotReserve > 0, h.length == ids.count - hotReserve { st.captureHotRung(length: h.length, model: qm) }
                         return (0, h.length)
                     }
@@ -2307,10 +2530,12 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     // of a conversation are retained for its whole life, so another conversation sharing the prefix (a
                     // client's system prompt and tool list -- OMP subagents share 11.4k tokens with the main agent)
                     // resumes there instead of from zero.
-                    else if !h25CanonicalPrefix, prefixRungStep > 0, c1 % prefixRungStep == 0, !isLast {
+                    else if !h25CanonicalPrefix, prefixRungStep > 0, c1 % prefixRungStep == 0, !isLast, !splitHere {
                         st.captureHotRung(length: c1, model: qm)
                     }
-                    if let sc = stateCache, !isLast, c1 % sc.step == 0 {
+                    // P119: a boundary that exists only because of the shared-prefix split gets none of a chunk end's
+                    // other side effects (disk rung, in-flight store): the set of those stays what it was without the knob.
+                    if let sc = stateCache, !isLast, !splitHere, c1 % sc.step == 0 {
                         eval(st.cache.flatMap { $0.state }); eval(mtpCache.state)
                         var d: [String: MLXArray] = ["T": MLXArray(Int32(c1))]
                         qm.exportCaches(st.cache, prefix: "trunk.", into: &d)
@@ -2320,12 +2545,20 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     // A scheduling boundary must also bound submitted GPU work. Otherwise
                     // several lazy chunks can queue ahead of a newly ready decoder.
                     eval(S, st.cache.flatMap { $0.state }, mtpCache.state)
+                    // P119: the shared-prefix rung, from the certified geometry only: this request's own B1 chunk
+                    // [0, rung) of a cold prefill (not a coalesced import, not a native batch), trunk AND head.
+                    if PrefillChunkPlan.capturesSharedRung(from: c0, to: c1, promptCount: ids.count, rung: sharedRung, margin: sharedPrefixRungMargin) {
+                        if splitHere { sharedPrefixSplits += 1 }
+                        if actualBatch == 1 {
+                            st.sharedPrefixCapture = hotStoreShared.captureSharedPrefix(prompt: ids, caches: st.cache, mtp: mtpCache, model: qm).rawValue
+                        } else { sharedPrefixNativeSkips += 1; st.sharedPrefixCapture = "native_batch" }
+                    }
                     let origin = st.h25AfterPrefill(from: c0, to: c1, batch: actualBatch, mtp: true, model: qm)
                     st.h26RecordPrefill(h26Before, from: c0, to: c1, batch: actualBatch,
                                         nativeGroup: nativeGroup, nativeSlot: nativeSlot, nativeDecoders: nativeDecoders,
                                         bodyDecoders: bodyDecoders, origin: origin)
                     st.h8RecordPrefill(h8Before, from: c0, to: c1, mtp: mtpCache, headTokens: toks)
-                    if hotCoalesce, hotStoreShared.enabled, !isLast, c1 < ids.count - hotReserve {
+                    if hotCoalesce, hotStoreShared.enabled, !isLast, !splitHere, c1 < ids.count - hotReserve {
                         hotStoreShared.store(tokens: Array(ids[0 ..< c1]), caches: st.cache, mtp: mtpCache, rungs: [], model: qm, inFlight: true, owner: seqId, finalCanonical: origin)
                     }
                     return (nn, -1)
@@ -2351,11 +2584,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         }
         while gc0 < ids.count {
             guard !cancelled() else { return }
-            let gc1 = chunkEnd(gc0)
+            let (gc1, splitHere) = chunkPlan(gc0, rung: sharedRung)
             // P087: a long prefill yields the model thread between chunks instead of owning it for
             // minutes. At 128k that is the difference between a 114 s freeze for every other client
             // and a 114 s request that the others interleave with.
-            let jump: Int = prefillJob(from: gc0, to: gc1, mtp: false) {
+            let jump: Int = prefillJob(from: gc0, to: gc1, mtp: false, solo: splitHere) {
                 defer { serveMemoryWitness.publish() }
                 guard !cancelled() else { return -2 }
                 let st = seqRegistry[seqId]
@@ -2365,6 +2598,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     eval(st.cache.flatMap { $0.state })                        // P103: as above
                     if gc0 > 0 { hotStoreShared.coalescedIntoNonFresh += 1 }
                     st.h25Count("coalesced_imports"); st.h25Adopt(h)
+                    if h.isSharedPrefix { st.sharedPrefixHit = h.length }
                     if !h25CanonicalPrefix, hotReserve > 0, h.length == ids.count - hotReserve { st.captureHotRung(length: h.length, model: qm) }
                     return h.length
                 }
@@ -2379,19 +2613,27 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 st.prefillForward = nil; st.prefillForwardBatchSize = 0
                 st.h26ForwardGroupID = 0; st.h26ForwardSlot = -1; st.h26ForwardDecoderCount = -1
                 if hotReserve > 0, let qm, gc1 == ids.count - hotReserve { st.captureHotRung(length: gc1, model: qm) }
-                if let sc = stateCache, let qm, gc1 < ids.count, gc1 % sc.step == 0 {
+                if let sc = stateCache, let qm, gc1 < ids.count, !splitHere, gc1 % sc.step == 0 {   // P119: as above
                     eval(st.cache.flatMap { $0.state })
                     var d: [String: MLXArray] = ["T": MLXArray(Int32(gc1))]
                     qm.exportCaches(st.cache, prefix: "trunk.", into: &d)
                     StateCache.write(sc, ids, gc1, d)
                 }
                 eval(st.lastLogits, st.cache.flatMap { $0.state })
+                // P119: as in the MTP prime, trunk only (this request primes no head; an MTP request can resume from
+                // it only after an MTP capture of the same head upgrades it)
+                if let qm, PrefillChunkPlan.capturesSharedRung(from: gc0, to: gc1, promptCount: ids.count, rung: sharedRung, margin: sharedPrefixRungMargin) {
+                    if splitHere { sharedPrefixSplits += 1 }
+                    if actualBatch == 1 {
+                        st.sharedPrefixCapture = hotStoreShared.captureSharedPrefix(prompt: ids, caches: st.cache, mtp: nil, model: qm).rawValue
+                    } else { sharedPrefixNativeSkips += 1; st.sharedPrefixCapture = "native_batch" }
+                }
                 let origin = qm.flatMap { st.h25AfterPrefill(from: gc0, to: gc1, batch: actualBatch, mtp: false, model: $0) }
                 st.h26RecordPrefill(h26Before, from: gc0, to: gc1, batch: actualBatch,
                                     nativeGroup: nativeGroup, nativeSlot: nativeSlot, nativeDecoders: nativeDecoders,
                                     bodyDecoders: bodyDecoders, origin: origin)
                 st.h8RecordPrefill(h8Before, from: gc0, to: gc1, mtp: nil)
-                if hotCoalesce, hotStoreShared.enabled, let qm, gc1 < ids.count - hotReserve {
+                if hotCoalesce, hotStoreShared.enabled, let qm, !splitHere, gc1 < ids.count - hotReserve {
                     hotStoreShared.store(tokens: Array(ids[0 ..< gc1]), caches: st.cache, mtp: nil, rungs: [], model: qm, inFlight: true, owner: seqId, finalCanonical: origin)
                 }
                 return -1
@@ -2414,7 +2656,9 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             st.pending = y
             st.lastLogits = MLXArray(0)
             st.xs = MLXArray(0)               // the prompt is done with; a 256k one is worth freeing
-            return y.item(Int.self)
+            let first = y.item(Int.self)
+            if st.sampler.processor != nil { st.sampler.processor!.observe(first) }    // P124: the output history
+            return first
         }
         guard firstTok >= 0 else { return }
         // measured AFTER the first token is materialised: the graph is lazy, and timing it before the
@@ -2543,6 +2787,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                         l[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + MLXArray(b).asType(l.dtype)
                     }
                 }
+                precondition(seqRegistry[seqId].sampler.processor == nil, "P124: a logit-processing row reached the batched sampler")
                 let tok = seqRegistry[seqId].sampler.sample(l).item(Int.self)
                 if tok == engineThinkCloseId { closeCommitted = true }
                 return tok
@@ -2615,6 +2860,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             let toolBoundary = pendingTok == engineThinkCloseId
                 && !toolCallInjected && !forcedPrefixIdsTemplate.isEmpty
             let rowBatchable = batchMinRows > 0 && forceQueue.isEmpty && !toolBoundary && !chatReq.logprobsRequested
+                && !chatReq.needsLogitProcessing      // P124: the per-row history lives in the serial sampler
                 && (ids.count + out.count) > batchFloor && qm != nil
             setRegistered(rowBatchable)
             // The MTP -> batch handover, at the only safe point: with the round's verified tokens all
@@ -2750,6 +2996,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     let nextArr = forceQueue.isEmpty ? st.sampler.sample(logits) : MLXArray([Int32(forceQueue.removeFirst())])
                     asyncEval(nextArr)
                     let nextTok = nextArr.item(Int.self)
+                    if st.sampler.processor != nil { st.sampler.processor!.observe(nextTok) }   // P124 (forced tokens too)
                     if softBias.active, !closeCommitted, nextTok == engineThinkCloseId { closeCommitted = true }
                     let tt = pendingTok
                     let stop = engineStopIdSet.contains(tt) || (context.tokenizer.eosTokenId.map { tt == $0 } ?? false)
@@ -2797,6 +3044,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // Everything below is host-side: no MLX, no model thread held.
             out.append(t)
             liveSessions.tokenEmitted(sessionId)
+            growReservation(ids.count + out.count + lookahead)
             let textDelta = detok.appendDelta(t)
             if thinkOpenInitially, !closedThink, guardFired == nil, forceQueue.isEmpty, !guardCloseIds.isEmpty {
                 if guardBudget > 0, out.count >= guardBudget { guardFired = "budget" }
@@ -2896,7 +3144,22 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             "think_guard": guardFired ?? "",
             "think_guard_at": guardAt,
         ]
+        if chatReq.needsLogitProcessing {                          // P124 witness (absent otherwise: default responses unchanged)
+            lastRequestStats["logit_processing"] = ["min_p": chatReq.logitParams.minP,
+                "presence_penalty": chatReq.logitParams.presencePenalty, "frequency_penalty": chatReq.logitParams.frequencyPenalty,
+                "repetition_penalty": chatReq.logitParams.repetitionPenalty, "logit_bias_tokens": chatReq.logitParams.logitBias.count,
+                // tokens the processor recorded: the emitted ones plus the serial step's unemitted look-ahead (+1, +2 on a stop id)
+                "sampled_tokens": mt.exclusive { seqRegistry[seqId].sampler.processor?.observed ?? 0 }] as [String: Any]
+        }
         if ProcessInfo.processInfo.environment["ENGINE_EXPOSE_TOKEN_IDS"] == "1" { lastRequestStats["token_ids"] = out }
+        if sharedPrefixRung > 0 {   // P119 per-request witness (absent with the knob off)
+            let (hitLength, capture): (Int, String) = mt.exclusive {
+                let st = seqRegistry[seqId]
+                return (st.sharedPrefixHit, st.sharedPrefixCapture)
+            }
+            lastRequestStats["shared_prefix_rung"] = ["hit_length": hitLength, "capture": capture, "eligible": sharedSplit,
+                                                      "admitted": sharedRung > 0]
+        }
         if h25Metadata {
             let diagnostic = mt.exclusive {
                 let st = seqRegistry[seqId]
@@ -3034,6 +3297,7 @@ let serialPrequeueDrafts: Bool = ProcessInfo.processInfo.environment["ENGINE_SER
 func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout EngineSampler,
                     bias: EngineThinkBias = EngineThinkBias(), generated: Int = 0, thinkOpen: Bool = false,
                     stopIds: Set<Int> = []) -> (tokens: [Int], drafted: Int, accepted: Int) {
+    precondition(sampler.processor == nil, "P124: a logit-processing row reached the speculative round")
     let model = sp.model, mtp = sp.mtp, embed = sp.embed, K = sp.K
     var draftArrs: [MLXArray] = [sp.d1]
     if let pre = sp.pre, pre.count == K - 1 {

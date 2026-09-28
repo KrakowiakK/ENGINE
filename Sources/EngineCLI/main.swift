@@ -20,6 +20,7 @@
 // This is the generic path (mlx-swift-lm modules). The arena's optimised Qwen
 // path (Qwen35FastEngine + MTP) is reached through `mlxfast-swift` and its
 // runtime worker; the two are different programs and are reported as such.
+import EngineServeSupport   // P124: ServeLogitProcessor in EngineSampler
 import Foundation
 import AVFoundation
 import CoreMedia
@@ -1568,6 +1569,9 @@ struct EngineSampler {
     /// P042: restore the pre-unit-4 full-sort sampler, for a paired cost difference on one binary.
     static let fullSortArm: Bool = ProcessInfo.processInfo.environment["ENGINE_SAMPLER_FULLSORT"] == "1"
     var temp: Float = 0, topP: Float = 1, topK: Int = 0
+    /// P124: logit_bias, repetition / presence / frequency penalties and min_p (nil = none: the pre-P124 sampler exactly).
+    var processor: ServeLogitProcessor? = nil
+    var minP: Float { processor?.params.minP ?? 0 }
     /// P087: a PER-REQUEST random key. `MLXRandom.categorical` without one draws from the process's
     /// global stream, which is fine while exactly one request exists and meaningless the moment two
     /// interleave: their draws alternate, so a client's `seed` no longer determines its own tokens.
@@ -1585,6 +1589,9 @@ struct EngineSampler {
     /// the row's next draw key, split off the request's stream (nil = the global stream) -- P095 U3-K
     mutating func drawKey() -> MLXArray? { nextKey() }
     mutating func sample(_ logits: MLXArray) -> MLXArray {
+        // P124: logit_bias and the penalties move the logits before anything else (a greedy argmax too); min_p filters the
+        // support after temperature / top_k / top_p below. No processor = the unchanged pre-P124 path.
+        let logits = processor == nil ? logits : processor!.apply(logits)
         if isGreedy { return logits.argMax(axis: -1) }
         var l = logits.asType(.float32) / temp
         let V = l.dim(-1)
@@ -1629,6 +1636,7 @@ struct EngineSampler {
                 let p = softmax(vals, axis: -1)
                 vals = MLX.which((p.cumsum(axis: -1) - p) .< MLXArray(topP), vals, MLXArray(-Float.infinity))
             }
+            if minP > 0 { vals = ServeLogitProcessor.applyMinP(vals, minP: minP) }             // P124, after top_p
             let pick = MLXRandom.categorical(vals, axis: -1, key: nextKey())             // index WITHIN k
             return takeAlong(ids, pick[.ellipsis, .newAxis], axis: -1).squeezed(axis: -1)
         }
@@ -1641,6 +1649,7 @@ struct EngineSampler {
             keep = putAlong(keep, idx, values: keepSorted, axis: -1)
             l = MLX.which(keep, l, MLXArray(-Float.infinity))
         }
+        if minP > 0 { l = ServeLogitProcessor.applyMinP(l, minP: minP) }                    // P124, after top_p
         return MLXRandom.categorical(l, axis: -1, key: nextKey())
     }
 }

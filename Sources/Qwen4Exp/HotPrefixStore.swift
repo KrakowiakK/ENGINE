@@ -113,10 +113,20 @@ public final class HotPrefixStore {
         let owner: Int
         let bytes: Int
         let chargedBytes: Int
-        init(tokens: [Int], rows: [String: MLXArray], rowsValidTo: Int, mtpValidTo: Int, rungs: [Rung], inFlight: Bool = false, owner: Int = -1, id: Int = 0) {
+        /// P119: a SHARED-PREFIX entry (`sharedEntries`, never in `entries`): exactly `sharedPrefixLength` tokens, rows
+        /// sliced to them, one rung at that length. `sharedMTPNextToken` is the MTP head's shifted input at the rung
+        /// (the prompt's token at index `sharedPrefixLength`): the head's last row was computed from it, so the head
+        /// rows serve only a prompt with the same next token. nil: captured without the head (trunk only).
+        let shared: Bool
+        let sharedMTPNextToken: Int?
+        let sharedHash: UInt64
+        var sharedUse = 0            // LRU tick among the shared entries (deterministic, unlike Date)
+        init(tokens: [Int], rows: [String: MLXArray], rowsValidTo: Int, mtpValidTo: Int, rungs: [Rung], inFlight: Bool = false, owner: Int = -1, id: Int = 0,
+             shared: Bool = false, sharedMTPNextToken: Int? = nil, sharedHash: UInt64 = 0) {
             self.id = id
             self.tokens = tokens; self.rows = rows; self.rowsValidTo = rowsValidTo; self.mtpValidTo = mtpValidTo
             self.inFlight = inFlight; self.owner = owner
+            self.shared = shared; self.sharedMTPNextToken = sharedMTPNextToken; self.sharedHash = sharedHash
             self.rungs = rungs; self.lastUse = Date()
             let rowBytes = rows.values.reduce(0) { $0 + $1.nbytes }
             self.rowBytes = rowBytes
@@ -175,7 +185,9 @@ public final class HotPrefixStore {
     }
 
     public var enabled: Bool { capBytes > 0 }
-    public var totalBytes: Int { entries.reduce(0) { $0 + $1.bytes } }
+    /// Includes the P119 shared-prefix entries: their bytes are charged to this store like any entry's.
+    public var totalBytes: Int { entries.reduce(0) { $0 + $1.bytes } + sharedEntries.reduce(0) { $0 + $1.bytes } }
+    /// Ordinary entries only (finished and in-flight); the P119 shared-prefix entries are `sharedCount`.
     public var count: Int { entries.count }
     private static func charge(rows: [String: MLXArray], rungs: [Rung], tokenCount: Int) -> Int {
         rows.values.reduce(0) { $0 + $1.nbytes + backingSlack }
@@ -184,28 +196,46 @@ public final class HotPrefixStore {
             } + tokenCount * MemoryLayout<Int>.stride
     }
     public var chargedBytes: Int {
-        entries.reduce(0) { $0 + $1.chargedBytes }
+        entries.reduce(0) { $0 + $1.chargedBytes } + sharedChargedBytes
     }
     /// Model owner only. Shrinks before new allocations, including to zero entries.
     /// A failed reclaim is a refused admission, never permission to overshoot.
+    /// P119: the shared-prefix entries beyond their protected share of the NEW budget go first (least recently used);
+    /// the rest are reclaimed only once no ordinary entry is left to evict -- an admission is never refused to keep them.
     @discardableResult
     public func setBudgetBytes(_ target: Int) -> Bool {
         precondition(strictBudget && target >= 0)
         budgetBytes = min(capBytes, target)
-        evict(to: budgetBytes, charged: true, keepOne: false)
+        trimSharedToShare()
+        evict(to: budgetBytes, charged: true, keepOne: false, includeShared: true)
         return chargedBytes <= budgetBytes
     }
     /// Caller publishes these plain values from the owner; HTTP never reads arrays.
+    /// P119: `logical_bytes`/`charged_bytes` include the shared-prefix entries (they are charged to this store) while
+    /// `entries`/`rungs`/`inflight_entries` count ordinary entries only; with the knob on the `shared_*` keys say how much
+    /// of the charge is theirs and how many ordinary entries their captures evicted (also counted in `evictions` and
+    /// `pre_copy_evictions`). Knob off: exactly the pre-P119 keys.
     public func snapshot() -> [String: Int] {
-        ["ceiling_bytes": capBytes, "target_bytes": budgetBytes, "logical_bytes": totalBytes,
-         "charged_bytes": chargedBytes, "entries": count, "rungs": entries.reduce(0) { $0 + $1.rungs.count },
-         "strict_budget": strictBudget ? 1 : 0, "rejected_stores": rejectedStores,
-         "pre_copy_evictions": preCopyEvictions, "copy_attempts": copyAttempts,
-         "inflight_entries": entries.filter { $0.inFlight }.count]
+        var d = ["ceiling_bytes": capBytes, "target_bytes": budgetBytes, "logical_bytes": totalBytes,
+                 "charged_bytes": chargedBytes, "entries": count, "rungs": entries.reduce(0) { $0 + $1.rungs.count },
+                 "strict_budget": strictBudget ? 1 : 0, "rejected_stores": rejectedStores,
+                 "pre_copy_evictions": preCopyEvictions, "copy_attempts": copyAttempts,
+                 "inflight_entries": entries.filter { $0.inFlight }.count]
+        if sharedPrefixEnabled {
+            d["shared_entries"] = sharedEntries.count; d["shared_logical_bytes"] = sharedLogicalBytes
+            d["shared_charged_bytes"] = sharedChargedBytes; d["shared_capture_evictions"] = sharedCaptureEvictions
+            d["shared_copy_attempts"] = sharedCopyAttempts
+        }
+        return d
     }
     public func statsLine() -> String {
-        String(format: "hot prefix store: %d sequence(s), %.1f GB of %.1f GB, hits %d, misses %d, stores %d, evictions %d, coalesced stores %d hits %d (%d into a non-fresh cache), in-flight reaped %d",
+        let line = String(format: "hot prefix store: %d sequence(s), %.1f GB of %.1f GB, hits %d, misses %d, stores %d, evictions %d, coalesced stores %d hits %d (%d into a non-fresh cache), in-flight reaped %d",
                entries.count, Double(totalBytes) / 1e9, Double(capBytes) / 1e9, hits, misses, stores, evictions, coalescedStores, coalescedHits, coalescedIntoNonFresh, inFlightReaped)
+        guard sharedPrefixEnabled else { return line }
+        return line + String(format: "; shared prefix rungs %d of %d at %d (%.2f GB), first sightings %d admissions %d, stores %d upgrades %d dedup %d hits %d evictions %d/%d rejected %d",
+                             sharedEntries.count, sharedPrefixCapacity, sharedPrefixLength, Double(sharedLogicalBytes) / 1e9,
+                             sharedFirstSightings, sharedAdmissions,
+                             sharedStores, sharedUpgrades, sharedDedupSkips, sharedHits, sharedLRUEvictions, sharedForcedEvictions, sharedRejected)
     }
 
     /// P106 H54 anchors (store-time only): when an entry is STORED, besides the first two and the last `keepDecodeRungs + 1`
@@ -368,7 +398,8 @@ public final class HotPrefixStore {
         if strictBudget {
             let incoming = Self.charge(rows: rows, rungs: ladder, tokenCount: tokens.count)
             // Refuse before deleting a useful predecessor or constructing copy graphs.
-            guard incoming <= budgetBytes else { rejectedStores += 1; return }
+            // P119: the shared-prefix entries stay (ordinary pressure does not evict them), so they are not room.
+            guard incoming <= budgetBytes - sharedChargedBytes else { rejectedStores += 1; return }
             entries.removeAll(where: superseded)
             let before = evictions
             evict(to: budgetBytes - incoming, charged: true, keepOne: false)
@@ -415,8 +446,17 @@ public final class HotPrefixStore {
     private func evictIfOver() {
         evict(to: strictBudget ? budgetBytes : capBytes, charged: strictBudget, keepOne: !strictBudget)
     }
-    private func evict(to target: Int, charged: Bool, keepOne: Bool) {
-        while (charged ? chargedBytes : totalBytes) > target, entries.count > (keepOne ? 1 : 0) {
+
+    private func evict(to target: Int, charged: Bool, keepOne: Bool, includeShared: Bool = false) {
+        while (charged ? chargedBytes : totalBytes) > target {
+            guard entries.count > (keepOne ? 1 : 0) else {
+                // P119: shared-prefix entries are never victims of ordinary pressure (a store, the fixed cap); only a
+                // budget squeeze that the ordinary entries cannot meet reaches them (after `trimSharedToShare`), least
+                // recently used first. With none stored this is exactly the old loop condition.
+                guard includeShared, let i = lruSharedIndex() else { break }
+                sharedEntries.remove(at: i); sharedForcedEvictions += 1
+                continue
+            }
             var victim: Int? = nil
             if evictAffinity {
                 // dominated: a NEWER entry (appended later) shares at least 90% of this entry's own tokens
@@ -437,17 +477,264 @@ public final class HotPrefixStore {
         // Only the legacy fixed-cap policy retains one oversized entry.
     }
 
+    // MARK: P119 shared-prefix rungs
+
+    /// P119 -- ONE rung per distinct prompt head, shared by every cold prompt that begins with it.
+    ///
+    /// A client that opens many conversations with the same system prompt (aider: all 352 main requests of a run share
+    /// 1321 tokens after the chat template) resumes from nothing today: the ordinary rungs sit at the prompt-prefix step
+    /// (8192), the reserve/prompt-end/decode rungs of earlier conversations all lie past the shared head, so no rung is
+    /// at or below the common prefix. A shared-prefix rung is the state at exactly `sharedPrefixLength` tokens (1024: a
+    /// width-canonical boundary, H50b/H57), captured by the server from a cold B1 prefill whose first chunk ends there.
+    ///
+    /// It lives OUTSIDE `entries`: never superseded, never dominated, never an eviction victim of ordinary pressure (a
+    /// store making room, the fixed cap) -- but only inside its PROTECTED SHARE: all shared entries together are charged
+    /// at most `budgetBytes / sharedPrefixShareDivisor` (a capture makes room from the least recently used shared
+    /// entries; a budget squeeze trims them to the share of the new budget first). Their bytes are charged to this
+    /// store (`totalBytes`, `chargedBytes`), so the ordinary entries get that much less room; a strict-budget squeeze
+    /// (`setBudgetBytes`, admission) that the ordinary entries cannot meet evicts the rest too, least recently used
+    /// first. At most `sharedPrefixCapacity` are kept, LRU among them. Identity = the exact first `sharedPrefixLength`
+    /// token ids (hash + length, then the ids) plus, for an entry that carries the MTP head's rows, the head's shifted
+    /// input token (see `Entry.sharedMTPNextToken`); a head-carrying capture supersedes a trunk-only one of the same ids.
+    /// A head earns a capture only on evidence of reuse (`admitSharedPrefix`: its second cold sighting).
+    /// 0 length or 0 capacity = off: nothing is stored or recorded and every decision is the pre-P119 one.
+    public var sharedPrefixLength = 0
+    public var sharedPrefixCapacity = 0
+    /// The shortest prompt a shared rung is captured from or resumes (0: any prompt longer than the rung). The server
+    /// sets rung + PrefillChunkPlan.sharedPrefixMargin: the same prompts that get the split, so the chunk after the rung
+    /// (resumed or split) has at least margin - 1 rows, above every row-count kernel threshold it would otherwise cross.
+    public var sharedPrefixMinPrompt = 0
+    /// The shared entries' protected share of the budget: at most `budgetBytes / divisor` charged (0 or 1: the whole budget).
+    public var sharedPrefixShareDivisor = 8
+    /// How many distinct heads' first sightings are remembered (LRU) for `admitSharedPrefix`.
+    public var sharedPrefixSightingCapacity = 64
+    public var sharedPrefixEnabled: Bool { enabled && sharedPrefixLength > 0 && sharedPrefixCapacity > 0 }
+    private func sharedPromptEligible(_ count: Int) -> Bool { count > sharedPrefixLength && count >= sharedPrefixMinPrompt }
+    private(set) var sharedEntries: [Entry] = []
+    private var sharedTick = 0
+    /// head hash -> tick of its last cold sighting (plain values; a hash collision can only admit one needless capture,
+    /// never a wrong resume: the entries themselves are matched by the exact ids)
+    private var sharedSightings: [UInt64: Int] = [:]
+    private var sightingTick = 0
+    public private(set) var sharedStores = 0, sharedUpgrades = 0, sharedDedupSkips = 0, sharedHits = 0
+    public private(set) var sharedLRUEvictions = 0, sharedForcedEvictions = 0, sharedRejected = 0, sharedMismatches = 0
+    public private(set) var sharedFirstSightings = 0, sharedAdmissions = 0, sharedCaptureEvictions = 0, sharedCopyAttempts = 0
+    public var sharedCount: Int { sharedEntries.count }
+    public var sharedLogicalBytes: Int { sharedEntries.reduce(0) { $0 + $1.bytes } }
+    public var sharedChargedBytes: Int { sharedEntries.reduce(0) { $0 + $1.chargedBytes } }
+    /// The protected share of the current budget (legacy mode: of the fixed cap, which is its budget), in the mode's own
+    /// accounting: charged bytes under the strict budget, logical bytes under the legacy cap (as each mode evicts).
+    public var sharedShareBytes: Int { sharedPrefixShareDivisor > 1 ? budgetBytes / sharedPrefixShareDivisor : budgetBytes }
+    private func shareCost(_ e: Entry) -> Int { strictBudget ? e.chargedBytes : e.bytes }
+    private func lruSharedIndex() -> Int? {
+        sharedEntries.indices.min { sharedEntries[$0].sharedUse < sharedEntries[$1].sharedUse }
+    }
+    /// A squeeze first takes back what the shared entries hold beyond their share of the new budget (LRU first).
+    private func trimSharedToShare() {
+        while sharedChargedBytes > sharedShareBytes, let i = lruSharedIndex() {
+            sharedEntries.remove(at: i); sharedForcedEvictions += 1
+        }
+    }
+
+    /// P119 admission (review F2/F7: no capture without evidence of reuse). Called by the server for a request whose
+    /// prefill starts COLD (no hot hit) and is eligible for the split: records the sighting of its head and answers
+    /// whether the head has earned the split + capture -- a cold request with the same first `sharedPrefixLength` ids was
+    /// seen before (within the last `sharedPrefixSightingCapacity` distinct heads), or a shared entry of these ids already
+    /// exists (an MTP upgrade of a trunk-only one, another next token). A first sighting costs nothing: the request keeps
+    /// the unsplit schedule and no ~173 MB copy is made, so traffic whose prompts all start differently (one-off clients,
+    /// cold-nonce instruments) never pays for rungs nobody resumes. Knob off: false, nothing recorded.
+    public func admitSharedPrefix(prompt: [Int]) -> Bool {
+        guard sharedPrefixEnabled, sharedPromptEligible(prompt.count) else { return false }
+        let h = Self.prefixHash(prompt[0 ..< sharedPrefixLength])
+        let seen = sharedSightings[h] != nil || !sharedMatches(prompt).isEmpty
+        sightingTick += 1; sharedSightings[h] = sightingTick
+        if sharedSightings.count > max(1, sharedPrefixSightingCapacity),
+           let oldest = sharedSightings.min(by: { $0.value < $1.value })?.key {
+            sharedSightings.removeValue(forKey: oldest)
+        }
+        if seen { sharedAdmissions += 1 } else { sharedFirstSightings += 1 }
+        return seen
+    }
+
+    public enum SharedPrefixDecision: String, Sendable { case disabled, ineligible, deduplicated, store, upgrade }
+    public enum SharedPrefixOutcome: String, Sendable { case disabled, ineligible, deduplicated, stored, upgraded, rejected, mismatch }
+
+    /// FNV-1a over the token ids' 64-bit patterns: deterministic across processes (Swift's Hasher is seeded per run).
+    public static func prefixHash<C: Collection>(_ tokens: C) -> UInt64 where C.Element == Int {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for t in tokens {
+            var v = UInt64(bitPattern: Int64(t))
+            for _ in 0 ..< 8 { h ^= v & 0xff; h = h &* 0x0000_0100_0000_01b3; v >>= 8 }
+        }
+        return h
+    }
+    private func touchShared(_ e: Entry) { sharedTick += 1; e.sharedUse = sharedTick }
+    /// A duplicate capture copies nothing; it refreshes the entries that cover it.
+    private func recordSharedDedup(_ prompt: [Int], next: Int?) {
+        sharedDedupSkips += 1
+        sharedMatches(prompt).filter { next == nil || $0.sharedMTPNextToken == next }.forEach(touchShared)
+    }
+    /// The shared entries whose tokens are exactly `prompt`'s first `sharedPrefixLength` (hash and length first).
+    private func sharedMatches(_ prompt: [Int]) -> [Entry] {
+        let R = sharedPrefixLength
+        guard R > 0, prompt.count >= R, !sharedEntries.isEmpty else { return [] }
+        let head = prompt[0 ..< R], h = Self.prefixHash(head)
+        return sharedEntries.filter { $0.tokens.count == R && $0.sharedHash == h && $0.tokens.elementsEqual(head) }
+    }
+
+    /// What capturing `prompt`'s shared-prefix rung would do; `withMTP`: the capture carries the head's rows (their
+    /// shifted input is `prompt[sharedPrefixLength]`). Pure: the caller checks this BEFORE exporting anything.
+    public func sharedPrefixDecision(prompt: [Int], withMTP: Bool) -> SharedPrefixDecision {
+        guard sharedPrefixEnabled else { return .disabled }
+        let R = sharedPrefixLength
+        guard sharedPromptEligible(prompt.count) else { return .ineligible }
+        let next: Int? = withMTP ? prompt[R] : nil
+        let matches = sharedMatches(prompt)
+        // a trunk-only capture is covered by ANY entry of the same ids; a head capture by one with the same next token
+        if matches.contains(where: { next == nil || $0.sharedMTPNextToken == next }) { return .deduplicated }
+        if next != nil, matches.contains(where: { $0.sharedMTPNextToken == nil }) { return .upgrade }
+        return .store
+    }
+
+    /// Model-free core of `captureSharedPrefix`. `rows` are the RAW row buffers (capacity included) valid to at least
+    /// `sharedPrefixLength` positions; they are sliced to exactly that many and compacted like every stored row (a
+    /// strided slice is copied out; rows are append-only, so a kept view's bytes never change). `rung` must be at that length.
+    /// `mtpNextToken` nil stores the trunk only (any `mtp.` rows are dropped); otherwise it must be `prompt[R]` and the
+    /// head rows must be present. The strict budget is checked BEFORE any copy, as for an ordinary store.
+    @discardableResult
+    public func storeSharedPrefix(prompt: [Int], rows: [String: MLXArray], mtpNextToken: Int?, rung: Rung, ratio: Int) -> SharedPrefixOutcome {
+        let decision = sharedPrefixDecision(prompt: prompt, withMTP: mtpNextToken != nil)
+        switch decision {
+        case .disabled: return .disabled
+        case .ineligible: return .ineligible
+        case .deduplicated: recordSharedDedup(prompt, next: mtpNextToken); return .deduplicated
+        case .store, .upgrade: break
+        }
+        let R = sharedPrefixLength
+        guard rung.length == R, mtpNextToken == nil || mtpNextToken == prompt[R] else { sharedMismatches += 1; return .mismatch }
+        var sliced: [String: MLXArray] = [:]
+        for (k, v) in rows {
+            guard let div = Self.rowDivisor(k, ratio: ratio) else { continue }
+            if mtpNextToken == nil, k.hasPrefix("mtp.") { continue }
+            let n = R / div, ax = Self.rowAxis(k)
+            guard v.ndim > ax, v.dim(ax) >= n else { sharedMismatches += 1; return .mismatch }
+            sliced[k] = ax == 2 ? v[0..., 0..., 0 ..< n, 0...] : v[0..., 0 ..< n, 0...]
+        }
+        guard sliced.keys.contains(where: { $0.hasPrefix("trunk.") }),
+              mtpNextToken == nil || sliced.keys.contains(where: { $0.hasPrefix("mtp.") }) else { sharedMismatches += 1; return .mismatch }
+        let incoming = Self.charge(rows: sliced, rungs: [rung], tokenCount: R)
+        // The protected share bounds every mode (review F1: legacy included, where the fixed cap is the budget). Refused
+        // before touching anything: even with every other shared entry gone the new one would not fit in it.
+        let share = sharedShareBytes
+        let incomingShare = strictBudget ? incoming : sliced.values.reduce(0) { $0 + $1.nbytes } + rung.bytes
+        guard incomingShare <= share else { sharedRejected += 1; return .rejected }
+        // Whom this store replaces: the trunk-only entry of the same ids it upgrades; then, least recently used first,
+        // shared entries until the count is under the capacity and the charge fits the share (ordinary entries are
+        // never displaced to keep a shared one). Terminates: with every other shared entry replaced, incoming <= share.
+        var replaced = decision == .upgrade ? sharedMatches(prompt).filter { $0.sharedMTPNextToken == nil } : []
+        let upgradedCount = replaced.count
+        func isReplaced(_ e: Entry) -> Bool { replaced.contains { $0 === e } }
+        var kept = sharedEntries.reduce(0) { $0 + shareCost($1) } - replaced.reduce(0) { $0 + shareCost($1) }
+        while sharedEntries.count - replaced.count >= sharedPrefixCapacity || kept + incomingShare > share,
+              let lru = sharedEntries.filter({ !isReplaced($0) }).min(by: { $0.sharedUse < $1.sharedUse }) {
+            replaced.append(lru); kept -= shareCost(lru)
+        }
+        // Strict: kept + incoming <= share <= budgetBytes, so evicting ordinary entries can always make the room; the
+        // physical guard below can still refuse.
+        sharedEntries.removeAll(where: isReplaced)
+        if strictBudget {
+            // Room is made the way an ordinary store makes it (ordinary entries only); then the physical guard.
+            let before = evictions
+            evict(to: budgetBytes - incoming, charged: true, keepOne: false)
+            preCopyEvictions += evictions - before; sharedCaptureEvictions += evictions - before
+            guard chargedBytes <= budgetBytes - incoming, permitAllocation?(incoming) ?? true else {
+                // Review F3: a refused capture must not lose what it would have replaced. The replaced entries are still
+                // resident (no allocation) and were charged before this call, which only lowered the total since.
+                // (The ordinary entries evicted above stay evicted, as for a refused ordinary store.)
+                sharedEntries.append(contentsOf: replaced); sharedEntries.sort { $0.id < $1.id }
+                sharedRejected += 1; return .rejected
+            }
+        }
+        sharedLRUEvictions += replaced.count - upgradedCount
+        // Review F4: release the replaced entries' arrays before the copies below allocate (no transient 2x).
+        replaced.removeAll()
+        sharedCopyAttempts += 1
+        let ownedRows = Self.compact(sliced)
+        let head = Self.compact(rung.head)
+        let stored = Rung(length: R, head: head, bytes: head.values.reduce(0) { $0 + $1.nbytes })
+        let e = Entry(tokens: Array(prompt[0 ..< R]), rows: ownedRows, rowsValidTo: R, mtpValidTo: mtpNextToken == nil ? 0 : R,
+                      rungs: [stored], id: nextEntryID, shared: true, sharedMTPNextToken: mtpNextToken,
+                      sharedHash: Self.prefixHash(prompt[0 ..< R]))
+        nextEntryID += 1
+        touchShared(e)
+        sharedEntries.append(e)
+        if decision == .upgrade { sharedUpgrades += 1 } else { sharedStores += 1 }
+        if !strictBudget {                       // the legacy fixed cap: ordinary entries make the room
+            let before = evictions
+            evictIfOver()
+            sharedCaptureEvictions += evictions - before
+        }
+        return decision == .upgrade ? .upgraded : .stored
+    }
+
+    /// P119: store the shared-prefix rung of `prompt` from `caches` holding EXACTLY its first `sharedPrefixLength`
+    /// tokens (and from `mtp`, the draft head's cache, when the request primes one: it must hold as many). Nothing is
+    /// copied for a duplicate, and in strict mode nothing before the budget check. The caller guarantees the geometry
+    /// (a B1 chunk [0, sharedPrefixLength) of a cold prefill, width-canonical projections): the store cannot see it.
+    @discardableResult
+    public func captureSharedPrefix(prompt: [Int], caches: [KVCache], mtp: KVCache?, model: Qwen4ExpModel) -> SharedPrefixOutcome {
+        let decision = sharedPrefixDecision(prompt: prompt, withMTP: mtp != nil)
+        switch decision {
+        case .disabled: return .disabled
+        case .ineligible: return .ineligible
+        case .deduplicated: recordSharedDedup(prompt, next: mtp != nil ? prompt[sharedPrefixLength] : nil); return .deduplicated
+        case .store, .upgrade: break
+        }
+        let R = sharedPrefixLength
+        let trunkLen = (caches.first { $0 is CacheList } as? CacheList).map { ($0[0] as! KVCacheSimple).offset } ?? -1
+        let mtpLen = ((mtp as? CacheList)?[0] as? KVCacheSimple)?.offset
+        guard trunkLen == R, mtp == nil || mtpLen == R else {
+            sharedMismatches += 1
+            FileHandle.standardError.write("engine: shared prefix rung: cache holds \(trunkLen) (head \(mtpLen ?? -1)) tokens, not \(R) -- not stored\n".data(using: .utf8)!)
+            return .mismatch
+        }
+        let ratio = model.configuration.text.indexerCompressRatio
+        var d: [String: MLXArray] = [:]
+        model.exportCaches(caches, prefix: "trunk.", into: &d)
+        // Metadata only (no copy yet): the core compacts after its budget check.
+        let head = d.filter { Self.rowDivisor($0.key, ratio: ratio) == nil }
+        let rung = Rung(length: R, head: head, bytes: head.values.reduce(0) { $0 + $1.nbytes })
+        return storeSharedPrefix(prompt: prompt, rows: captureRows(caches, mtp: mtp, model: model),
+                                 mtpNextToken: mtp != nil ? prompt[R] : nil, rung: rung, ratio: ratio)
+    }
+
+    /// Plain owner counters for the server's witness (GET /v1/engine/sessions `shared_prefix_rung`).
+    public func sharedPrefixSnapshot() -> [String: Int] {
+        ["enabled": sharedPrefixEnabled ? 1 : 0, "length": sharedPrefixLength, "capacity": sharedPrefixCapacity,
+         "entries": sharedEntries.count, "entries_with_mtp": sharedEntries.filter { $0.mtpValidTo > 0 }.count,
+         "stores": sharedStores, "upgrades": sharedUpgrades, "dedup_skips": sharedDedupSkips, "hits": sharedHits,
+         "lru_evictions": sharedLRUEvictions, "forced_evictions": sharedForcedEvictions, "rejected": sharedRejected,
+         "mismatches": sharedMismatches, "bytes": sharedLogicalBytes, "charged_bytes": sharedChargedBytes,
+         "share_bytes": sharedPrefixEnabled ? sharedShareBytes : 0, "share_divisor": sharedPrefixShareDivisor,
+         "first_sightings": sharedFirstSightings, "admissions": sharedAdmissions, "sightings": sharedSightings.count,
+         "capture_evictions": sharedCaptureEvictions, "copy_attempts": sharedCopyAttempts]
+    }
+
     // MARK: lookup / materialise
 
     private static func metadata(_ entry: Entry) -> [String: Int] {
-        ["id": entry.id, "tokens": entry.tokens.count, "rows_valid_to": entry.rowsValidTo,
-         "mtp_valid_to": entry.mtpValidTo, "in_flight": entry.inFlight ? 1 : 0]
+        var d = ["id": entry.id, "tokens": entry.tokens.count, "rows_valid_to": entry.rowsValidTo,
+                 "mtp_valid_to": entry.mtpValidTo, "in_flight": entry.inFlight ? 1 : 0]
+        if entry.shared { d["shared_prefix"] = 1 }
+        return d
     }
     public struct Hit {
         let entry: Entry
         public let rung: Int
         public let length: Int
         public var hasMTP: Bool { length <= entry.mtpValidTo }
+        /// P119: the hit is a shared-prefix rung.
+        public var isSharedPrefix: Bool { entry.shared }
         /// Value contains fixed heads only: callers must not retain Hit/Entry after import.
         public var selectedRung: Rung { entry.rungs[rung] }
         public var entryMetadata: [String: Int] { HotPrefixStore.metadata(entry) }
@@ -468,9 +755,18 @@ public final class HotPrefixStore {
     public func lookup(_ ids: [Int], minLength: Int = 1, preferMTP: Bool = false, quiet: Bool = false,
                        canonicalWidth: Int? = nil, diagnostic: (([String: Int]) -> Void)? = nil) -> Hit? {
         guard enabled else { return nil }
-        func best(mtpOnly: Bool) -> Hit? {
+        /// P119: a shared-prefix entry is a candidate only where resuming from it cannot cost the request its draft
+        /// head: for an MTP request it needs its head rows AND the same shifted input token (resuming without the head
+        /// would pin an MTP request to serial decode, which costs far more than the prefill it saves); a request that does
+        /// not want MTP takes any. Never in the canonical diagnostic mode: it carries no certificate.
+        func sharedEligible(_ e: Entry) -> Bool {
+            let R = e.tokens.count
+            guard canonicalWidth == nil, sharedPromptEligible(ids.count) else { return false }
+            return !preferMTP || (e.mtpValidTo >= R && e.sharedMTPNextToken == ids[R])
+        }
+        func best(_ candidates: [Entry], mtpOnly: Bool) -> Hit? {
             var best: Hit? = nil
-            for e in entries {
+            for e in candidates {
                 let n = min(e.tokens.count, ids.count)
                 var p = 0
                 while p < n && e.tokens[p] == ids[p] { p += 1 }
@@ -505,8 +801,19 @@ public final class HotPrefixStore {
         }
         // In canonical mode a requested head needs its matching shifted input and coverage;
         // a plain/legacy fallback would silently change the requested prefill trajectory.
-        let found = canonicalWidth != nil ? best(mtpOnly: preferMTP)
-            : ((preferMTP ? best(mtpOnly: true) : nil) ?? best(mtpOnly: false))
+        var found = canonicalWidth != nil ? best(entries, mtpOnly: preferMTP)
+            : ((preferMTP ? best(entries, mtpOnly: true) : nil) ?? best(entries, mtpOnly: false))
+        // P119 (review F1): a shared-prefix rung only where it beats that decision -- strictly longer than whatever the
+        // ordinary entries give, or as long and carrying the draft head the ordinary hit lacks (an MTP request; the
+        // shared candidate then always has it). Otherwise ties go to the ordinary rung, and a longer ordinary hit is never
+        // displaced: an MTP request whose only ordinary hit is a 50k-token entry without draft rows (the serial fallback)
+        // keeps resuming at 50k instead of re-prefilling from the rung, exactly as without the knob. Nothing stored
+        // (knob off): today's decision.
+        if canonicalWidth == nil, !sharedEntries.isEmpty,
+           let s = best(sharedEntries.filter(sharedEligible), mtpOnly: preferMTP) {
+            let o = found?.length ?? 0
+            if s.length > o || (s.length == o && preferMTP && s.hasMTP && found?.hasMTP == false) { found = s }
+        }
         if quiet { if found != nil { coalescedHits += 1 }; return found }
         if found != nil { hits += 1 } else { misses += 1 }
         if debug {
@@ -546,6 +853,7 @@ public final class HotPrefixStore {
             d[k] = ax == 2 ? v[0..., 0..., 0 ..< n, 0...] : v[0..., 0 ..< n, 0...]
         }
         e.lastUse = Date()
+        if e.shared { sharedHits += 1; touchShared(e) }
         // A short imported prefix must not keep a full long donor alive after that
         // donor is evicted and its cache charge released. Evaluate the detaching
         // copies on this owner before returning them to any live request cache.

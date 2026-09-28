@@ -24,6 +24,11 @@ What it does:
   cache can be enabled.
 - **262,144-token context** (the checkpoint's `max_position_embeddings`), with admission control that reserves
   memory before a request starts and answers `503` + `Retry-After` instead of running out of memory.
+- **Memory guard** for a Mac that also runs other things: the engine never plans for more than the memory that was free
+  when it started (and refuses to start, with the numbers, if the weights cannot fit), and it follows macOS's
+  memory-pressure signal plus the free memory every 2 s. Under pressure the hot prefix cache first shrinks to half, then
+  empties, and new requests get `503` while running ones finish; it recovers on its own. The level is shown in
+  `/v1/engine/sessions` (`memory_guard`) and logged. `ENGINE_MEMORY_GUARD=0` turns it off.
 - **Thinking soft stop**: instead of a hard thinking budget, a bias on `</think>` ramps up to +12 logits between
   2,000 and 8,000 thinking tokens so the model closes its reasoning at a sentence boundary. After 8,000 tokens the bias keeps
   climbing, quadratically, to +52 logits at a deadline of 14,000 thinking tokens. That exceeds every `</think>` gap
@@ -58,11 +63,16 @@ What it does:
 - Network access for the first build: SwiftPM fetches the Swift package dependencies (for example
   `swift-transformers` and `swift-jinja`) from GitHub.
 - About 195 GB of disk for the weights.
-- **Recommended: `sudo sysctl iogpu.disable_wired_collector=1`** (it resets on every reboot). Every measurement in
-  this project since 2026-09-21 assumed it. In the first GPU run after a reboot into macOS 27.2 it was back at 0: a
-  31,744-token prefill took 69.7 s instead of 29.5 s and many decode rounds stalled for about 2.3 s. With it set
-  to 1 again, the same prefill took 29.7 s. (This is consistent with the collector as the cause but confounded
-  with a reboot, an OS update and a build change; no within-window toggle was run.)
+- **Required for the documented performance: `sudo sysctl iogpu.disable_wired_collector=1`** (it resets on every
+  reboot; `tools/serve.sh` warns when it is not set). Without it macOS unwires the model's memory: on this machine
+  (macOS 27.0, 2026-09-21) wired memory fell from about 269 GB to about 8 GB within a minute of the server starting and
+  decode decayed request by request to about 7 tok/s. A controlled toggle on 2026-09-27 (same build, same session,
+  llm_context_benchmarks at 0.5k-128k): with the collector on, prefill 352-941 tok/s and single runs stalling at
+  19-29 tok/s of generation; with it off, prefill 1087-1267 tok/s and generation 61-93 tok/s. If you cannot use sudo,
+  `ENGINE_WIRED_LIMIT_GB=190 tools/serve.sh` wires only the model's weights: in the same test generation stayed at
+  59-86 tok/s but prefill reached only 764-990 tok/s (one run); a sweep of that limit (200-260 GB) found no value
+  without a loss. To keep the setting across reboots, `sudo tools/install_wired_collector_boot.sh` installs a small
+  LaunchDaemon that applies it at every boot (`--uninstall` removes it).
   `tools/serve.sh` never changes sysctls itself. On macOS 27 it runs without an MLX wired limit
   (`ENGINE_WIRED_LIMIT_GB=0`, overridable).
 
@@ -132,7 +142,8 @@ restarting it, and without authentication.
 - `POST /v1/chat/completions`: OpenAI chat completions, streaming (SSE) and non-streaming. Supported fields:
   `messages` (text only: the text parts of `content` are concatenated, and image and other non-text content parts
   are silently dropped, with no error; the server has no image or video input), `max_tokens` /
-  `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `n` (1-8), `stop`, `stream`,
+  `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`,
+  `repetition_penalty` (alias `repeat_penalty`), `logit_bias`, `seed`, `n` (1-8), `stop`, `stream`,
   `stream_options.include_usage`, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format` (best effort:
   an instruction, not constrained decoding), `logprobs` / `top_logprobs`, `reasoning_effort`. Extensions:
   `thinking_budget` and `loop_guard` (hard guards, off by default; a request with either one active decodes
@@ -155,6 +166,12 @@ Request defaults (production launcher):
   map to `low`. `medium` and `low` are used as given, and anything else gets the default.
 - **Sampling**: `temperature` defaults to 0 (greedy) when omitted. The checkpoint's own generation config
   recommends `temperature 1.0, top_p 0.95, top_k 20`, and Engine Studio sends those values.
+  Order (Hugging Face / vLLM V0): `logit_bias` (-100..100), `repetition_penalty` (prompt and output tokens; 1 = off),
+  `presence_penalty` / `frequency_penalty` (-2..2, output tokens, OpenAI's formula), then temperature, `top_k`,
+  `top_p`, `min_p` (0..1, relative to the most probable token). The penalties and `logit_bias` also change a greedy
+  request's argmax; `min_p` does nothing to a greedy request. Out-of-range values are refused with `400`. A request
+  that uses a penalty or `logit_bias` (or `min_p` with sampling) decodes serially without MTP, like `logprobs`, so
+  it is slower; default values (0, 1, empty) keep the fast batched path. Logprobs are those of the raw logits.
 - Limits: HTTP headers 64 KiB, body 32 MiB. A request that finds all 8 slots busy waits in a first-in-first-out queue
   and starts as soon as a slot frees (`tools/serve.sh`: `--queue-max 32 --queue-timeout-s 1500`). A full queue, a wait
   past the limit, or no memory for the request's reservation answers `503` with `Retry-After: 1`. Run directly
@@ -191,10 +208,14 @@ sessions payload. See [apps/engine-studio/README.md](apps/engine-studio/README.m
 ## Performance
 
 All numbers below were **measured on build B50** (the production build before this export) on one Mac Studio with
-M3 Ultra (80-core GPU) and 512 GB, macOS 27.2, `iogpu.disable_wired_collector=1`. This export is build B52, which
-changed only the request defaults above; B50 served with a default `reasoning_effort` of `medium` and a default
-`max_tokens` of 32,000. None of the clients below set `reasoning_effort`, so every figure ran at `medium`, and
-every client set `max_tokens` explicitly. The figures were not re-measured on B52. Generated tokens include the
+M3 Ultra (80-core GPU) and 512 GB, macOS 27.2, `iogpu.disable_wired_collector=1`. This export is build B56: B52
+changed the request defaults above, B53 added the request queue, B54 the shared-prefix rung (a repeated 1024-token
+prompt head is prefilled once) and the admission growth window (the hot cache is not squeezed by output a request has
+not generated yet), B56 the sampling parameters `min_p`, the penalties and `logit_bias`, and the memory guard; greedy
+output of requests without the new parameters was checked identical to the previous build before each deployment. B50 served with a
+default `reasoning_effort` of `medium` and a default `max_tokens` of 32,000. None of the clients below set
+`reasoning_effort`, so every figure ran at `medium`, and every client set `max_tokens` explicitly. The figures were
+not re-measured on B52-B54 (except the llm_context_benchmarks run in the requirements section). Generated tokens include the
 reasoning tokens. Treat the figures as indicative, not as guarantees.
 
 **One request at a time**: B50 behind the production launcher `tools/serve.sh` (MTP on), measured with the
