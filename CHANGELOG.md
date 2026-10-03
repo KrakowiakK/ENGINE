@@ -49,3 +49,11 @@ Everything since the B56 release (2026-09-28).
 - **Diagnostics:** `POST /v1/engine/flush` (`ENGINE_ADMIN_FLUSH=1`, off by default) evicts the hot store and frees
   MLX's buffer cache on an idle server, for leak checks; `ENGINE_GPU_LEDGER=1` reports GPU busy and idle time per
   window of command buffers.
+
+### Open
+
+- After repeated batched traffic the host heap still grows by about 0.3 MB per batched request even with the hot
+  cache and MLX's buffer cache flushed: newly compiled Metal kernels for new shapes, a bounded index-range cache and
+  untyped allocations. Whether it levels off has not been established yet; GPU memory does not grow.
+- A burst of many cold requests gets its first tokens only after the whole burst has prefilled (see the README's
+  16-session table and known limitations).
