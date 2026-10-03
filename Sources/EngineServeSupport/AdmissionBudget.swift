@@ -90,11 +90,17 @@ public final class AdmissionBudget: @unchecked Sendable {
     /// nil retains the legacy fixed active-only budget. In shared mode capacityBytes
     /// includes active reservations and reclaimable hot storage; this is its idle ceiling.
     public let hotCacheCeilingBytes: Double?
+    /// How many copies of a row's history the bound prices (default 3: private KV, a padded pooled copy and a restack).
+    /// Row-resident KV keeps one copy per row, written in place, so the server may lower it (2026-10-03: thirteen 128k
+    /// rows peaked at ~7.3 GB each against a 15 GB price, and three more waited 1500 s with 180 GB free).
+    public let historyFactor: Double
     public init(maxContext: Int, maxChoices: Int = 8, capacityBytes: Double,
                 bytesPerToken: Double, fixedBytesPerSequence: Double = 384e6,
                 historyCapacityBytes: (@Sendable (Int) -> Double)? = nil,
-                hotCacheCeilingBytes: Double? = nil, growthWindow: Int = 0) {
+                hotCacheCeilingBytes: Double? = nil, growthWindow: Int = 0, historyFactor: Double = 3) {
         precondition(maxContext > 0 && maxChoices > 0 && capacityBytes > 0 && bytesPerToken > 0)
+        precondition(historyFactor >= 1 && historyFactor <= 3)
+        self.historyFactor = historyFactor
         precondition(growthWindow >= 0)
         self.growthWindow = growthWindow
         precondition(hotCacheCeilingBytes == nil || (hotCacheCeilingBytes!.isFinite && hotCacheCeilingBytes! >= 0))
@@ -125,7 +131,7 @@ public final class AdmissionBudget: @unchecked Sendable {
         let paddedLength = max(length, lengths.values.max() ?? 0)
         let history = historyBytes(paddedLength)
         guard history.isFinite, history > 0 else { return nil }
-        let estimate = Double(lengths.count + 1) * (3 * (history + 512 * bytesPerToken) + fixedBytesPerSequence)
+        let estimate = Double(lengths.count + 1) * (historyFactor * (history + 512 * bytesPerToken) + fixedBytesPerSequence)
         guard estimate <= capacityBytes else { return nil }
         let start = committedStart(length: length, current: current)
         if let ceiling = effectiveCeiling {
@@ -135,6 +141,16 @@ public final class AdmissionBudget: @unchecked Sendable {
                                max(0, bound - activeCommittedBytesLocked())) else { return nil }
         }
         next += 1; lengths[next] = length; committed[next] = start; return next
+    }
+    /// The capacity check of `reserve` alone -- no reservation, no hot-store callback, no owner thread: a cheap test a
+    /// request that was refused can repeat while it waits for room (2026-10-03, T-0048).
+    public func estimateFits(length: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard length > 0 && length <= maxContext, !paused else { return false }
+        let paddedLength = max(length, lengths.values.max() ?? 0)
+        let history = historyBytes(paddedLength)
+        guard history.isFinite, history > 0 else { return false }
+        return Double(lengths.count + 1) * (historyFactor * (history + 512 * bytesPerToken) + fixedBytesPerSequence) <= capacityBytes
     }
     /// P120: raise reservation `id`'s committed length to cover `current` plus a growth window (never past its admitted
     /// length). Returns nil when nothing changed; otherwise the prepare callback ran with the smaller hot target and the
@@ -162,7 +178,7 @@ public final class AdmissionBudget: @unchecked Sendable {
     }
     private func boundLocked(count: Int, longest: Int) -> Double {
         guard count > 0, longest > 0 else { return 0 }
-        return Double(count) * (3 * (historyBytes(longest) + 512 * bytesPerToken) + fixedBytesPerSequence)
+        return Double(count) * (historyFactor * (historyBytes(longest) + 512 * bytesPerToken) + fixedBytesPerSequence)
     }
     public func release(_ id: Int) { lock.lock(); lengths[id] = nil; committed[id] = nil; lock.unlock() }
     public var active: Int { lock.lock(); defer { lock.unlock() }; return lengths.count }
@@ -182,6 +198,7 @@ public final class AdmissionBudget: @unchecked Sendable {
                 "pressure_ceiling_factor": pressureFactor, "admissions_paused": paused ? 1 : 0,
                 "pressure_refusals": Double(pausedRefusals),
                 "admission_growth_window": Double(growthWindow), "active_committed_bytes": committedBytes,
+                "admission_history_factor": historyFactor,
                 "max_committed_length": Double(committed.values.max() ?? 0),
                 "admission_growths": Double(growths), "admission_growths_refused": Double(growthsRefused)]
     }

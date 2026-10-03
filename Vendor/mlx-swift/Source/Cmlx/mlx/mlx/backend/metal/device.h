@@ -163,6 +163,7 @@ class MLX_API CommandEncoder {
   // INST-ENG-022. Two samples per dispatch: 2k before, 2k+1 after.
   NS::SharedPtr<MTL::CounterSampleBuffer> ktimer_buf_;
   std::vector<const std::string*> ktimer_names_;
+  std::vector<std::string> nt_names_;   // ENGINE_GPU_LEDGER_NAMETIME: kernel names of the open buffer
   int ktimer_n_{0};
   void ktimer_sample(bool pre);
 };

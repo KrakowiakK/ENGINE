@@ -81,8 +81,12 @@ public final class HotPrefixStore {
         public let head: [String: MLXArray]
         public let bytes: Int
         public let canonical: CanonicalPrefillOrigin?
+        /// What the strict budget charges for this rung (its arrays' bytes plus the allocator slack each), computed ONCE:
+        /// the totals walk every rung of every entry, and asking MLX for each array's size there was per-step host work.
+        public let charged: Int
         public init(length: Int, head: [String: MLXArray], bytes: Int, canonical: CanonicalPrefillOrigin? = nil) {
             self.length = length; self.head = head; self.bytes = bytes; self.canonical = canonical
+            self.charged = head.values.reduce(0) { $0 + $1.nbytes + HotPrefixStore.backingSlack }
         }
         public var metadata: [String: Int] {
             ["length": length, "origin": canonical?.kind.rawValue ?? 0,
@@ -103,8 +107,17 @@ public final class HotPrefixStore {
         /// The MTP head's rows are valid to here (0: the sequence never drafted). A request that
         /// joined a batch retired its draft state part-way, so this can be short of the trunk.
         let mtpValidTo: Int
-        let rungs: [Rung]           // ascending by length; geometry is immutable after construction
+        /// Ascending by length. Mutable only by `trimRung` (2026-10-01): pressure may drop a rung that never served a
+        /// hit before it evicts whole entries; the rows stay, so every remaining rung still resumes exactly as before.
+        var rungs: [Rung] { didSet { HotPrefixStore.rungClock &+= 1 } }
+        /// Lengths of the rungs that have served at least one hit (a trim never takes them).
+        var usedRungLengths: Set<Int> = []
         var lastUse: Date
+        /// Store-local event ticks (deterministic, unlike `Date`): when the entry was stored and when it last served a
+        /// hit. Eviction affinity (P100) treats an entry as dominated by a newer one only if it has NOT served a hit
+        /// since that newer entry was stored (`lastTick <= newer.createdTick`).
+        var createdTick = 0
+        var lastTick = 0
         let rowBytes: Int
         /// P103: a PARTIAL entry written mid-prefill so that identical prompts arriving together share one prefill
         /// (P100's coalescing). It carries one rung and, from the plain path, no MTP rows -- so it must never
@@ -113,6 +126,12 @@ public final class HotPrefixStore {
         let owner: Int
         let bytes: Int
         let chargedBytes: Int
+        /// RUNG SHARING (2026-10-01): the charge of the rows and tokens alone. Ordinary entries are charged to the
+        /// store by this plus each DISTINCT rung once (`uniqueRungTotals`), because entries whose token prefix is
+        /// the same share one rung object instead of each holding a copy.
+        let rowCharged: Int
+        /// FNV-1a hash of `tokens[0 ..< rungs[i].length]` for each rung, the key a later store matches against.
+        var rungHashes: [UInt64] = []
         /// P119: a SHARED-PREFIX entry (`sharedEntries`, never in `entries`): exactly `sharedPrefixLength` tokens, rows
         /// sliced to them, one rung at that length. `sharedMTPNextToken` is the MTP head's shifted input at the rung
         /// (the prompt's token at index `sharedPrefixLength`): the head's last row was computed from it, so the head
@@ -132,6 +151,7 @@ public final class HotPrefixStore {
             self.rowBytes = rowBytes
             self.bytes = rowBytes + rungs.reduce(0) { $0 + $1.bytes }
             self.chargedBytes = HotPrefixStore.charge(rows: rows, rungs: rungs, tokenCount: tokens.count)
+            self.rowCharged = HotPrefixStore.charge(rows: rows, rungs: [], tokenCount: tokens.count)
         }
     }
 
@@ -157,7 +177,11 @@ public final class HotPrefixStore {
     /// sessions share an 18k-token preamble -- let a fresh session evict another session whose own
     /// turn was under 64 tokens: the two are not the same conversation, and the rule could not tell.
     public var supersedeSlack = 16
-    private(set) var entries: [Entry] = []
+    private(set) var entries: [Entry] = [] { didSet { entriesVersion &+= 1 } }
+    /// Change counters for the memoised rung totals: `entries` (the array) and any entry's `rungs`.
+    private var entriesVersion = 0
+    nonisolated(unsafe) static var rungClock = 0
+    private var rungMemo: (version: Int, clock: Int, totals: (bytes: Int, charged: Int, refs: Int, unique: Int))?
     private var nextEntryID = 1
     /// Diagnostics for the last lookup when `debug` is on: per entry, its tokens (a COW reference),
     /// its rung lengths, and the common prefix with the prompt. The server decodes the drift point.
@@ -167,6 +191,42 @@ public final class HotPrefixStore {
     /// overwrites `lastDebug` between a lookup and its reader's next owner job, so a reader checks this first.
     public private(set) var lastDebugQuery: [Int] = []
     public private(set) var hits = 0, misses = 0, stores = 0, evictions = 0
+    private var tick = 0
+
+    /// EVICTION REGRET (2026-10-01): the tokens of the last `regretLedgerCapacity` evicted entries (no arrays) and
+    /// the rung lengths they held. A lookup whose best evicted candidate would have resumed more than one rung step
+    /// further than the hit it got counts one regretted request and the prefill tokens it lost -- the direct measure
+    /// of whether the eviction policy throws away what is about to be reused.
+    public var regretLedgerCapacity = 512
+    /// Per evicted entry, its rung lengths and the prefix hashes at them (`prefixHashes`) -- not its tokens: comparing a
+    /// request against 512 evicted token arrays cost ~1.6 ms per request at an 18k-token shared preamble and ~8.6 ms at
+    /// 100k (and could pin GBs of tokens); one hashing pass over the request now answers the same question.
+    private var evictedLedger: [(rungs: [Int], hashes: [UInt64])] = []
+    public private(set) var regretRequests = 0, regretTokens = 0
+    private func ledgerEvicted(_ e: Entry) {
+        guard regretLedgerCapacity > 0, !e.inFlight else { return }
+        let lengths = e.rungs.map(\.length)
+        let hashes = e.rungHashes.count == lengths.count ? e.rungHashes : Self.prefixHashes(e.tokens, lengths)
+        evictedLedger.append((lengths, hashes))
+        if evictedLedger.count > regretLedgerCapacity { evictedLedger.removeFirst(evictedLedger.count - regretLedgerCapacity) }
+    }
+    /// The best evicted rung a request could have resumed at: the longest evicted rung r <= ids.count - 1 whose token
+    /// prefix equals the request's (prefix hash at r); regret when it beats the hit by more than a rung step.
+    private func recordRegret(_ ids: [Int], got: Int) {
+        guard !evictedLedger.isEmpty, ids.count > 1 else { return }
+        var wanted = Set<Int>()
+        for (rungs, _) in evictedLedger { for r in rungs where r > got + rungStep && r <= ids.count - 1 { wanted.insert(r) } }
+        guard !wanted.isEmpty else { return }
+        let lengths = wanted.sorted()
+        let mine = Dictionary(uniqueKeysWithValues: zip(lengths, Self.prefixHashes(ids, lengths)))
+        var bestEvicted = 0
+        for (rungs, hashes) in evictedLedger {
+            for (k, r) in rungs.enumerated() where r > bestEvicted && k < hashes.count {
+                if let h = mine[r], h == hashes[k] { bestEvicted = r }
+            }
+        }
+        if bestEvicted > got + rungStep { regretRequests += 1; regretTokens += bestEvicted - got }
+    }
 
     /// P100: evict a DOMINATED entry first -- one whose tokens are (at least 90%) a prefix of a newer entry, i.e. the
     /// earlier turn of the same conversation -- and only then the least recently used. Under a subagent fan-out the
@@ -178,6 +238,8 @@ public final class HotPrefixStore {
     /// server; the disk-resume + coalesce interleaving reaches it on the FIRST loop iteration), and partial entries reaped.
     public var coalescedIntoNonFresh = 0
     public private(set) var inFlightReaped = 0
+    /// In-flight entries a later chunk end of the same request replaced (it is a longer prefix of the same prompt).
+    public private(set) var inFlightReplaced = 0
     public init(capBytes: Int, rungStep: Int = 512, keepDecodeRungs: Int = 2, strictBudget: Bool = false) {
         precondition(capBytes >= 0)
         self.capBytes = capBytes; self.budgetBytes = capBytes; self.strictBudget = strictBudget
@@ -186,18 +248,106 @@ public final class HotPrefixStore {
 
     public var enabled: Bool { capBytes > 0 }
     /// Includes the P119 shared-prefix entries: their bytes are charged to this store like any entry's.
-    public var totalBytes: Int { entries.reduce(0) { $0 + $1.bytes } + sharedEntries.reduce(0) { $0 + $1.bytes } }
+    public var totalBytes: Int { entries.reduce(0) { $0 + $1.rowBytes } + uniqueRungTotals().bytes + sharedEntries.reduce(0) { $0 + $1.bytes } }
     /// Ordinary entries only (finished and in-flight); the P119 shared-prefix entries are `sharedCount`.
     public var count: Int { entries.count }
     private static func charge(rows: [String: MLXArray], rungs: [Rung], tokenCount: Int) -> Int {
         rows.values.reduce(0) { $0 + $1.nbytes + backingSlack }
             + rungs.reduce(0) { total, rung in
-                total + rung.head.values.reduce(0) { $0 + $1.nbytes + backingSlack }
+                total + rung.charged
             } + tokenCount * MemoryLayout<Int>.stride
     }
     public var chargedBytes: Int {
-        entries.reduce(0) { $0 + $1.chargedBytes } + sharedChargedBytes
+        entries.reduce(0) { $0 + $1.rowCharged } + uniqueRungTotals().charged + sharedChargedBytes
     }
+    private static func rungCharge(_ r: Rung) -> Int { r.charged }
+    /// Distinct rung objects among the ordinary entries (identity of their first head array) and what they weigh.
+    /// Length of the common prefix of `a` and `b` (at most `limit`), compared 64 tokens at a time with memcmp and then
+    /// token by token inside the first differing block -- the same answer as the element loop, an order of magnitude
+    /// less host time on the long shared preambles agents send (every lookup, store and eviction runs it on the model thread).
+    static func commonPrefix(_ a: [Int], _ b: [Int], limit: Int = .max) -> Int {
+        let n = min(a.count, b.count, limit)
+        return a.withUnsafeBufferPointer { pa in b.withUnsafeBufferPointer { pb in
+            var p = 0
+            let block = 64, stride = block * MemoryLayout<Int>.stride
+            while p + block <= n, memcmp(pa.baseAddress! + p, pb.baseAddress! + p, stride) == 0 { p += block }
+            while p < n && pa[p] == pb[p] { p += 1 }
+            return p
+        } }
+    }
+    /// Common-prefix lengths of entry pairs by id (tokens never change after a store), for the dominance test.
+    private var pairPrefixMemo: [UInt64: Int] = [:]
+    private func pairCommonPrefix(_ x: Entry, _ y: Entry) -> Int {
+        let key = UInt64(UInt32(truncatingIfNeeded: min(x.id, y.id))) << 32 | UInt64(UInt32(truncatingIfNeeded: max(x.id, y.id)))
+        if let v = pairPrefixMemo[key] { return v }
+        if pairPrefixMemo.count > 200_000 { pairPrefixMemo.removeAll(keepingCapacity: true) }
+        let v = Self.commonPrefix(x.tokens, y.tokens)
+        pairPrefixMemo[key] = v
+        return v
+    }
+
+    /// Memoised until `entries` or any entry's rungs change: the serve loop reads `snapshot()` (three calls) on EVERY decode
+    /// step, and recomputing walked every rung's head arrays -- with ~70 entries after a busy spell that host work made the
+    /// GPU wait (ledger host_late 8-10 -> 27-31 ms per window) and single-stream decode fell ~6% until a restart.
+    private func uniqueRungTotals() -> (bytes: Int, charged: Int, refs: Int, unique: Int) {
+        if let m = rungMemo, m.version == entriesVersion, m.clock == Self.rungClock { return m.totals }
+        let t = computeUniqueRungTotals()
+        rungMemo = (entriesVersion, Self.rungClock, t)
+        return t
+    }
+    private func computeUniqueRungTotals() -> (bytes: Int, charged: Int, refs: Int, unique: Int) {
+        var seen = Set<ObjectIdentifier>(); var bytes = 0, charged = 0, refs = 0
+        for e in entries {
+            for r in e.rungs {
+                refs += 1
+                guard let a = r.head.values.first else { continue }
+                if seen.insert(ObjectIdentifier(a)).inserted { bytes += r.bytes; charged += Self.rungCharge(r) }
+            }
+        }
+        return (bytes, charged, refs, seen.count)
+    }
+    /// FNV-1a over the token prefix at each length (one pass; `lengths` in any order).
+    static func prefixHashes(_ tokens: [Int], _ lengths: [Int]) -> [UInt64] {
+        let order = lengths.enumerated().sorted { $0.element < $1.element }
+        var out = [UInt64](repeating: 0, count: lengths.count)
+        var h: UInt64 = 0xcbf29ce484222325, i = 0
+        for (slot, len) in order {
+            while i < min(len, tokens.count) { h = (h ^ UInt64(bitPattern: Int64(tokens[i]))) &* 0x100000001b3; i += 1 }
+            out[slot] = h ^ UInt64(len)
+        }
+        return out
+    }
+    public private(set) var rungDedupHits = 0
+    /// RUNG TRIM (2026-10-01): under pressure, before any whole entry is evicted, drop rungs that never served a hit --
+    /// from the least recently used entry first, its longest such rung first, only between its reserve rung (prompt - 1)
+    /// and its last (final) rung, and never a rung another entry shares. A single-turn agent loop resumes only at the prompt-end rung; the decode-window rungs
+    /// (~115 MB each on E9) of every entry sat unused and cost about half the store. Off = whole-entry eviction only.
+    public var rungTrim = true
+    public private(set) var rungsTrimmed = 0
+    /// (entry index, rung index) of the next rung to trim, or nil when none qualifies.
+    private func trimCandidate() -> (Int, Int)? {
+        var holders: [ObjectIdentifier: Int] = [:]
+        for e in entries { for r in e.rungs { if let a = r.head.values.first { holders[ObjectIdentifier(a), default: 0] += 1 } } }
+        for i in entries.indices.sorted(by: { entries[$0].lastUse < entries[$1].lastUse }) {
+            let e = entries[i]
+            guard !e.inFlight, e.rungs.count > 2 else { continue }
+            // The server stores a RESERVE rung at prompt - 1 next to the prompt-end rung (lengths L and L + 1): it is
+            // where a repeated prompt resumes, and the rungs below it are prefix rungs other prompts share. Only the
+            // rungs strictly between the reserve and the final state (the prompt end and the decode window) qualify;
+            // an entry without that pair is left whole.
+            guard let reserve = (0 ..< (e.rungs.count - 1)).last(where: { e.rungs[$0 + 1].length == e.rungs[$0].length + 1 }),
+                  reserve + 1 <= e.rungs.count - 2 else { continue }
+            for k in stride(from: e.rungs.count - 2, through: reserve + 1, by: -1) {
+                let r = e.rungs[k]
+                guard !e.usedRungLengths.contains(r.length), let a = r.head.values.first,
+                      holders[ObjectIdentifier(a)] == 1 else { continue }
+                return (i, k)
+            }
+        }
+        return nil
+    }
+    /// Rung sharing on (default); off stores every rung as its own copy, as before 2026-10-01.
+    public var rungSharing = true
     /// Model owner only. Shrinks before new allocations, including to zero entries.
     /// A failed reclaim is a refused admission, never permission to overshoot.
     /// P119: the shared-prefix entries beyond their protected share of the NEW budget go first (least recently used);
@@ -220,7 +370,10 @@ public final class HotPrefixStore {
                  "charged_bytes": chargedBytes, "entries": count, "rungs": entries.reduce(0) { $0 + $1.rungs.count },
                  "strict_budget": strictBudget ? 1 : 0, "rejected_stores": rejectedStores,
                  "pre_copy_evictions": preCopyEvictions, "copy_attempts": copyAttempts,
-                 "inflight_entries": entries.filter { $0.inFlight }.count]
+                 "inflight_entries": entries.filter { $0.inFlight }.count,
+                 "eviction_regret_requests": regretRequests, "eviction_regret_tokens": regretTokens,
+                 "evicted_ledger": evictedLedger.count, "rung_dedup_hits": rungDedupHits, "rungs_trimmed": rungsTrimmed, "inflight_replaced": inFlightReplaced,
+                 "rung_refs": uniqueRungTotals().refs, "rung_unique": uniqueRungTotals().unique]
         if sharedPrefixEnabled {
             d["shared_entries"] = sharedEntries.count; d["shared_logical_bytes"] = sharedLogicalBytes
             d["shared_charged_bytes"] = sharedChargedBytes; d["shared_capture_evictions"] = sharedCaptureEvictions
@@ -249,6 +402,12 @@ public final class HotPrefixStore {
     public var anchorStep = 0
     public var anchorWindow = 0
     var anchorSlots: Int { anchorStep > 0 && anchorWindow > 0 ? anchorWindow / anchorStep + 1 : 0 }
+    /// Long-document spine (live AND store-time): besides the rungs above, the highest middle rung of every
+    /// `spineStep`-wide band at or past `spineStep` -- so a 1M-token document re-sent with a different tail resumes
+    /// within one band of the divergence instead of from its first two rungs (a 1M cold prefill is ~19 min). A row of
+    /// length L holds at most `spineSlots(L)` such rungs; the admission charges them with the row's history. 0 = off.
+    public var spineStep = 0
+    public func spineSlots(_ length: Int) -> Int { spineStep > 0 ? length / spineStep : 0 }
 
     /// The first two captures plus the last `keepDecodeRungs + 1` captures: the LIVE limit (admission reserves it per row).
     /// The extra last entry is needed even when final store cannot capture a new final rung.
@@ -267,13 +426,18 @@ public final class HotPrefixStore {
             }.map { $0.element }
         guard ordered.count > retainedRungLimit else { return ordered }
         let tail = ordered.count - (keepDecodeRungs + 1)
+        // per spine band past the first, the highest middle rung
+        var spine: [Int: Int] = [:]
+        if spineStep > 0 { for i in 2 ..< tail where ordered[i].length >= spineStep { spine[ordered[i].length / spineStep] = i } }
         guard anchors, anchorSlots > 0, let top = ordered.last?.length else {
-            return Array(ordered.prefix(2)) + Array(ordered.suffix(keepDecodeRungs + 1))
+            if spine.isEmpty { return Array(ordered.prefix(2)) + Array(ordered.suffix(keepDecodeRungs + 1)) }
+            let keep = Set(spine.values)
+            return ordered.enumerated().filter { i, _ in i < 2 || i >= tail || keep.contains(i) }.map { $0.element }
         }
         // per band inside the window, the highest middle rung (the last index of that band among the middle ones)
         var pick: [Int: Int] = [:]
         for i in 2 ..< tail where ordered[i].length >= top - anchorWindow { pick[ordered[i].length / anchorStep] = i }
-        let keep = Set(pick.values)
+        let keep = Set(pick.values).union(spine.values)
         return ordered.enumerated().filter { i, _ in i < 2 || i >= tail || keep.contains(i) }.map { $0.element }
     }
 
@@ -373,11 +537,16 @@ public final class HotPrefixStore {
         let length = tokens.count
         var ladder = retainedRungs(rungs, validTo: min(length, rowsValidTo), anchors: true)
         guard !ladder.isEmpty else { return }
+        // An in-flight store replaces its own request's previous one: that entry is a shorter prefix of the same prompt,
+        // so a coalescing reader only ever wants the newest. Kept, they stacked one row copy per chunk end -- a 300k
+        // prefill filled the 192 GB store with its own partial copies and evicted every other conversation.
+        if inFlight, owner >= 0 {
+            let before = entries.count
+            entries.removeAll { $0.inFlight && $0.owner == owner }
+            inFlightReplaced += before - entries.count
+        }
         func commonPrefix(_ old: Entry) -> Int {
-            let n = min(old.tokens.count, length)
-            var common = 0
-            while common < n && old.tokens[common] == tokens[common] { common += 1 }
-            return common
+            Self.commonPrefix(old.tokens, tokens, limit: length)
         }
         func superseded(_ old: Entry) -> Bool {
             guard !inFlight, !old.inFlight else { return false }
@@ -395,8 +564,25 @@ public final class HotPrefixStore {
             }
             if !carried.isEmpty { ladder = retainedRungs(carried + ladder, validTo: min(length, rowsValidTo), anchors: true) }
         }
+        // RUNG SHARING: a rung whose token prefix, length and certificate another entry already holds is that entry's
+        // rung object -- same tokens, same state; a lookup would resume from either -- so it is neither copied nor
+        // charged again. Hash first, then the tokens themselves, so a hash collision can never share a wrong state.
+        let rungHashes = Self.prefixHashes(tokens, ladder.map(\.length))
+        var pooled: [UInt64: (Entry, Int)] = [:]
+        for e in entries { for (k, h) in e.rungHashes.enumerated() where k < e.rungs.count { pooled[h] = (e, k) } }
+        var reused = Set<Int>()
+        if rungSharing, !pooled.isEmpty {
+            ladder = ladder.enumerated().map { k, r in
+                guard let (e, idx) = pooled[rungHashes[k]], e.rungs[idx].length == r.length, e.rungs[idx].canonical == r.canonical,
+                      e.tokens.count >= r.length, tokens.count >= r.length,
+                      e.tokens[0 ..< r.length] == tokens[0 ..< r.length] else { return r }
+                reused.insert(k); rungDedupHits += 1
+                return e.rungs[idx]
+            }
+        }
         if strictBudget {
-            let incoming = Self.charge(rows: rows, rungs: ladder, tokenCount: tokens.count)
+            let incoming = Self.charge(rows: rows, rungs: ladder.enumerated().filter { !reused.contains($0.offset) }.map(\.element),
+                                       tokenCount: tokens.count)
             // Refuse before deleting a useful predecessor or constructing copy graphs.
             // P119: the shared-prefix entries stay (ordinary pressure does not evict them), so they are not room.
             guard incoming <= budgetBytes - sharedChargedBytes else { rejectedStores += 1; return }
@@ -412,12 +598,15 @@ public final class HotPrefixStore {
         // retained row must not pin all other rows while being charged only its own nbytes.
         // In-flight entries need the same rule: native prefill can supply their views too.
         let ownedRows = Self.compact(rows)
-        ladder = ladder.map { rung in
+        ladder = ladder.enumerated().map { k, rung in
+            guard !reused.contains(k) else { return rung }   // a shared rung keeps its identity: copying it would duplicate it
             let head = Self.compact(rung.head)
             return Rung(length: rung.length, head: head, bytes: head.values.reduce(0) { $0 + $1.nbytes }, canonical: rung.canonical)
         }
         let e = Entry(tokens: tokens, rows: ownedRows, rowsValidTo: rowsValidTo, mtpValidTo: mtpValidTo, rungs: ladder, inFlight: inFlight, owner: owner, id: nextEntryID)
         nextEntryID += 1
+        e.rungHashes = rungHashes
+        tick += 1; e.createdTick = tick; e.lastTick = tick
         // Superseded: an older entry that is a prefix of this one, or nearly so -- a previous turn
         // whose tokens the new prompt re-rendered with a different last token or two (an empty
         // think block, a re-ordered tool call) is still the same conversation, one turn behind.
@@ -457,21 +646,31 @@ public final class HotPrefixStore {
                 sharedEntries.remove(at: i); sharedForcedEvictions += 1
                 continue
             }
+            if rungTrim, let (i, k) = trimCandidate() {
+                entries[i].rungs.remove(at: k)
+                if k < entries[i].rungHashes.count { entries[i].rungHashes.remove(at: k) }
+                rungsTrimmed += 1
+                continue
+            }
             var victim: Int? = nil
             if evictAffinity {
-                // dominated: a NEWER entry (appended later) shares at least 90% of this entry's own tokens
+                // dominated: a NEWER entry (appended later) shares at least 90% of this entry's own tokens AND this entry
+                // has served no hit since that newer entry was stored. The recency condition (2026-09-30) keeps sibling
+                // prompts that share a long preamble -- an agent loop re-sending the same few prompts -- from dominating
+                // each other: at 128 GB the store evicted still-reused prompts (95% common prefix with a sibling) ahead of
+                // idle entries. A conversation's previous turn that nobody resumes stays dominated as before (P100).
                 let dominated = entries.indices.filter { i in
                     let a = entries[i].tokens
                     return (i + 1 ..< entries.count).contains { j in
-                        let b = entries[j].tokens; let n = min(a.count, b.count)
-                        var p = 0
-                        while p < n && a[p] == b[p] { p += 1 }
+                        guard entries[i].lastTick <= entries[j].createdTick else { return false }
+                        let p = pairCommonPrefix(entries[i], entries[j])
                         return p * 10 >= a.count * 9
                     }
                 }
                 victim = dominated.min { entries[$0].lastUse < entries[$1].lastUse }
             }
             let i = victim ?? entries.indices.min { entries[$0].lastUse < entries[$1].lastUse }!
+            ledgerEvicted(entries[i])
             entries.remove(at: i); evictions += 1
         }
         // Only the legacy fixed-cap policy retains one oversized entry.
@@ -767,9 +966,7 @@ public final class HotPrefixStore {
         func best(_ candidates: [Entry], mtpOnly: Bool) -> Hit? {
             var best: Hit? = nil
             for e in candidates {
-                let n = min(e.tokens.count, ids.count)
-                var p = 0
-                while p < n && e.tokens[p] == ids[p] { p += 1 }
+                let p = Self.commonPrefix(e.tokens, ids)
                 var limit = min(p, ids.count - 1, e.rowsValidTo)
                 if mtpOnly { limit = min(limit, e.mtpValidTo) }
                 guard limit >= minLength else { continue }
@@ -816,12 +1013,11 @@ public final class HotPrefixStore {
         }
         if quiet { if found != nil { coalescedHits += 1 }; return found }
         if found != nil { hits += 1 } else { misses += 1 }
+        if canonicalWidth == nil { recordRegret(ids, got: found?.length ?? 0) }
         if debug {
             lastDebugQuery = ids
             lastDebug = entries.map { e in
-                let n = min(e.tokens.count, ids.count)
-                var p = 0
-                while p < n && e.tokens[p] == ids[p] { p += 1 }
+                let p = Self.commonPrefix(e.tokens, ids)
                 return (e.tokens, e.rungs.map { $0.length }, p, e.mtpValidTo)
             }
         }
@@ -853,6 +1049,8 @@ public final class HotPrefixStore {
             d[k] = ax == 2 ? v[0..., 0..., 0 ..< n, 0...] : v[0..., 0 ..< n, 0...]
         }
         e.lastUse = Date()
+        tick += 1; e.lastTick = tick
+        e.usedRungLengths.insert(M)
         if e.shared { sharedHits += 1; touchShared(e) }
         // A short imported prefix must not keep a full long donor alive after that
         // donor is evicted and its cache charge released. Evaluate the detaching

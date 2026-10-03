@@ -46,6 +46,8 @@ enum KernelBench {
         if args.contains("moe-decode") { return try moeDecode(args) }
         if args.contains("head") { return try headBench(args) }
         if args.contains("gather") { return gatherBench(args) }
+        if args.contains("qmmsweep") { return try qmmSweep(args) }
+        if args.contains("readbw") { return try readBW(args) }
         if args.contains("proj") { return try projBench(args) }
         if args.contains("gdn") { return try gdnBench(args) }
         if args.contains("topk") { return try topkBench(args) }
@@ -355,6 +357,162 @@ enum KernelBench {
     /// `--case proj`: the dense projections of one attention layer (qkvi, o_proj) and one GDN layer
     /// (in_proj_qkvz, out_proj) at M rows exactly as MLX dispatches them (qmv_fast below 12 rows, M on the
     /// grid, the weight streamed per row). Floor: the weight once. The M=1 multiple is the per-row cost.
+    /// `engine kernelbench qmmsweep [--k 2560,6144] [--n ...] [--m ...] [--bytes 1.5e9] [--reps 7]`
+    /// Dense 8-bit g64 transposed quantized matmul (the engine's projections) on SYNTHETIC weights, timed the way the forward
+    /// runs them: a DEPENDENT chain (each call's input waits for the previous output through a zero-weighted add), over R
+    /// distinct matrices rotated so one chain streams >= --bytes from DRAM (one matrix re-read every call would sit in the
+    /// SLC). The dependency alone (the same two tiny ops without the matmul) is timed too and reported, so a kernel's own
+    /// time is `us - dep`. Whatever path MLX picks (qmv / xr8 / qmm / qmm_splitk, the ENGINE_QMM_* knobs) is what runs:
+    /// confirm it with ENGINE_QMM_TRACE=1.
+    static func qmmSweep(_ args: [String]) throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        func ints(_ key: String, _ dflt: String) -> [Int] { (argValue(args, key) ?? dflt).split(separator: ",").compactMap { Int($0) } }
+        let Ks = ints("--k", "2560,6144"), Ns = ints("--n", "1280,2560,5120,8192,16384"), Ms = ints("--m", "1,4,5,8,12,16,24,32")
+        let budget = Double(argValue(args, "--bytes") ?? "1.5e9") ?? 1.5e9
+        let reps = Int(argValue(args, "--reps") ?? "7") ?? 7
+        let env = ProcessInfo.processInfo.environment
+        let knobs = ["ENGINE_QMM_SMALL_M", "ENGINE_QMM_TILE", "ENGINE_QMM_SMALL_MIN_N", "ENGINE_QMV_LIMIT", "ENGINE_QMV_LIMIT_NARROW",
+                     "ENGINE_QMM_SMALL_NOSPLIT", "ENGINE_QMM_SPLIT_TILE", "ENGINE_QMM_SPLIT_TILE_MAX_M", "ENGINE_QMM_SPLIT_K", "ENGINE_QMM_SPLIT_TGS"]
+        print("engine kernelbench qmmsweep: VENDORED mlx, 8-bit g64, dependent chains, knobs: " + knobs.map { "\($0)=\(env[$0] ?? "-")" }.joined(separator: " "))
+        MLXRandom.seed(7)
+        // --shapes NxK,NxK,... (the model's projection shapes) instead of the --k x --n cross product
+        let shapes: [(n: Int, k: Int)] = argValue(args, "--shapes").map { list in
+            list.split(separator: ",").compactMap { p -> (n: Int, k: Int)? in
+                let d = p.split(separator: "x").compactMap { Int($0) }; return d.count == 2 ? (n: d[0], k: d[1]) : nil }
+        } ?? Ks.flatMap { k in Ns.map { (n: $0, k: k) } }
+        for (N, K) in shapes {
+            do {
+                let perMatrix = Double(N * K) * (1.0 + 4.0 / 64.0)          // 8-bit weights + bf16 scale and bias per 64
+                let R = max(8, min(256, Int((budget / perMatrix).rounded(.up))))
+                var mats: [(MLXArray, MLXArray, MLXArray)] = []
+                for _ in 0 ..< R {
+                    let wf = (MLXRandom.normal([N, K]) * 0.02).asType(.bfloat16)
+                    let q = quantized(wf, groupSize: 64, bits: 8)
+                    eval(q.wq, q.scales, q.biases!)
+                    mats.append((q.wq, q.scales, q.biases!))
+                }
+                // numerics (gate G2b): the first matrix through the dispatched kernel against a float32 matmul of its dequantized
+                // weights; a bf16 result is off by ~2^-8 of the output scale, a broken kernel by ~1
+                let wd0 = dequantized(mats[0].0, scales: mats[0].1, biases: mats[0].2, groupSize: 64, bits: 8).asType(.float32)
+                for M in Ms {
+                    let x = (MLXRandom.normal([M, K]) * 0.5).asType(.bfloat16); eval(x)
+                    let y0 = quantizedMatmul(x, mats[0].0, scales: mats[0].1, biases: mats[0].2, transpose: true, groupSize: 64, bits: 8).asType(.float32)
+                    let yr = matmul(x.asType(.float32), wd0.transposed())
+                    let relErr = (abs(y0 - yr).max() / abs(yr).max()).item(Float.self)
+                    func chain(_ withMatmul: Bool) -> MLXArray {
+                        var xi = x; var last = x
+                        for (w, sc, bi) in mats {
+                            let y = withMatmul ? quantizedMatmul(xi, w, scales: sc, biases: bi, transpose: true, groupSize: 64, bits: 8) : xi
+                            last = y
+                            xi = x + (y[0 ..< 1, 0 ..< 1] * 0).asType(.bfloat16)
+                        }
+                        return last
+                    }
+                    let ms = timed(reps) { chain(true) } / Double(R)
+                    let dep = timed(reps) { chain(false) } / Double(R)
+                    let kern = max(1e-6, ms - dep)
+                    print(fmt("qmm sweep: K=%5d N=%6d M=%2d  %8.2f us  (dep %5.2f -> kernel %8.2f us = %5.0f GB/s)  R=%3d  %.1f MB/matrix  relerr %.2e",
+                              K, N, M, ms * 1e3, dep * 1e3, kern * 1e3, perMatrix / (kern * 1e-3) / 1e9, R, perMatrix / 1e6, Double(relErr)))
+                }
+                mats.removeAll()
+                MLX.GPU.clearCache()
+            }
+        }
+    }
+
+    /// `engine kernelbench --case readbw [--mb 512] [--bufs 8] [--reps 7]`: this machine's read ceiling measured several
+    /// ways over distinct DRAM-resident buffers (bufs x mb, far above the SLC): MLX sum, C-0053's grid-stride 16-byte kernel,
+    /// a contiguous-chunk 16-byte kernel with 4 loads in flight per thread (threadgroups x size swept), and MLX's 8-bit qmv
+    /// over matrices of the same bytes (1, 2, 4 rows). GB/s = bytes of one pass over all buffers / its median wall time.
+    static func readBW(_ args: [String]) throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let mb = Int(argValue(args, "--mb") ?? "512") ?? 512
+        let nb = Int(argValue(args, "--bufs") ?? "8") ?? 8
+        let reps = Int(argValue(args, "--reps") ?? "7") ?? 7
+        let n32 = mb * (1 << 20) / 4
+        MLXRandom.seed(3)
+        var bufs: [MLXArray] = []
+        for _ in 0 ..< nb { let b = MLXRandom.randInt(low: 0, high: 1 << 30, [n32]).asType(.uint32); eval(b); bufs.append(b) }
+        let bytes = Double(nb) * Double(n32) * 4
+        func report(_ name: String, _ ms: Double, _ b: Double) {
+            print(fmt("read bw: %@  %8.1f GB/s  (%.2f ms for %.0f MB)", name.padding(toLength: 34, withPad: " ", startingAt: 0), b / (ms * 1e-3) / 1e9, ms, b / 1e6))
+        }
+        print("engine kernelbench readbw: \(nb) buffers x \(mb) MB, \(reps) reps (median)")
+        report("mlx sum uint32", timed(reps) { MLX.stacked(bufs.map { $0.sum() }) }, bytes)
+        let n4 = MLXArray([Int32(n32 / 4)])
+        let gridStride = MLXFast.metalKernel(name: "kb_read_gridstride", inputNames: ["w", "n4"], outputNames: ["o"], source: """
+            uint gid = thread_position_in_grid.x, nth = threads_per_grid.x;
+            const device uint4* w4 = (const device uint4*)w;
+            uint4 acc = uint4(0);
+            for (ulong i = gid; i < (ulong)n4[0]; i += nth) acc ^= w4[i];
+            o[gid] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+            """)
+        for threads in [1 << 16, 1 << 18, 1 << 20] {
+            report("grid-stride uint4 \(threads) thr", timed(reps) {
+                MLX.stacked(bufs.map { gridStride([$0, n4], template: [], grid: (threads, 1, 1), threadGroup: (256, 1, 1),
+                                                  outputShapes: [[threads]], outputDTypes: [.uint32])[0].sum() }) }, bytes)
+        }
+        let chunked = MLXFast.metalKernel(name: "kb_read_chunk4", inputNames: ["w", "n4"], outputNames: ["o"], source: """
+            uint tg = threadgroup_position_in_grid.x, ntg = threadgroups_per_grid.x;
+            uint lid = thread_position_in_threadgroup.x, tpg = threads_per_threadgroup.x;
+            const device uint4* w4 = (const device uint4*)w;
+            ulong n = (ulong)n4[0]; ulong chunk = (n + ntg - 1) / ntg; ulong beg = (ulong)tg * chunk; ulong end = min(beg + chunk, n);
+            uint4 a0 = uint4(0), a1 = uint4(0), a2 = uint4(0), a3 = uint4(0);
+            ulong i = beg + lid;
+            for (; i + 3 * tpg < end; i += 4 * tpg) { a0 ^= w4[i]; a1 ^= w4[i + tpg]; a2 ^= w4[i + 2 * tpg]; a3 ^= w4[i + 3 * tpg]; }
+            for (; i < end; i += tpg) a0 ^= w4[i];
+            uint4 a = a0 ^ a1 ^ a2 ^ a3;
+            o[tg * tpg + lid] = a.x ^ a.y ^ a.z ^ a.w;
+            """)
+        for (ntg, tpg) in [(320, 256), (640, 256), (1280, 256), (2560, 256), (640, 1024), (1280, 1024)] {
+            report("chunk4 uint4 \(ntg) tg x \(tpg)", timed(reps) {
+                MLX.stacked(bufs.map { chunked([$0, n4], template: [], grid: (ntg * tpg, 1, 1), threadGroup: (tpg, 1, 1),
+                                               outputShapes: [[ntg * tpg]], outputDTypes: [.uint32])[0].sum() }) }, bytes)
+        }
+        // DEPENDENT chain (each read waits for the previous one, like a model's layer sequence): per-dispatch ramp-up and
+        // tail are not hidden by overlap here
+        let chainK = MLXFast.metalKernel(name: "kb_read_chunk4_dep", inputNames: ["w", "n4", "dep"], outputNames: ["o"], source: """
+            uint tg = threadgroup_position_in_grid.x, ntg = threadgroups_per_grid.x;
+            uint lid = thread_position_in_threadgroup.x, tpg = threads_per_threadgroup.x;
+            const device uint4* w4 = (const device uint4*)w;
+            ulong n = (ulong)n4[0]; ulong chunk = (n + ntg - 1) / ntg; ulong beg = (ulong)tg * chunk; ulong end = min(beg + chunk, n);
+            uint4 a0 = uint4(dep[0]), a1 = uint4(0), a2 = uint4(0), a3 = uint4(0);
+            ulong i = beg + lid;
+            for (; i + 3 * tpg < end; i += 4 * tpg) { a0 ^= w4[i]; a1 ^= w4[i + tpg]; a2 ^= w4[i + 2 * tpg]; a3 ^= w4[i + 3 * tpg]; }
+            for (; i < end; i += tpg) a0 ^= w4[i];
+            uint4 a = a0 ^ a1 ^ a2 ^ a3;
+            o[tg * tpg + lid] = a.x ^ a.y ^ a.z ^ a.w;
+            """)
+        for (ntg, tpg) in [(640, 256), (2560, 256)] {
+            report("DEP chain chunk4 \(ntg) tg x \(tpg)", timed(reps) {
+                var dep = MLXArray([UInt32(0)])
+                for b in bufs {
+                    let o = chainK([b, n4, dep], template: [], grid: (ntg * tpg, 1, 1), threadGroup: (tpg, 1, 1),
+                                   outputShapes: [[ntg * tpg]], outputDTypes: [.uint32])[0]
+                    dep = o[0 ..< 1]
+                }
+                return dep }, bytes)
+        }
+        report("DEP chain mlx sum", timed(reps) {
+            var dep = MLXArray([UInt32(0)])
+            for b in bufs { dep = (b.sum() + dep).reshaped([1]) }
+            return dep }, bytes)
+        bufs.removeAll(); MLX.GPU.clearCache()
+        // MLX's 8-bit qmv over matrices of about the same bytes (K = 2560, as lm_head)
+        let K = 2560, N = (mb * (1 << 20)) / Int(Double(K) * 1.0625) / 64 * 64
+        var mats: [(MLXArray, MLXArray, MLXArray)] = []
+        for _ in 0 ..< nb {
+            let q = quantized((MLXRandom.normal([N, K]) * 0.02).asType(.bfloat16), groupSize: 64, bits: 8)
+            eval(q.wq, q.scales, q.biases!); mats.append((q.wq, q.scales, q.biases!))
+        }
+        let qbytes = Double(nb) * Double(N * K) * 1.0625
+        for M in [1, 2, 4] {
+            let x = (MLXRandom.normal([M, K]) * 0.5).asType(.bfloat16); eval(x)
+            report("mlx qmv 8-bit \(N)x\(K) M=\(M)", timed(reps) {
+                MLX.stacked(mats.map { quantizedMatmul(x, $0.0, scales: $0.1, biases: $0.2, transpose: true, groupSize: 64, bits: 8).sum() }) }, qbytes)
+        }
+    }
+
     static func projBench(_ args: [String]) throws {
         setvbuf(stdout, nil, _IOLBF, 0)
         let attnPath = argValue(args, "--file") ?? "runs/flashnext/attn_l3_e9.safetensors"

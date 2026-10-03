@@ -14,6 +14,7 @@
 // needed key vanishes (eviction) or never lands, the waiter claims and encodes it
 // itself.
 import Foundation
+import EngineServeSupport
 import CryptoKit
 import MLXLMCommon
 import Tokenizers
@@ -167,7 +168,7 @@ final class TemplateTokenCache: @unchecked Sendable {
     private let addedSet: Set<String>
     private let cond = NSCondition()        // its lock is the single bookkeeping lock
     private var table: [String: [Int32]] = [:]
-    private var lru: [String] = []          // oldest first
+    private var lru = KeyLRU()              // use order, oldest first; O(1) per touch (EngineServeSupport)
     private var bytesUsed = 0
     private var inFlight: Set<String> = []
     private var stat = Stats()
@@ -203,11 +204,10 @@ final class TemplateTokenCache: @unchecked Sendable {
     private func insertLocked(_ key: String, ids: [Int]) {
         let entry = ids.map { Int32(clamping: $0) }
         table[key] = entry
-        lru.append(key)
+        lru.touch(key)
         bytesUsed += 4 * entry.count
         inFlight.remove(key)
-        while bytesUsed > capacityBytes, let evict = lru.first {
-            lru.removeFirst()
+        while bytesUsed > capacityBytes, let evict = lru.popOldest() {
             if let e = table.removeValue(forKey: evict) {
                 bytesUsed -= 4 * e.count
                 stat.evictions += 1
@@ -274,7 +274,7 @@ final class TemplateTokenCache: @unchecked Sendable {
                 if let cached = table[k] {
                     stat.segmentHits += 1
                     detail.cachedSegments += 1
-                    lru.removeAll { $0 == k }; lru.append(k)
+                    lru.touch(k)
                     cond.unlock()
                     out.append(contentsOf: cached.map { Int($0) })
                     break

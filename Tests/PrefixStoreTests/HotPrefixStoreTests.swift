@@ -210,6 +210,101 @@ final class HotPrefixStoreTests: XCTestCase {
         XCTAssertEqual(off.count, 0); XCTAssertNil(off.lookup(c + [1]))
     }
 
+    /// 2026-09-30: eviction affinity must not treat a recently used sibling as dominated. Two prompts share a long
+    /// preamble (>= 90% of the first), the first keeps serving hits after the second was stored, and a third store
+    /// makes room: the idle sibling goes, the reused one stays. A previous turn nobody resumes is still dominated.
+    func testDominatedEvictionSparesASiblingThatKeepsServingHits() {
+        let pre = Array(0 ..< 360)
+        let a = pre + Array(900 ..< 920)            // 380 tokens, 360 shared with b (94.7%, like the logged 2377/2504)
+        let b = pre + Array(700 ..< 720)            // 20 differing tokens: more than supersedeSlack (16), so not a turn
+        let c = Array(3000 ..< 3380)
+        let probe = HotPrefixStore(capBytes: 1 << 30, rungStep: 4)
+        probe.store(tokens: a, rows: rows(T: 380, salt: 0, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 0)])
+        probe.store(tokens: b, rows: rows(T: 380, salt: 1, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 1)])
+        let store = HotPrefixStore(capBytes: probe.totalBytes + 1, rungStep: 4)   // room for two entries, not three
+        store.store(tokens: a, rows: rows(T: 380, salt: 0, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 0)])
+        store.store(tokens: b, rows: rows(T: 380, salt: 1, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 1)])
+        // a keeps being used after b was stored
+        let hit = store.lookup(a + [1])
+        XCTAssertEqual(hit?.length, 380)
+        XCTAssertNotNil(store.exported(hit!, ratio: ratio))
+        store.store(tokens: c, rows: rows(T: 380, salt: 2, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 2)])
+        XCTAssertEqual(store.evictions, 1)
+        XCTAssertEqual(store.lookup(a + [1])?.length, 380, "the reused sibling must survive")
+        XCTAssertNil(store.lookup(b + [1]).flatMap { $0.length == 380 ? $0 : nil }, "the idle sibling is the victim")
+        // without the later hit, a is dominated by b and goes first (P100 unchanged)
+        let idle = HotPrefixStore(capBytes: probe.totalBytes + 1, rungStep: 4)
+        idle.store(tokens: a, rows: rows(T: 380, salt: 0, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 0)])
+        idle.store(tokens: b, rows: rows(T: 380, salt: 1, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 1)])
+        idle.store(tokens: c, rows: rows(T: 380, salt: 2, mtp: false), rowsValidTo: 380, mtpValidTo: 0, rungs: [rung(380, salt: 2)])
+        XCTAssertEqual(idle.lookup(b + [1])?.length, 380)
+        XCTAssertNil(idle.lookup(a + [1]).flatMap { $0.length == 380 ? $0 : nil })
+    }
+
+    /// 2026-10-01 RUNG SHARING: siblings with the same token prefix hold ONE rung object for that prefix, it is
+    /// charged once, a lookup still resumes from it, and evicting one sibling leaves the other its rung.
+    func testSiblingsShareThePrefixRungAndItIsChargedOnce() {
+        let pre = Array(0 ..< 360)
+        let a = pre + Array(900 ..< 920), b = pre + Array(700 ..< 720)
+        func store(_ s: HotPrefixStore, _ t: [Int], _ salt: Float) {
+            s.store(tokens: t, rows: rows(T: 380, salt: salt, mtp: false), rowsValidTo: 380, mtpValidTo: 0,
+                    rungs: [rung(360, salt: salt), rung(380, salt: salt)])
+        }
+        let solo = HotPrefixStore(capBytes: 1 << 30, rungStep: 4, strictBudget: true)
+        store(solo, a, 0)
+        let both = HotPrefixStore(capBytes: 1 << 30, rungStep: 4, strictBudget: true)
+        store(both, a, 0); store(both, b, 1)
+        XCTAssertEqual(both.rungDedupHits, 1, "b's prefix rung at 360 is a's")
+        let snap = both.snapshot()
+        XCTAssertEqual(snap["rung_refs"], 4); XCTAssertEqual(snap["rung_unique"], 3)
+        // two entries cost less than twice one: the shared rung is charged once
+        XCTAssertLessThan(both.chargedBytes, 2 * solo.chargedBytes)
+        // b still resumes at the shared prefix rung and at its own end
+        XCTAssertEqual(both.lookup(pre + [5, 6])?.length, 360)
+        XCTAssertEqual(both.lookup(b + [1])?.length, 380)
+        // a different prefix never shares (hash, then tokens)
+        let other = HotPrefixStore(capBytes: 1 << 30, rungStep: 4, strictBudget: true)
+        store(other, a, 0); store(other, Array(5000 ..< 5380), 2)
+        XCTAssertEqual(other.rungDedupHits, 0)
+        // evicting a keeps b's shared rung alive and charged
+        let tight = HotPrefixStore(capBytes: both.chargedBytes + 1, rungStep: 4, strictBudget: true)
+        store(tight, a, 0); store(tight, b, 1)
+        store(tight, Array(8000 ..< 8380), 3)
+        XCTAssertGreaterThan(tight.evictions, 0)
+        if tight.lookup(b + [1]) != nil { XCTAssertEqual(tight.lookup(pre + [5, 6])?.length, 360) }
+    }
+
+    /// 2026-10-01 RUNG TRIM: under pressure the store first drops rungs between an entry's reserve (prompt - 1) and
+    /// final rungs that never served a hit -- the prompt end and the decode window -- before evicting any entry; the
+    /// reserve, the prefix rungs below it, a used rung and the final state stay.
+    func testPressureTrimsUnusedDecodeRungsBeforeEvictingAnEntry() {
+        let a = Array(0 ..< 400), b = Array(1000 ..< 1400)
+        func ladder(_ salt: Float) -> [HotPrefixStore.Rung] { [100, 199, 200, 300, 400].map { rung($0, salt: salt) } }   // prefix, reserve, prompt end, decode, final
+        let probe = HotPrefixStore(capBytes: 1 << 30, rungStep: 4, strictBudget: true)
+        probe.store(tokens: a, rows: rows(T: 400, salt: 0, mtp: false), rowsValidTo: 400, mtpValidTo: 0, rungs: ladder(0))
+        let one = probe.chargedBytes
+        // room for two entries minus one rung: storing b must trim instead of evicting a
+        let store = HotPrefixStore(capBytes: 2 * one - 1, rungStep: 4, keepDecodeRungs: 8, strictBudget: true)
+        store.store(tokens: a, rows: rows(T: 400, salt: 0, mtp: false), rowsValidTo: 400, mtpValidTo: 0, rungs: ladder(0))
+        XCTAssertEqual(store.lookup(Array(a[0 ..< 300]) + [7])?.length, 300)              // a's decode rung serves a hit: used
+        _ = store.exported(store.lookup(Array(a[0 ..< 300]) + [7])!, ratio: ratio)
+        store.store(tokens: b, rows: rows(T: 400, salt: 1, mtp: false), rowsValidTo: 400, mtpValidTo: 0, rungs: ladder(1))
+        XCTAssertEqual(store.evictions, 0, "a trim made the room")
+        XCTAssertEqual(store.rungsTrimmed, 1)
+        XCTAssertEqual(store.count, 2)
+        // a lost its unused prompt-end rung (200), kept reserve 199, prefix 100, used 300 and final 400
+        XCTAssertEqual(store.lookup(Array(a[0 ..< 250]) + [7])?.length, 199)
+        XCTAssertEqual(store.lookup(Array(a[0 ..< 300]) + [7])?.length, 300)
+        XCTAssertEqual(store.lookup(a + [7])?.length, 400)
+        XCTAssertEqual(store.lookup(Array(b[0 ..< 250]) + [7])?.length, 200)              // b is whole
+        // with trim off the same pressure evicts the older entry instead
+        let off = HotPrefixStore(capBytes: 2 * one - 1, rungStep: 4, keepDecodeRungs: 8, strictBudget: true)
+        off.rungTrim = false
+        off.store(tokens: a, rows: rows(T: 400, salt: 0, mtp: false), rowsValidTo: 400, mtpValidTo: 0, rungs: ladder(0))
+        off.store(tokens: b, rows: rows(T: 400, salt: 1, mtp: false), rowsValidTo: 400, mtpValidTo: 0, rungs: ladder(1))
+        XCTAssertEqual(off.evictions, 1); XCTAssertEqual(off.count, 1)
+    }
+
     /// P106 B41 (H50d): the next turn of a conversation supersedes its previous entry; it must INHERIT the old
     /// entry's rungs inside their common prefix (the early "prefix" rungs another conversation can share), and a
     /// different conversation sharing only that prefix must then still resume there.

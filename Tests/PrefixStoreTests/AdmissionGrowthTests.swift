@@ -11,6 +11,37 @@ final class AdmissionGrowthTests: XCTestCase {
     }
     private func bound(_ count: Int, _ longest: Int) -> Double { Double(count) * 3 * Double(longest + 512) }
 
+    /// The lock-only estimate a waiting request repeats agrees with reserve's capacity test: it pads to the longest
+    /// active row, never reserves, and turns true when that row is released (2026-10-03, T-0048).
+    func testEstimateFitsMatchesReserveCapacityAndReservesNothing() {
+        let b = budget(window: 0, capacity: 6_000)            // one row of 900 bounds at 3 x (900 + 512) = 4_236
+        let long = b.reserve(length: 900) { _, _ in true }!
+        XCTAssertFalse(b.estimateFits(length: 10), "a short request is priced at the longest active row: 2 x 4_236 > 6_000")
+        XCTAssertNil(b.reserve(length: 10) { _, _ in true })
+        XCTAssertEqual(b.active, 1, "the estimate reserved nothing")
+        b.release(long)
+        XCTAssertTrue(b.estimateFits(length: 10))
+        XCTAssertNotNil(b.reserve(length: 10) { _, _ in true })
+        XCTAssertFalse(b.estimateFits(length: 1001), "past max_context it never fits")
+    }
+
+    /// T-0051: the history factor scales the history part of every row's price and nothing else; 3 is the old bound.
+    func testHistoryFactorScalesOnlyTheHistoryPrice() {
+        func make(_ f: Double) -> AdmissionBudget {
+            AdmissionBudget(maxContext: 1000, capacityBytes: 10_000, bytesPerToken: 1, fixedBytesPerSequence: 100,
+                            historyCapacityBytes: { Double($0) }, hotCacheCeilingBytes: 10_000, historyFactor: f)
+        }
+        func admitted(_ f: Double) -> Int {
+            let b = make(f); var n = 0
+            while b.reserve(length: 900, prepareCache: { _, _ in true }) != nil { n += 1 }
+            return n
+        }
+        XCTAssertEqual(admitted(3), 2, "3 x (900 + 512) + 100 = 4_336 per row: two fit 10_000, three do not")
+        XCTAssertEqual(admitted(2), 3, "2 x (900 + 512) + 100 = 2_924 per row: three fit, four do not")
+        XCTAssertEqual(make(2).snapshot()["admission_history_factor"], 2)
+        XCTAssertEqual(AdmissionBudget(maxContext: 10, capacityBytes: 1, bytesPerToken: 1).historyFactor, 3, "the default is the old bound")
+    }
+
     func testWindowZeroIsTheB53FormulaAndNeverGrows() {
         let b = budget(window: 0)
         var seen: [(Double, Double)] = []

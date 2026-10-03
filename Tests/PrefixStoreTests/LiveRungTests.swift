@@ -129,6 +129,24 @@ final class LiveRungTests: XCTestCase {
         XCTAssertEqual(live.map(\.length), [1, 2, 98, 99, 100])
     }
 
+    /// Long-document spine: a live ladder keeps the highest rung of every spine band past the first, bounded by
+    /// spineSlots(length), so a long document with a new tail resumes within one band; short rows are unchanged.
+    func testSpineKeepsOneLiveRungPerLongBandAndLeavesShortRowsAlone() throws {
+        let store = HotPrefixStore(capBytes: 1 << 20, keepDecodeRungs: 2)
+        store.spineStep = 32
+        var live: [HotPrefixStore.Rung] = []
+        for i in stride(from: 8, through: 160, by: 8) {
+            live = try XCTUnwrap(store.retainedLiveRungs(live + [rung(i, identity: i)]))
+            XCTAssertLessThanOrEqual(live.count, store.retainedRungLimit + store.spineSlots(i))
+        }
+        XCTAssertEqual(live.map(\.length), [8, 16, 56, 88, 120, 136, 144, 152, 160])
+        let short = (1...31).map { rung($0, identity: $0) }
+        XCTAssertEqual(store.retainedRungs(short).map(\.length), [1, 2, 29, 30, 31], "below one band = legacy")
+        store.anchorStep = 8; store.anchorWindow = 16
+        XCTAssertEqual(store.retainedRungs(live, anchors: true).map(\.length), [8, 16, 56, 88, 120, 136, 144, 152, 160],
+                       "store-time selection keeps the spine")
+    }
+
     func testBackwardsCaptureAndCutoffAreExplicitlyRefused() throws {
         let store = HotPrefixStore(capBytes: 1 << 20, keepDecodeRungs: 2)
         let full = (1...10).map { rung($0, identity: $0) }

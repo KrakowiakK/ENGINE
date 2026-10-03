@@ -451,6 +451,13 @@ struct EngineGpuLedger {
   double kt_span_ticks = 0.0, kt_span_ns = 0.0;
   unsigned long long kt_bufs = 0, kt_bad = 0;
 
+  // ENGINE_GPU_LEDGER_NAMETIME=1 (with ENGINE_GPU_LEDGER): each command buffer's GPU interval is charged to the
+  // kernel names it dispatched (joined with '+'); with MLX_MAX_OPS_PER_BUFFER=1 that is the time of one kernel, on a
+  // GPU without per-dispatch counters (M3: CounterSamplingPointAtDispatchBoundary unsupported).
+  bool nametime_on = false;
+  std::mutex ntmtx;
+  std::unordered_map<std::string, std::array<double, 2>> ntime;  // {ms, buffers}
+
   EngineGpuLedger() {
     const char* e = std::getenv("ENGINE_GPU_LEDGER");
     on = e && e[0] && !(e[0] == '0' && e[1] == '\0');
@@ -459,7 +466,9 @@ struct EngineGpuLedger {
     const char* kc = std::getenv("ENGINE_KERNEL_TIMER_CAP");
     if (kc && kc[0]) { int v = std::atoi(kc); if (v > 1) ktimer_cap = v; }
     const char* n = std::getenv("ENGINE_GPU_LEDGER_NAMES");
-    names_on = (on && n && n[0] && !(n[0] == '0' && n[1] == '\0')) || ktimer_on;
+    const char* nt = std::getenv("ENGINE_GPU_LEDGER_NAMETIME");
+    nametime_on = on && nt && nt[0] && !(nt[0] == '0' && nt[1] == '\0');
+    names_on = (on && n && n[0] && !(n[0] == '0' && n[1] == '\0')) || ktimer_on || nametime_on;
     const char* w = std::getenv("ENGINE_GPU_LEDGER_WINDOW");
     if (w && w[0]) {
       int v = std::atoi(w);
@@ -535,6 +544,19 @@ struct EngineGpuLedger {
       for (auto& p : h) {
         std::fprintf(stderr, "gpu-names[%d]:   %8llu  %s\n", printed - 1,
                      p.second, p.first.c_str());
+      }
+    }
+    if (nametime_on) {
+      std::vector<std::pair<std::string, std::array<double, 2>>> t;
+      { std::lock_guard<std::mutex> lk(ntmtx); t.assign(ntime.begin(), ntime.end()); ntime.clear(); }
+      std::sort(t.begin(), t.end(), [](const auto& a, const auto& b) { return a.second[0] > b.second[0]; });
+      double tot = 0.0; for (auto& p : t) tot += p.second[0];
+      std::fprintf(stderr, "gpu-ntime[%d]: distinct=%zu total=%.3f ms\n", printed - 1, t.size(), tot);
+      int shown = 0;
+      for (auto& p : t) {
+        if (shown++ >= 60) break;
+        std::fprintf(stderr, "gpu-ntime[%d]:   %9.3f ms %5.1f%% %7.0f bufs  %s\n", printed - 1, p.second[0],
+                     tot > 0 ? 100.0 * p.second[0] / tot : 0.0, p.second[1], p.first.c_str());
       }
     }
     if (ktimer_on) {
@@ -679,6 +701,11 @@ void CommandEncoder::dispatch_threadgroups(
   }
   maybeInsertBarrier();
   buffer_ops_++;
+  if (engine_gpu_ledger().nametime_on) {
+    auto& g = engine_gpu_ledger();
+    std::lock_guard<std::mutex> lk(g.nmtx);
+    nt_names_.push_back(g.cur ? *g.cur : std::string("<unbound>"));
+  }
   if (engine_ktimer_on()) ktimer_sample(true);
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
   if (engine_ktimer_on()) ktimer_sample(false);
@@ -695,6 +722,11 @@ void CommandEncoder::dispatch_threads(
   }
   maybeInsertBarrier();
   buffer_ops_++;
+  if (engine_gpu_ledger().nametime_on) {
+    auto& g = engine_gpu_ledger();
+    std::lock_guard<std::mutex> lk(g.nmtx);
+    nt_names_.push_back(g.cur ? *g.cur : std::string("<unbound>"));
+  }
   if (engine_ktimer_on()) ktimer_sample(true);
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
   if (engine_ktimer_on()) ktimer_sample(false);
@@ -877,8 +909,20 @@ void CommandEncoder::commit(std::function<void()> completion) {
     // Stamped BEFORE commit(), so "host_late" is measured against the moment the
     // host actually handed the buffer over, not the moment it finished.
     double t_commit = engine_media_now();
-    buffer_->addCompletedHandler([t_commit](MTL::CommandBuffer* cbuf) {
-      engine_gpu_ledger().add(t_commit, cbuf->GPUStartTime(), cbuf->GPUEndTime());
+    std::string key;
+    if (engine_gpu_ledger().nametime_on) {
+      for (size_t i = 0; i < nt_names_.size(); ++i) { if (i) key += "+"; key += nt_names_[i]; }
+      if (key.empty()) key = "<no dispatch>";
+    }
+    nt_names_.clear();
+    buffer_->addCompletedHandler([t_commit, key](MTL::CommandBuffer* cbuf) {
+      auto& g = engine_gpu_ledger();
+      if (g.nametime_on && cbuf->GPUEndTime() > cbuf->GPUStartTime()) {
+        std::lock_guard<std::mutex> lk(g.ntmtx);
+        auto& v = g.ntime[key];
+        v[0] += (cbuf->GPUEndTime() - cbuf->GPUStartTime()) * 1e3; v[1] += 1;
+      }
+      g.add(t_commit, cbuf->GPUStartTime(), cbuf->GPUEndTime());
     });
   }
   buffer_->commit();

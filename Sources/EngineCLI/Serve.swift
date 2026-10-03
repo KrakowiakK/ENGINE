@@ -195,6 +195,13 @@ func serve(_ o: Options) async throws {
     let thinkBiasStart = try o.int("--think-bias-start", 2000)
     let thinkBiasFull = try o.int("--think-bias-full", 8000)
     let thinkBiasDeadline = try o.nonNegativeInt("--think-bias-deadline", 0)
+    // T-0045: where the ramp may act before the deadline -- none (everywhere), line or para (only after a token that
+    // ends a line / a paragraph), see EngineThinkBias.gate
+    let thinkBiasGateName = o.values["--think-bias-gate"] ?? "none"
+    guard let thinkBiasGate = ["none": 0, "line": 1, "para": 2][thinkBiasGateName] else {
+        throw EngineError.invalid("--think-bias-gate must be none, line or para (got \(thinkBiasGateName))")
+    }
+    try engineLoadBoundaryTokens(modelDir: URL(fileURLWithPath: modelPath).resolvingSymlinksInPath(), gate: thinkBiasGate)
     let stateCacheDir = o.values["--state-cache"]
     let stateCacheStep = try o.int("--state-cache-step", 512)
     // P086: the store is shared and content-keyed, so it is bounded by a cap and an LRU, not by the
@@ -302,8 +309,18 @@ func serve(_ o: Options) async throws {
     let textConfig = configObject["text_config"] as? [String: Any] ?? configObject
     let nativeContext = textConfig["max_position_embeddings"] as? Int ?? 0
     let contextLimit = try o.int("--max-context", nativeContext)
-    guard contextLimit > 0, nativeContext == 0 || contextLimit <= nativeContext else {
-        throw EngineError.invalid("--max-context must be positive and no larger than the checkpoint context")
+    // 2026-10-02 (operator: extend the context to 1M): with ENGINE_CONTEXT_EXTENSION=1, --max-context may go up to
+    // 4x the checkpoint's max_position_embeddings (E9: 262144 -> 1048576). RoPE angles are computed from positions on
+    // the fly, so nothing in the model caps the length; past the trained range the long-context quality is the
+    // measured question (knowledge base: needle tests), so the extension is never implicit.
+    let contextExtension = ProcessInfo.processInfo.environment["ENGINE_CONTEXT_EXTENSION"] == "1"
+    let contextCeiling = nativeContext == 0 ? Int.max : (contextExtension ? 4 * nativeContext : nativeContext)
+    guard contextLimit > 0, contextLimit <= contextCeiling else {
+        throw EngineError.invalid("--max-context must be positive and no larger than the checkpoint context"
+            + (contextExtension ? " x4 (ENGINE_CONTEXT_EXTENSION=1)" : " (ENGINE_CONTEXT_EXTENSION=1 allows up to 4x)"))
+    }
+    if contextLimit > nativeContext && nativeContext > 0 {
+        FileHandle.standardError.write("engine serve: CONTEXT EXTENSION -- max context \(contextLimit) is \(String(format: "%.1f", Double(contextLimit) / Double(nativeContext)))x the checkpoint's \(nativeContext); positions past it are outside the trained range\n".data(using: .utf8)!)
     }
     guard defaultMaxTokens >= 0, defaultMaxTokens < contextLimit, stateCacheStep > 0,
           hotCacheGB.isFinite, hotCacheGB >= 0, stateCacheMaxGB.isFinite, stateCacheMaxGB >= 0,
@@ -349,7 +366,9 @@ func serve(_ o: Options) async throws {
                     "prefill_chunk_shared": sharedChunk, "prefill_chunk_alone": aloneChunk, "prefill_budget_cut": h57BudgetCut, "batch_min": batchMinRows,
                     "batch_mtp_policy": batchMTPPolicy,
                     "scheduler": ProcessInfo.processInfo.environment["ENGINE_SCHEDULER"] == "fifo" ? "fifo" : "phase",
-                    "scheduler_decode_burst": 4]
+                    "scheduler_decode_burst": serveDecodeBurst, "scheduler_decode_affinity_ms": serveDecodeAffinityMs,
+                    "scheduler_decode_share": serveDecodeShare, "scheduler_decode_share_min_s": serveDecodeShareMinS,
+                    "admin_flush": serveAdminFlush]
     let modelId = dir.lastPathComponent
     // P089 U10: from this line on, EVERY MLX call in this process happens on the model thread, and
     // every MLXArray a request owns is created and destroyed there. Loading above is single
@@ -426,6 +445,7 @@ func serve(_ o: Options) async throws {
     serveRuntime["release_pooled_private_history"] = releasePooledPrivateHistory
     // P106 H48: requested AND applicable -- an ineligible diagnostic environment keeps the stacked pool
     serveRuntime["row_resident_kv"] = rowResidentKV && Qwen4ExpModel.rowResidentEligible
+    serveRuntime["batch_floor"] = (rowResidentKV && Qwen4ExpModel.rowResidentEligible ? Qwen4ExpModel.shortRowBatchFloor : nil) ?? -1
     serveRuntime["prefill_batch_max"] = batchPrefill ? 4 : 1
     serveRuntime["prefill_batch_token_budget"] = 4096
     serveRuntime["prefill_batch_decode_token_budget"] = 1024
@@ -448,7 +468,10 @@ func serve(_ o: Options) async throws {
     serveRuntime["template_cache_verify"] = templateCacheVerify
     modelThreadShared = ModelThread(minBatch: max(1, batchMinRows), gatherWindow: batchWindowMs / 1000,
                                     maxBatch: batchMaxRows, phaseScheduling: ProcessInfo.processInfo.environment["ENGINE_SCHEDULER"] != "fifo",
-                                    prefillMaxBatch: batchPrefill ? 4 : 1, prefillTokenBudget: 4096, snapshot: { req, token in
+                                    maxConsecutiveDecodeDispatches: serveDecodeBurst,
+                                    prefillMaxBatch: batchPrefill ? 4 : 1, prefillTokenBudget: 4096,
+                                    decodeAffinity: serveDecodeAffinityMs / 1000, decodeShare: serveDecodeShare,
+                                    decodeShareMinWork: serveDecodeShareMinS, snapshot: { req, token in
         let row = seqRegistry[req.key].row
         let pooledSpec = batchPoolShared.specPool != nil && batchPoolShared.memberIds.contains(ObjectIdentifier(row))
         return StepResult(token: token, queued: row.takeQueued(), hasSpec: row.spec != nil || pooledSpec)
@@ -463,6 +486,8 @@ func serve(_ o: Options) async throws {
     // P106 H54: keep the prefix-step rungs of an entry's last 32k tokens (ENGINE_HOT_ANCHOR_WINDOW, 0 = legacy retention)
     hotStoreShared.anchorStep = prefixRungStep
     hotStoreShared.anchorWindow = Int(ProcessInfo.processInfo.environment["ENGINE_HOT_ANCHOR_WINDOW"] ?? "") ?? 32768
+    // long-document spine: one resume rung per 64k band of a long row (ENGINE_HOT_SPINE_STEP, 0 = off)
+    hotStoreShared.spineStep = max(0, Int(ProcessInfo.processInfo.environment["ENGINE_HOT_SPINE_STEP"] ?? "") ?? 65536)
     serveRuntime["hot_anchor_window"] = hotStoreShared.anchorWindow
     hotStoreShared.evictAffinity = ProcessInfo.processInfo.environment["ENGINE_HOT_EVICT"] != "lru"
     // P119 (validated above; 0 leaves the store exactly as before: no shared entry can exist, no sighting is recorded)
@@ -559,15 +584,19 @@ func serve(_ o: Options) async throws {
         // chunkEnd only rounds down/splits. Include native chunks, warm-up and verify.
         let forwardRows = max(1024, max(configuredChunk > 0 ? configuredChunk : max(aloneChunk, sharedChunk),
                                        max(mtpDepth, batchMTPDepth) + 1))
+        let stableState = Qwen4ExpCacheCapacity.fixedStateBytes(a, mtp: mtpDepth > 0)
+        let rungBytes = Qwen4ExpCacheCapacity.hotRungBytes(a, maxForwardRows: forwardRows,
+                                                        allocationSlack: max(16_384, 3 * Int(getpagesize())))
+        // the long-document spine rungs a row of this length may hold live (0 with the spine off)
+        let spineStep = hotStoreShared.enabled ? hotStoreShared.spineStep : 0
         historyCapacity = { length in
             AdmissionBudget.historyCapacityBytes(length: length,
                 attentionLayers: fullLayers + (mtpDepth > 0 ? 1 : 0), kvHeads: kvHeads, headDim: headDim,
                 indexerHeadDim: a.indexerHeadDim, indexerCompressRatio: a.indexerCompressRatio,
                 kvStep: kvStep, indexerStep: indexerStep, maxForwardRows: forwardRows, capacityGrowthLimit: contextLimit)
+                + (spineStep > 0 ? Double(length / spineStep) * rungBytes : 0)
         }
-        let stableState = Qwen4ExpCacheCapacity.fixedStateBytes(a, mtp: mtpDepth > 0)
-        let rungBytes = Qwen4ExpCacheCapacity.hotRungBytes(a, maxForwardRows: forwardRows,
-                                                        allocationSlack: max(16_384, 3 * Int(getpagesize())))
+        serveRuntime["hot_spine_step"] = spineStep
         let liveRungReserve = hotStoreShared.enabled ? Double(hotStoreShared.retainedRungLimit + 1) * rungBytes : 0
         fixedBytesPerSequence = max(fixedBytesPerSequence, 3 * stableState + liveRungReserve)
         serveRuntime["hot_live_rung_limit"] = hotStoreShared.retainedRungLimit
@@ -579,10 +608,15 @@ func serve(_ o: Options) async throws {
         serveRuntime["history_max_forward_rows"] = forwardRows
         serveRuntime["stable_state_bytes_per_row_derived"] = stableState
     }
+    // ENGINE_ADMISSION_HISTORY_FACTOR (1...3, default 3): the copies of each row's history the admission bound prices.
+    // Below 3 only with row-resident KV, where a row's history exists once and is written in place (no padded pooled
+    // copy, no history restack); the fixed state, which still restacks, keeps its 3x inside fixedBytesPerSequence.
+    let historyFactor = rowResidentKV && Qwen4ExpModel.rowResidentEligible ? min(3, max(1, Double(ProcessInfo.processInfo.environment["ENGINE_ADMISSION_HISTORY_FACTOR"] ?? "") ?? 3)) : 3
+    serveRuntime["admission_history_factor"] = historyFactor
     serveAdmission = AdmissionBudget(maxContext: contextLimit, capacityBytes: requestedBudget,
         bytesPerToken: bytesPerToken, fixedBytesPerSequence: fixedBytesPerSequence,
         historyCapacityBytes: historyCapacity, hotCacheCeilingBytes: serveSharedRAMBudget ? hotCacheGB * 1e9 : nil,
-        growthWindow: admissionGrowthWindow)
+        growthWindow: admissionGrowthWindow, historyFactor: historyFactor)
     serveRuntime["shared_ram_budget"] = serveSharedRAMBudget
     serveRuntime["ram_live_limit_bytes"] = serveRAMLiveLimitBytes
     modelThreadShared.exclusive {
@@ -623,7 +657,7 @@ func serve(_ o: Options) async throws {
         // sessions view a dashboard polls every second) must neither count as a request -- `activeRequests.current`
         // picks the prefill chunk width -- nor be refused with a 503 while the server is full.
         let worker = Thread {
-            handleServeConnection(clientFD, context: context, modelId: modelId, defaultMaxTokens: defaultMaxTokens, stateCache: connectionCache, mtpDepth: mtpDepth, thinkBudget: thinkBudget, loopGuard: loopGuard, thinkBiasMax: thinkBiasMax, thinkBiasStart: thinkBiasStart, thinkBiasFull: thinkBiasFull, thinkBiasDeadline: thinkBiasDeadline, batchMinRows: batchMinRows, serveReasoningEffort: serveReasoningEffort, prefillChunk: prefillChunk, keepReasoning: preserveThinking != "none")
+            handleServeConnection(clientFD, context: context, modelId: modelId, defaultMaxTokens: defaultMaxTokens, stateCache: connectionCache, mtpDepth: mtpDepth, thinkBudget: thinkBudget, loopGuard: loopGuard, thinkBiasMax: thinkBiasMax, thinkBiasStart: thinkBiasStart, thinkBiasFull: thinkBiasFull, thinkBiasDeadline: thinkBiasDeadline, thinkBiasGate: thinkBiasGate, batchMinRows: batchMinRows, serveReasoningEffort: serveReasoningEffort, prefillChunk: prefillChunk, keepReasoning: preserveThinking != "none")
             close(clientFD)
             connections.leave()
         }
@@ -794,6 +828,15 @@ private struct ChatRequest {
     /// P124: min_p, presence / frequency / repetition penalties, logit_bias (parsed and validated; an error -> 400)
     var logitParams = ServeSamplingParams()
     var samplingError: String? = nil
+    /// Operator request 2026-09-30: `reasoning_effort` "none"/"off"/"disabled", `enable_thinking: false` or
+    /// `chat_template_kwargs.enable_thinking: false` render the template with enable_thinking=false (an empty,
+    /// closed <think></think> block and no effort instructions) instead of mapping "none" to "low".
+    var thinkingOff: Bool = false
+    /// Optional content-only budget: generation stops (finish_reason "length", finish_phase "content") once this
+    /// many tokens were generated AFTER the reasoning block closed. `max_tokens` keeps covering the whole output
+    /// and `thinking_budget` keeps capping the reasoning, so the answer's room no longer depends on how long the
+    /// reasoning ran.
+    var maxAnswerTokens: Int? = nil
     /// A request whose sampling needs the per-step processor: it runs serially without MTP (like logprobs), never in a
     /// batched round, whose shared argmax / top-k block and draft acceptance know nothing of per-row histories.
     var needsLogitProcessing: Bool { logitParams.adjustsLogits || (logitParams.minP > 0 && temperature > 0) }
@@ -906,12 +949,20 @@ private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defau
         messages.append(last)
     }
 
-    return ChatRequest(
+    let effortRaw = (obj["reasoning_effort"] as? String)?.lowercased()
+    let templateKwargs = obj["chat_template_kwargs"] as? [String: Any]
+    let thinkingOff = ["none", "off", "disabled"].contains(effortRaw ?? "")
+        || (obj["enable_thinking"] as? Bool) == false || (templateKwargs?["enable_thinking"] as? Bool) == false
+    let maxAnswerTokens = (obj["max_answer_tokens"] as? Int).flatMap { $0 > 0 ? $0 : nil }
+    var request = ChatRequest(
         messages: messages, maxTokens: maxTokens, requestedMaxTokens: requestedMaxTokens, temperature: temp, topP: topP, topK: topK, thinkingBudget: thinkingBudget, loopGuard: loopGuardReq, thinkBiasMax: thinkBiasReq, thinkBiasDeadline: thinkBiasDeadlineReq, n: n, stream: stream,
         streamIncludeUsage: streamIncludeUsage, stopStrings: stopStrings, seed: seed, reasoningEffort: reasoningEffort,
         preserveThinking: preserveThinking, logprobsRequested: logprobsRequested, topLogprobsCount: topLogprobsCount, rawTools: rawTools, toolChoice: toolChoice,
         parallelToolCalls: parallelToolCalls, jsonInstruction: jsonInstruction,
         logitParams: logitParams, samplingError: samplingError)
+    request.thinkingOff = thinkingOff
+    request.maxAnswerTokens = maxAnswerTokens
+    return request
 }
 
 // MARK: - tool-call parsing (THIS checkpoint's XML form, from chat_template.jinja)
@@ -1060,6 +1111,9 @@ final class BatchRow {
     /// a sampled token -- so one argmax over the whole [B, V] block and ONE host read serve the
     /// group, instead of B slices and B round-trips.
     var biasNow: (() -> Float)? = nil
+    /// T-0045: true while the row's bias acts only after boundary tokens (EngineThinkBias.gated); the batched paths
+    /// then mask `biasNow` by each row's input token
+    var biasGated: (() -> Bool)? = nil
     var greedy = true
     var commit: ((Int) -> Void)? = nil
     /// P095 U3-K: the row's sampler parameters and its next draw key, for the batched sampled path
@@ -1491,6 +1545,11 @@ nonisolated(unsafe) var batchMTPDepthShared = 0
 nonisolated(unsafe) var batchMTPPolicy: String = ProcessInfo.processInfo.environment["ENGINE_BATCH_MTP_POLICY"] ?? "auto"
 nonisolated(unsafe) var batchMTPRounds = 0, batchMTPDrafted = 0, batchMTPAccepted = 0, batchMTPPlainSteps = 0
 nonisolated(unsafe) var batchGroupsWithoutSpec = 0, batchSpecDropped = 0, batchRoundsSkipped = 0
+/// What the batch draft policy sampled (owner thread writes, the sessions endpoint reads): round / plain-step cost
+/// sums, the slowest round, and each pool's FIRST round cost (the sample a fresh policy starts from).
+nonisolated(unsafe) var batchPolicyRoundMsSum = 0.0, batchPolicyRounds = 0, batchPolicyRoundMsMax = 0.0
+nonisolated(unsafe) var batchPolicyPlainMsSum = 0.0, batchPolicyPlains = 0
+nonisolated(unsafe) var batchPolicyFirstRounds = 0, batchPolicyFirstRoundMsSum = 0.0, batchPolicyFirstRoundMsMax = 0.0
 
 final class BatchPool {
     var memberIds: [ObjectIdentifier] = []
@@ -1506,8 +1565,12 @@ final class BatchPool {
     func draftDepth(maxK: Int) -> Int {
         specPool == nil ? 0 : policy.depth(maxK: maxK, mode: batchMTPPolicy)
     }
-    func noteRound(K: Int, ms: Double, acc: Double) { policy.noteRound(k: K, ms: ms, acceptance: acc) }
-    func notePlain(ms: Double) { policy.notePlain(ms: ms) }
+    func noteRound(K: Int, ms: Double, acc: Double) {
+        if policy.roundMs.isEmpty { batchPolicyFirstRounds += 1; batchPolicyFirstRoundMsSum += ms; batchPolicyFirstRoundMsMax = max(batchPolicyFirstRoundMsMax, ms) }
+        batchPolicyRoundMsSum += ms; batchPolicyRounds += 1; batchPolicyRoundMsMax = max(batchPolicyRoundMsMax, ms)
+        policy.noteRound(k: K, ms: ms, acceptance: acc)
+    }
+    func notePlain(ms: Double) { batchPolicyPlainMsSum += ms; batchPolicyPlains += 1; policy.notePlain(ms: ms) }
     /// THE POOL'S OWN length per row, advanced by the forward it ran -- never the member's copy.
     /// A member updates `row.length` before it submits its step, so a member that misses a round
     /// still carries the length it had BEFORE the pool advanced it. Unstacking on that stale number
@@ -1580,12 +1643,47 @@ nonisolated(unsafe) var templateCacheShared: TemplateTokenCache? = nil
 nonisolated(unsafe) var templateRenderShared: ChatTemplateRender? = nil
 nonisolated(unsafe) var templateCacheVerify = false
 
+/// 2026-10-03 (T-0048): ENGINE_ADMISSION_WAIT (default 1) -- a request refused by the KV budget waits for room instead of an
+/// immediate 503 (see the admission site); counted in /v1/engine/sessions admission_wait.
+let serveAdmissionWait: Bool = ProcessInfo.processInfo.environment["ENGINE_ADMISSION_WAIT"] != "0"
+final class AdmissionWaitWitness: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiting = 0, waits = 0, admitted = 0, refused = 0, maxSeconds = 0.0, totalSeconds = 0.0
+    func begin() { lock.lock(); waiting += 1; waits += 1; lock.unlock() }
+    func end(admitted ok: Bool, seconds: Double) {
+        lock.lock(); waiting -= 1; if ok { admitted += 1 } else { refused += 1 }
+        maxSeconds = max(maxSeconds, seconds); totalSeconds += seconds; lock.unlock()
+    }
+    func snapshot() -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        return ["enabled": serveAdmissionWait, "waiting": waiting, "waits": waits, "admitted_after_wait": admitted,
+                "refused_after_wait": refused, "max_wait_s": maxSeconds, "total_wait_s": totalSeconds]
+    }
+}
+let serveAdmissionWaitWitness = AdmissionWaitWitness()
+/// 2026-10-03 (T-0048): ENGINE_DECODE_AFFINITY_MS (default 0 = off) -- after a decode dispatch, with a prefill waiting,
+/// the model thread waits up to this long for the decoder's next job (ModelThread.decodeAffinity); ENGINE_DECODE_BURST
+/// (default 4, the shipped bound) -- decode dispatches allowed while a prefill waits.
+let serveDecodeAffinityMs: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_DECODE_AFFINITY_MS"] ?? "") ?? 0)
+let serveDecodeBurst: Int = max(1, Int(ProcessInfo.processInfo.environment["ENGINE_DECODE_BURST"] ?? "") ?? 4)
+/// ENGINE_DECODE_SHARE (default 0 = the count rules): with a prefill waiting, decode may use up to this fraction of the last
+/// prefill dispatch's time (ModelThread.decodeShare), so long-context chunks leave room for chats and short ones do not.
+let serveDecodeShare: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_DECODE_SHARE"] ?? "") ?? 0)
+/// ENGINE_DECODE_SHARE_MIN_S (default 0.5): the share applies only after a prefill dispatch at least this long.
+let serveDecodeShareMinS: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_DECODE_SHARE_MIN_S"] ?? "") ?? 0.5)
+/// ENGINE_ADMIN_FLUSH=1 (diagnostic, off by default): POST /v1/engine/flush evicts the whole hot store and returns MLX's
+/// cached buffers on an idle server, so a leak check can compare the memory floor after hours of traffic with a fresh one.
+let serveAdminFlush = ProcessInfo.processInfo.environment["ENGINE_ADMIN_FLUSH"] == "1"
 /// P102: ENGINE_PREFILL_CHUNK_SHARED (default 1024) -- the prefill chunk width while other requests are in flight.
 let sharedChunk: Int = Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CHUNK_SHARED"] ?? "") ?? 1024
 /// P106 H50b: the adaptive width while a request prefills alone (P093: 4096). With 1024-row width-canonical
 /// projections a 2048 chunk leaves the state bit-identical to 1024 chunks (probe at 16384 and 131072); 3072 and
 /// 4096 still differ from layer 4 on (a width-dependent op in the first attention layer, not yet identified).
 let aloneChunk: Int = Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CHUNK_ALONE"] ?? "") ?? 4096
+/// 2026-10-02: ENGINE_PREFILL_LONG_FROM (default 262144, E9's native context) and ENGINE_PREFILL_CHUNK_LONG (default 1024):
+/// past that many tokens a lone prefill uses the narrower chunk, bounding the workspace of 1M-token prompts.
+let longContextFrom: Int = Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_LONG_FROM"] ?? "") ?? 262144
+let longContextChunk: Int = Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CHUNK_LONG"] ?? "") ?? 1024
 /// P106 H57: ENGINE_PREFILL_BUDGET_CUT (default ON; 0 = off) -- with width-canonical projections, a prefill chunk never
 /// straddles the QSA indexer budget, so alone chunks wider than 2048 stay state-identical to 1024 chunks.
 let h57BudgetCut: Bool = ProcessInfo.processInfo.environment["ENGINE_PREFILL_BUDGET_CUT"] != "0"
@@ -1768,7 +1866,7 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
         if K > 0, let sp = batchPoolShared.specPool {
             // P099: one batched MTP round -- K drafts per row, one [B, K+1] verify block, per-row acceptance and roll-back
             let r0 = Date()
-            let rowsIn = group.map { m in BatchRoundRow(greedy: m.greedy, bias: m.biasNow?() ?? 0, thinkOpen: m.thinkOpenNow?() ?? false, stopIds: m.stopIds, drawKey: m.drawKey) }
+            let rowsIn = group.map { m in BatchRoundRow(greedy: m.greedy, bias: m.biasNow?() ?? 0, biasGated: m.biasGated?() ?? false, thinkOpen: m.thinkOpenNow?() ?? false, stopIds: m.stopIds, drawKey: m.drawKey) }
             let out = runBatchedMTPRound(qm, caches: pool, spec: sp, pending: group.map { $0.pending }, lengths: lengths, K: K, rows: rowsIn,
                                          samplerParams: sameSampled ? (p0.temp, p0.topK, p0.topP) : nil)
             var acc = 0
@@ -1801,7 +1899,7 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
         if sameSampled, let toksArr = sampleTopKBlock(
                 { () -> MLXArray in
                     var l = lg
-                    let biases = group.map { $0.biasNow?() ?? 0 }
+                    let biases = group.map { m in (m.biasGated?() ?? false) && !engineBoundaryIds.contains(m.pending) ? 0 : (m.biasNow?() ?? 0) }
                     if biases.contains(where: { $0 > 0 }) {
                         let col = l[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)]
                         l[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + MLXArray(biases).reshaped([biases.count, 1]).asType(l.dtype)
@@ -1823,7 +1921,7 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
             // over the same values as the per-row slice (first index on a tie in both), so the
             // tokens are identical; what changes is B-1 host round-trips and the eval barrier.
             var l = lg
-            let biases = group.map { $0.biasNow?() ?? 0 }
+            let biases = group.map { m in (m.biasGated?() ?? false) && !engineBoundaryIds.contains(m.pending) ? 0 : (m.biasNow?() ?? 0) }
             if biases.contains(where: { $0 > 0 }) {
                 let col = l[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)]
                 l[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + MLXArray(biases).reshaped([biases.count, 1]).asType(l.dtype)
@@ -1900,7 +1998,7 @@ private func usageObject(promptTokens: Int, completionTokens: Int, stats: [Strin
 
 // MARK: - main handler
 
-private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: String, defaultMaxTokens: Int, stateCache: StateCacheConfig?, mtpDepth: Int = 0, thinkBudget: Int = 0, loopGuard: Int = 0, thinkBiasMax: Float = 0, thinkBiasStart: Int = 2000, thinkBiasFull: Int = 8000, thinkBiasDeadline: Int = 0, batchMinRows: Int = 0, serveReasoningEffort: String = "medium", prefillChunk: Int = 0, keepReasoning: Bool = true) {
+private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: String, defaultMaxTokens: Int, stateCache: StateCacheConfig?, mtpDepth: Int = 0, thinkBudget: Int = 0, loopGuard: Int = 0, thinkBiasMax: Float = 0, thinkBiasStart: Int = 2000, thinkBiasFull: Int = 8000, thinkBiasDeadline: Int = 0, thinkBiasGate: Int = 0, batchMinRows: Int = 0, serveReasoningEffort: String = "medium", prefillChunk: Int = 0, keepReasoning: Bool = true) {
     let req: HTTPTransport.Request
     do { req = try HTTPTransport.readRequest(fd) }
     catch {
@@ -1958,6 +2056,9 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             "reordered_dispatches": ps.reorderedDispatches, "forced_oldest_dispatches": ps.forcedOldestDispatches]
         let obj = liveSessions.snapshot(extra: ["model": modelId, "max_concurrent": serveMaxConcurrent, "mtp_depth": mtpDepth, "runtime": runtimeView, "reserved_sequences": serveAdmission.active,
             "scheduler_phases": phases, "prefill_scheduling": prefillScheduling,
+            "admission_wait": serveAdmissionWaitWitness.snapshot(),
+            "decode_affinity": ["ms": serveDecodeAffinityMs, "burst": serveDecodeBurst, "share": serveDecodeShare, "share_min_s": serveDecodeShareMinS,
+                                "waits": modelThreadShared.decodeAffinityStats.waits, "hits": modelThreadShared.decodeAffinityStats.hits],
             "queue": activeRequests.snapshot(), "max_tokens_decisions": serveMaxTokensWitness.snapshot(), "reasoning_effort_decisions": serveEffortWitness.snapshot(),
             "cache_layout": serveMemoryWitness.cacheLayoutSnapshot(),
             "pooled_private_history": serveMemoryWitness.pooledPrivateHistorySnapshot(),
@@ -1965,7 +2066,35 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             "memory_guard": memoryGuardSnapshot(),
             "shared_prefix_rung": serveMemoryWitness.sharedPrefixSnapshot(),
             "indexer_graph_construction": serveMemoryWitness.indexerSnapshot(), "restack": serveMemoryWitness.restackSnapshot(), "memory": serveMemoryWitness.snapshot(), "native_prefill_sizes": serveMemoryWitness.prefillSnapshot(),
+            "batch_policy": ["rounds": batchPolicyRounds, "round_ms_mean": batchPolicyRounds > 0 ? batchPolicyRoundMsSum / Double(batchPolicyRounds) : 0,
+                             "round_ms_max": batchPolicyRoundMsMax, "plain_steps": batchPolicyPlains,
+                             "plain_ms_mean": batchPolicyPlains > 0 ? batchPolicyPlainMsSum / Double(batchPolicyPlains) : 0,
+                             "skipped_by_policy": batchRoundsSkipped, "first_rounds": batchPolicyFirstRounds,
+                             "first_round_ms_mean": batchPolicyFirstRounds > 0 ? batchPolicyFirstRoundMsSum / Double(batchPolicyFirstRounds) : 0,
+                             "first_round_ms_max": batchPolicyFirstRoundMsMax],
             "batch_steps": modelThreadShared.stepCount, "batch_sizes": Dictionary(uniqueKeysWithValues: modelThreadShared.sizeHistogram.map { (String($0.key), $0.value) })])
+        writeHTTPResponse(fd, status: 200, statusText: "OK", contentType: "application/json",
+                           body: (try? JSONSerialization.data(withJSONObject: obj)) ?? Data())
+        return
+    }
+    if req.method == "POST", req.path == "/v1/engine/flush", serveAdminFlush, serveSharedRAMBudget {
+        // Leak check (2026-10-03): with no request running, evict every hot-store entry and free MLX's cached buffers, then
+        // restore the store's budget (it refills with traffic). What stays active is the floor a fresh process also has.
+        guard activeRequests.current == 0 else {
+            writeHTTPResponse(fd, status: 409, statusText: "Conflict", contentType: "application/json",
+                               body: jsonErrorBody("requests are running; flush only an idle server", type: "busy"))
+            return
+        }
+        let obj: [String: Double] = modelThreadShared.exclusive {
+            let before = Double(Memory.activeMemory), cacheBefore = Double(Memory.cacheMemory), entries = Double(hotStoreShared.count)
+            _ = hotStoreShared.setBudgetBytes(0)
+            Memory.clearCache()
+            let after = Double(Memory.activeMemory), cacheAfter = Double(Memory.cacheMemory), left = Double(hotStoreShared.count)
+            _ = hotStoreShared.setBudgetBytes(Int(serveAdmission.snapshot()["hot_target_bytes"]!))
+            serveMemoryWitness.publish()
+            return ["active_bytes_before": before, "cache_bytes_before": cacheBefore, "hot_entries_before": entries,
+                    "active_bytes_after": after, "cache_bytes_after": cacheAfter, "hot_entries_after": left]
+        }
         writeHTTPResponse(fd, status: 200, statusText: "OK", contentType: "application/json",
                            body: (try? JSONSerialization.data(withJSONObject: obj)) ?? Data())
         return
@@ -2038,6 +2167,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
     let ids: [Int]
     do {
         var extra: [String: any Sendable] = ["reasoning_effort": chatReq.reasoningEffort]
+        if chatReq.thinkingOff { extra["enable_thinking"] = false }
         if let pt = chatReq.preserveThinking { extra["preserve_thinking"] = pt }
         if let cache = templateCacheShared, let renderer = templateRenderShared {
             let rendered = try renderer.render(messages: chatReq.messages, tools: toolsForTemplate, extra: extra)
@@ -2077,7 +2207,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
     chatReq.maxTokens = tokensDecision.tokens
     serveMaxTokensWitness.record(tokensDecision.reason)
     let effortAsked = (obj["reasoning_effort"] as? String).map { String($0.prefix(16)) } ?? "(default)"
-    serveEffortWitness.record("\(effortAsked)->\(chatReq.reasoningEffort)")
+    serveEffortWitness.record("\(effortAsked)->\(chatReq.thinkingOff ? "thinking-off" : chatReq.reasoningEffort)")
     if h8BoundaryProbe && (ids.isEmpty || ids.count > 8192 || !(1...32).contains(chatReq.maxTokens)
             || chatReq.n != 1 || chatReq.temperature != 0 || chatReq.logprobsRequested
             || chatReq.stream || !chatReq.rawTools.isEmpty
@@ -2099,19 +2229,36 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                           body: jsonErrorBody("prompt (\(ids.count)) + max_tokens (\(chatReq.maxTokens)) + lookahead (\(lookahead)) must fit max_context (\(serveAdmission.maxContext)); n must be 1...\(serveAdmission.maxChoices)"))
         return
     }
-    let pendingReservation: Int?
-    if serveSharedRAMBudget {
-        pendingReservation = modelThreadShared.exclusive {
-            let result = serveAdmission.reserve(length: ids.count + chatReq.maxTokens + lookahead,
-                                                current: ids.count + lookahead, prepareCache: serveReclaim)
-            serveRAMReclaimWitness["last_admission_committed"] = result == nil ? 0 : 1
-            if result == nil {
-                _ = hotStoreShared.setBudgetBytes(Int(serveAdmission.snapshot()["hot_target_bytes"]!))
+    func reserveNow() -> Int? {
+        if serveSharedRAMBudget {
+            return modelThreadShared.exclusive {
+                let result = serveAdmission.reserve(length: ids.count + chatReq.maxTokens + lookahead,
+                                                    current: ids.count + lookahead, prepareCache: serveReclaim)
+                serveRAMReclaimWitness["last_admission_committed"] = result == nil ? 0 : 1
+                if result == nil {
+                    _ = hotStoreShared.setBudgetBytes(Int(serveAdmission.snapshot()["hot_target_bytes"]!))
+                }
+                serveMemoryWitness.publish()
+                return result
             }
-            serveMemoryWitness.publish()
-            return result
         }
-    } else { pendingReservation = serveAdmission.reserve(length: ids.count + chatReq.maxTokens + lookahead) }
+        return serveAdmission.reserve(length: ids.count + chatReq.maxTokens + lookahead)
+    }
+    var pendingReservation = reserveNow()
+    // 2026-10-03 (T-0048): a request the KV budget cannot take right now WAITS for room -- the lock-only estimate every
+    // 250 ms, the real reservation on the owner once it fits -- up to --queue-timeout-s, instead of an immediate 503. Next
+    // to a 981k-token row the padded estimate leaves room for one more request, and 5 of 16 short chats sent during 1M-token
+    // requests were refused at once (C-0120). The memory guard's pause and a client that leaves still end the wait;
+    // ENGINE_ADMISSION_WAIT=0 restores the immediate refusal.
+    if pendingReservation == nil, serveAdmissionWait, !serveAdmission.admissionsPaused {
+        let t0 = Date(), deadline = t0.addingTimeInterval(serveQueueTimeout)
+        serveAdmissionWaitWitness.begin()
+        while pendingReservation == nil, Date() < deadline, !serveAdmission.admissionsPaused, !HTTPTransport.peerClosed(fd) {
+            Thread.sleep(forTimeInterval: 0.25)
+            if serveAdmission.estimateFits(length: ids.count + chatReq.maxTokens + lookahead) { pendingReservation = reserveNow() }
+        }
+        serveAdmissionWaitWitness.end(admitted: pendingReservation != nil, seconds: Date().timeIntervalSince(t0))
+    }
     guard let reservation = pendingReservation else {
         let why = serveAdmission.admissionsPaused ? "the machine is critically short of memory (memory guard); retry shortly"
                                                   : "KV memory budget exhausted; retry after active requests finish"
@@ -2215,7 +2362,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let fixedChunk = prefillChunk > 0 ? prefillChunk : (Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CHUNK"] ?? "") ?? 0)
         // P102: the shared-regime chunk width is a knob (P093 measured 1024 -> 957/981 tok/s, 2048 -> 1090/1122, 4096 -> 1160/1222;
         // the price of a wider chunk is the stall every decoding row pays per chunk)
-        func chunkWidth() -> Int { fixedChunk > 0 ? fixedChunk : (activeRequests.current > 1 ? sharedChunk : aloneChunk) }
+        // 2026-10-02 (1M context): alone, the width drops to `longContextChunk` once the prefill is past `longContextFrom`
+        // tokens -- the prefill workspace grows with the context, and a 1M-token prompt at 1024 peaked at 355 GB.
+        func chunkWidth(_ from: Int = 0) -> Int {
+            fixedChunk > 0 ? fixedChunk : (activeRequests.current > 1 ? sharedChunk : (from >= longContextFrom ? longContextChunk : aloneChunk))
+        }
         // P093: chunk ends land on multiples of the rung spacing whatever length the prefill resumed
         // from, so the disk rungs stay where another session will look for them.
         let rungAlign = max(1, stateCache?.step ?? 1)
@@ -2239,7 +2390,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // 2048, 4096, 8192, 12288, ...), so the prefix-step rungs (every 8192) and the H54 anchors are still captured.
             // H50: a wide chunk must end ON the canonical target rather than step over it (diagnostic mode only).
             // P119: the arithmetic lives in EngineServeSupport/PrefillChunkPlan.swift (unchanged) so it is tested.
-            PrefillChunkPlan.end(from: from, width: chunkWidth(), rungAlign: rungAlign, promptCount: ids.count,
+            PrefillChunkPlan.end(from: from, width: chunkWidth(from), rungAlign: rungAlign, promptCount: ids.count,
                                  qsaBudgetCut: qsaBudgetCut, canonicalTarget: h25CanonicalPrefix && h50WidthCanonical ? canonicalTarget : nil,
                                  hotReserve: hotReserve)
         }
@@ -2676,6 +2827,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         var toolCallInjected = !forceQueue.isEmpty
         var toolBoundaryPlainSteps = 0
         var closedThink = false
+        // max_answer_tokens: the output index where the visible answer starts (0 when no <think> block is open).
+        var answerStart: Int? = thinkOpenInitially ? nil : 0
 
         // Incremental tool-call streaming: this checkpoint writes tool calls as XML
         // (<tool_call><function=NAME><parameter=P>V</parameter>...), not raw JSON, so there is no
@@ -2722,7 +2875,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         // P077 soft stop ramp (per connection; a request may override the ceiling)
         let softBias = EngineThinkBias(start: thinkBiasStart, full: thinkBiasFull,
                                        maxBias: chatReq.thinkBiasMax ?? thinkBiasMax,
-                                       deadline: chatReq.thinkBiasDeadline ?? thinkBiasDeadline)
+                                       deadline: chatReq.thinkBiasDeadline ?? thinkBiasDeadline, gate: thinkBiasGate)
         // P068 thinking guard state; effective settings were also used before
         // MTP cache import/priming to select the safe request policy.
         var guardWindows: [[Int]: Int] = [:]
@@ -2758,7 +2911,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         // which is the only region where `raggedDecode` is defined at all. A DRAFTING row is a
         // candidate too -- it hands its draft state over the moment a group is really forming.
         let batchRatio = qm?.configuration.text.indexerCompressRatio ?? 4
-        let batchFloor = qm?.configuration.text.indexerBudget ?? 2048
+        let batchFloor = (rowResidentKV && Qwen4ExpModel.rowResidentEligible ? Qwen4ExpModel.shortRowBatchFloor : nil)
+            ?? qm?.configuration.text.indexerBudget ?? 2048
         var pendingTok = firstTok                    // the pending token as a plain Int, always known
         var pendingStale = false                     // `seq.pending` lags on the batched path
         // P089: the model thread lingers for peers only when at least `--batch-min` rows COULD join,
@@ -2781,7 +2935,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             seqRegistry[seqId].row.step = { lg in
                 var l = lg
                 if softBias.active, thinkOpenInitially, !closedThink, !closeCommitted {
-                    let b = softBias.bias(out.count)
+                    let b = softBias.bias(out.count, after: seqRegistry[seqId].row.pending)
                     if b > 0 {
                         let col = l[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)]
                         l[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + MLXArray(b).asType(l.dtype)
@@ -2793,6 +2947,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 return tok
             }
             seqRegistry[seqId].row.biasNow = { (softBias.active && thinkOpenInitially && !closedThink && !closeCommitted) ? softBias.bias(out.count) : 0 }
+            seqRegistry[seqId].row.biasGated = { softBias.gated(out.count) }
             seqRegistry[seqId].row.greedy = seqRegistry[seqId].sampler.isGreedy
             seqRegistry[seqId].row.commit = { tok in if tok == engineThinkCloseId { closeCommitted = true } }
             let sp = seqRegistry[seqId].sampler
@@ -2802,6 +2957,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             seqRegistry[seqId].row.thinkOpenNow = { thinkOpenInitially && !closedThink && !closeCommitted }
         }
         while out.count < chatReq.maxTokens {
+            if let cap = chatReq.maxAnswerTokens, let start = answerStart, out.count - start >= cap { break }
             guard !cancelled() else { liveSessions.update(sessionId) { $0.finishReason = "cancelled" }; return }
             // P093: a decode rung for the hot store every `rungStep` committed tokens. The caches
             // hold ids + out + the verified-but-unemitted queue (the last queue element is the
@@ -2956,10 +3112,19 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                         guard !cancelled() else { return ([], -1, 0) }
                         let st = seqRegistry[seqId]
                         guard var sp = st.spec else { return ([], 0, 0) }
+                        if specTokenTrace != nil, !specTokenTraced.contains(seqId) {
+                            specTokenTraced.insert(seqId); specTraceWrite(["seq": seqId, "prompt": ids, "out_before": out])
+                        }
+                        // T-0041: the copy index starts from the prompt, the emitted tokens and the pending token the round
+                        // forwards first (sp.n0): it is NOT in `out` yet (out.append happens when it is emitted below), and
+                        // without it every lookup would be shifted by one token
+                        if draftCopy.on, sp.copyIndex == nil, ids.count + out.count < draftCopy.maxContext {
+                            sp.copyIndex = CopyIndex(Array((ids + out + [sp.n0]).suffix(draftCopy.window)))
+                        }
                         let rr = serveSpecRound(&sp, cache: st.cache, sampler: &st.sampler, bias: softBias,
                                                 generated: out.count,
                                                 thinkOpen: thinkOpenInitially && !closedThink && !closeCommitted,
-                                                stopIds: speculativeStopIds)
+                                                stopIds: speculativeStopIds, traceSeq: specTokenTrace != nil ? seqId : -1)
                         st.spec = sp
                         return rr
                     }
@@ -2987,7 +3152,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     // the model closes at ITS OWN next sentence boundary instead of being truncated
                     // mid-derivation.
                     if softBias.active, thinkOpenInitially, !closedThink, !closeCommitted, forceQueue.isEmpty {
-                        let b = softBias.bias(out.count)
+                        let b = softBias.bias(out.count, after: pendingTok)
                         if b > 0 {
                             let col = logits[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)]
                             logits[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + MLXArray(b).asType(logits.dtype)
@@ -3065,6 +3230,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 contentInput = split.remainder
                 if reasoningSplit.matched != nil {
                     closedThink = true
+                    answerStart = out.count
                     reasoningFinal = reasoningPrevText.trimmingCharacters(in: .whitespacesAndNewlines)
                     if forceQueue.isEmpty, !toolCallInjected, !forcedPrefixIdsTemplate.isEmpty {
                         forceQueue = forcedPrefixIdsTemplate; toolCallInjected = true
@@ -3199,6 +3365,13 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             }
         }
 
+        // Operator request 2026-09-30: a "length" finish names the phase it ran out in -- "reasoning" (the <think>
+        // block never closed) or "content" (the answer was cut) -- since the two need different client reactions.
+        let finishPhase: String? = finishReason == "length" ? ((thinkOpenInitially && !closedThink) ? "reasoning" : "content") : nil
+        func finishPhaseChoice(_ c: [String: Any]) -> [String: Any] {
+            guard let phase = finishPhase else { return c }
+            var c = c; c["finish_phase"] = phase; return c
+        }
         liveSessions.update(sessionId) { [finishReason, specStats] e in
             e.finishReason = finishReason; e.mtpDrafted += specStats.drafted; e.mtpAccepted += specStats.accepted
         }
@@ -3207,7 +3380,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // toolStreamingActive; repeating the full array here would duplicate every argument.
             let terminalChunk: [String: Any] = [
                 "id": completionId, "object": "chat.completion.chunk", "created": created, "model": modelId,
-                "choices": [["index": choiceIndex, "delta": [String: Any](), "finish_reason": finishReason]],
+                "choices": [finishPhaseChoice(["index": choiceIndex, "delta": [String: Any](), "finish_reason": finishReason])],
             ]
             if choiceIndex == chatReq.n - 1 { finalStreamChunk = terminalChunk }
             else { sendSSEChunk(terminalChunk) }
@@ -3216,7 +3389,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             message["content"] = (toolCalls.isEmpty && finalContent.isEmpty) ? NSNull() as Any : finalContent
             if let r = reasoningFinal, !r.isEmpty { message["reasoning_content"] = r }
             if !toolCalls.isEmpty { message["tool_calls"] = toolCalls }
-            var choice: [String: Any] = ["index": choiceIndex, "message": message, "finish_reason": finishReason]
+            var choice: [String: Any] = finishPhaseChoice(["index": choiceIndex, "message": message, "finish_reason": finishReason])
             if chatReq.logprobsRequested { choice["logprobs"] = ["content": logprobsContent] }
             choicesOut.append(choice)
         }
@@ -3267,6 +3440,16 @@ struct ServeSpecState {
     /// with the round's own cleanup before anything else reads the head (handover, store), so every other reader sees
     /// exactly B44's state. ENGINE_SERIAL_PREQUEUE_DRAFTS=0 restores drafting at round entry.
     var pre: [MLXArray]? = nil
+    /// Diagnostic (ENGINE_SPEC_TOKEN_TRACE only): the head probability (max softmax over the draft vocabulary) of d1 and of
+    /// the queued drafts, captured through Qwen4ExpModel.draftProbSink next to the unchanged argmax; nil when not tracing.
+    var p1: MLXArray? = nil
+    var preP: [MLXArray]? = nil
+    /// T-0041 copy mode (ENGINE_DRAFT_COPY=1): an n-gram index over prompt + emitted tokens, the lookup draft decided for
+    /// the next round at the end of this one (host-side, no GPU read), and whether this round was a lookup round.
+    var copyIndex: CopyIndex? = nil
+    var nextLookup: [Int]? = nil
+    var lastWasLookup = false
+    var lookupLen = 0
     /// H60 review: a queued chain that is never consumed (the request's last round) must not have grown a head buffer,
     /// or the stored head's capacity (charged by the hot store) would differ from B44's. Queue only when the K-1 rows fit.
     func chainFitsWithoutGrowth() -> Bool {
@@ -3281,6 +3464,7 @@ struct ServeSpecState {
     mutating func settle() {
         guard let pre else { return }
         self.pre = nil
+        self.preP = nil
         let kv = (mtpCache as! CacheList)[0] as! KVCacheSimple
         _ = kv.trim(pre.count)
         let idxc = (mtpCache as! CacheList)[1] as! ArraysCache
@@ -3289,30 +3473,152 @@ struct ServeSpecState {
     }
 }
 let serialPrequeueDrafts: Bool = ProcessInfo.processInfo.environment["ENGINE_SERIAL_PREQUEUE_DRAFTS"] != "0"
+/// T-0040 (opt-in): per-round draft depth from the MTP head's own confidence. ENGINE_DRAFT_POLICY=conf drafts the next token
+/// only while the last draft's head probability (max softmax over the draft vocabulary) is >= ENGINE_DRAFT_TAU (0.7), at
+/// most ENGINE_DRAFT_KMAX (8) drafts; the verify block then holds exactly the drafted tokens. Each decision reads one
+/// probability (a host sync), so the queued-draft pipeline (H60) is off for this path. Replay on the coding suite: +16-18%
+/// per round at zero sync cost (C-0089 pending); the live A/B decides. Single-stream rounds only.
+struct DraftPolicyConfig { let conf: Bool; let tau: Float; let kmax: Int }
+/// T-0041 (opt-in) copy mode, the 'longer verify block + context lookup' idea: when the text being written repeats a
+/// span of the prompt or of the output (an edited file written back, a quoted document), verify up to
+/// ENGINE_DRAFT_COPY_L (12) tokens taken from the context instead of MTP drafts. Entered when the last
+/// ENGINE_DRAFT_COPY_MIN (6) tokens match an earlier span, kept while each lookup round is fully accepted. The decision is
+/// made on the host from token ids after the round's acceptance read, so it costs no GPU sync. Single-stream rounds only.
+/// The block grows while the copy holds: a lookup round starts at ENGINE_DRAFT_COPY_L0 tokens (default = L, i.e. fixed
+/// length) and doubles after every fully accepted lookup round, up to L -- a short or broken match (diff-style output)
+/// then costs a small block instead of a 12-token one.
+/// ENGINE_DRAFT_COPY_WINDOW (65536): only the most recent tokens of the context are indexed. The index is built on the
+/// model thread when a request's first round runs; MEASURED with the same code at -O (.kb/profile/copyindex): 32k tokens
+/// 7 ms / 14 MB, 64k 14 ms / 25 MB, 256k 79 ms / 93 MB, 1M 437 ms / 364 MB -- unbounded, a 1M-token request would stall
+/// every stream for ~0.4 s and hold 364 MB.
+/// ENGINE_DRAFT_COPY_MAX_CTX (65536): no copy mode for a request whose context is longer -- every row of a 13-row lookup block
+/// reads the whole context, and MEASURED on the long-context recall task copy mode decoded 89.85 vs 105.10 tok/s at 300k
+/// (-14.5%), +4.8% warm at 100k (C-0122); the edit gains (C-0107) are all on prompts of a few thousand tokens.
+struct DraftCopyConfig { let on: Bool; let minMatch: Int; let maxLen: Int; let startLen: Int; let window: Int; let maxContext: Int }
+let draftCopy: DraftCopyConfig = {
+    let e = ProcessInfo.processInfo.environment
+    let maxLen = max(1, min(12, Int(e["ENGINE_DRAFT_COPY_L"] ?? "") ?? 12))
+    let c = DraftCopyConfig(on: e["ENGINE_DRAFT_COPY"] == "1", minMatch: max(2, Int(e["ENGINE_DRAFT_COPY_MIN"] ?? "") ?? 6),
+                            maxLen: maxLen, startLen: max(1, min(maxLen, Int(e["ENGINE_DRAFT_COPY_L0"] ?? "") ?? maxLen)),
+                            window: max(64, Int(e["ENGINE_DRAFT_COPY_WINDOW"] ?? "") ?? 65536),
+                            maxContext: max(0, Int(e["ENGINE_DRAFT_COPY_MAX_CTX"] ?? "") ?? 65536))
+    if c.on { FileHandle.standardError.write("engine: draft copy mode min=\(c.minMatch) L=\(c.maxLen) L0=\(c.startLen) window=\(c.window) max_ctx=\(c.maxContext) (single-stream rounds)\n".data(using: .utf8)!) }
+    return c
+}()
+/// Latest earlier occurrence of each n-gram (n = 2..6) of a token sequence; the current suffix itself is never indexed,
+/// so a lookup returns the continuation of the most recent EARLIER span that ends like the text so far.
+final class CopyIndex {
+    private(set) var ctx: [Int]
+    private var maps: [[UInt64: Int]] = Array(repeating: [:], count: 7)
+    init(_ tokens: [Int]) {
+        ctx = []
+        ctx.reserveCapacity(tokens.count + 4096)
+        append(tokens)
+    }
+    private func key(_ start: Int, _ n: Int) -> UInt64 {
+        var h: UInt64 = 1469598103934665603
+        for i in start ..< start + n { h = (h ^ UInt64(bitPattern: Int64(ctx[i]))) &* 1099511628211 }
+        return h
+    }
+    func append(_ toks: [Int]) {
+        for t in toks {
+            let e = ctx.count - 1                       // index the n-grams ending at the current last position
+            if e >= 0 { for n in 2 ... 6 where e - n + 1 >= 0 { maps[n][key(e - n + 1, n)] = e - n + 1 } }
+            ctx.append(t)
+        }
+    }
+    /// (match length, continuation of at most L tokens) of the longest suffix (6 down to minN) seen earlier
+    func lookup(_ L: Int, minN: Int = 2) -> (Int, [Int])? {
+        let c = ctx.count
+        for n in stride(from: 6, through: minN, by: -1) where c > n {
+            guard let st = maps[n][key(c - n, n)] else { continue }
+            if Array(ctx[st ..< st + n]) != Array(ctx[(c - n) ..< c]) { continue }      // hash collision
+            let from = st + n, to = min(from + L, c)
+            if to > from { return (n, Array(ctx[from ..< to])) }
+        }
+        return nil
+    }
+}
+let draftPolicy: DraftPolicyConfig = {
+    let e = ProcessInfo.processInfo.environment
+    let c = DraftPolicyConfig(conf: e["ENGINE_DRAFT_POLICY"] == "conf", tau: Float(e["ENGINE_DRAFT_TAU"] ?? "") ?? 0.7,
+                              kmax: max(1, Int(e["ENGINE_DRAFT_KMAX"] ?? "") ?? 8))
+    if c.conf { FileHandle.standardError.write("engine: draft policy conf tau=\(c.tau) kmax=\(c.kmax) (single-stream rounds)\n".data(using: .utf8)!) }
+    return c
+}()
 
 /// One speculative round: K-1 further drafts from the head, one verify forward of [n0]+drafts on the
 /// trunk, accept the longest agreeing prefix plus the bonus token, roll the trunk tape back over the
 /// rejected rows, re-prime the head on the accepted rows. Mirrors speculativeLoop in main.swift.
 /// Returns the newly verified tokens in order; the state is updated in place.
+/// Diagnostic: ENGINE_SPEC_TOKEN_TRACE=<path> appends one JSON line per request (its prompt ids) and per speculative
+/// round (drafts, verify predictions, accepted count) of the B1 path -- the input of an offline drafting simulation.
+let specTokenTrace: FileHandle? = {
+    guard let p = ProcessInfo.processInfo.environment["ENGINE_SPEC_TOKEN_TRACE"], !p.isEmpty else { return nil }
+    if !FileManager.default.fileExists(atPath: p) { FileManager.default.createFile(atPath: p, contents: nil) }
+    let h = FileHandle(forWritingAtPath: p); h?.seekToEndOfFile(); return h
+}()
+nonisolated(unsafe) var specTokenTraced = Set<Int>()
+func specTraceWrite(_ obj: [String: Any]) {
+    guard let h = specTokenTrace, let d = try? JSONSerialization.data(withJSONObject: obj) else { return }
+    h.write(d); h.write("\n".data(using: .utf8)!)
+}
 func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout EngineSampler,
                     bias: EngineThinkBias = EngineThinkBias(), generated: Int = 0, thinkOpen: Bool = false,
-                    stopIds: Set<Int> = []) -> (tokens: [Int], drafted: Int, accepted: Int) {
+                    stopIds: Set<Int> = [], traceSeq: Int = -1) -> (tokens: [Int], drafted: Int, accepted: Int) {
     precondition(sampler.processor == nil, "P124: a logit-processing row reached the speculative round")
-    let model = sp.model, mtp = sp.mtp, embed = sp.embed, K = sp.K
+    let model = sp.model, mtp = sp.mtp, embed = sp.embed
+    var K = sp.K
+    // diagnostic draft confidences for the token trace (T-0040): captured only while tracing, so the graph is unchanged
+    let tracing = specTokenTrace != nil && traceSeq >= 0
+    let noProb = MLXArray([Float(-1)])
+    var probArrs: [MLXArray] = tracing ? [sp.p1 ?? noProb] : []
     var draftArrs: [MLXArray] = [sp.d1]
-    if let pre = sp.pre, pre.count == K - 1 {
+    let lookupRound = sp.nextLookup
+    sp.nextLookup = nil
+    if let lk = lookupRound, !lk.isEmpty {
+        // T-0041 copy mode: verify the looked-up tokens; the head's d1 is not used this round
+        sp.settle()
+        draftArrs = [MLXArray(lk.map { Int32($0) })]
+        K = lk.count
+        if tracing { probArrs = [MLXArray(Array(repeating: Float(-2), count: lk.count))] }
+    } else if draftPolicy.conf {
+        // T-0040: draft while the last draft is confident; the decision for each next draft reads its probability
+        sp.settle()
+        var Slast = sp.Slast
+        var probs: [MLXArray] = [sp.p1 ?? noProb]
+        var pLast: Float = sp.p1.map { $0.item(Float.self) } ?? 1          // unknown (first round) -> keep drafting
+        while draftArrs.count < draftPolicy.kmax && pLast >= draftPolicy.tau {
+            var captured: MLXArray? = nil
+            model.draftProbSink = { captured = $0.reshaped(-1) }
+            let (m, s2) = mtp(hidden: Slast, tokens: draftArrs.last![.newAxis], embed: embed, cache: sp.mtpCache)
+            draftArrs.append(model.draftToken(m[0..., -1, 0...]))
+            model.draftProbSink = nil
+            Slast = s2
+            let pc = captured ?? noProb
+            probs.append(pc)
+            pLast = pc.item(Float.self)
+        }
+        K = draftArrs.count
+        if tracing { probArrs = probs }
+    } else if let pre = sp.pre, pre.count == K - 1 {
         draftArrs += pre                                    // H60: queued by the previous round
+        if tracing { probArrs += (sp.preP?.count == K - 1 ? sp.preP! : Array(repeating: noProb, count: K - 1)) }
     } else {
         sp.settle()
         var Slast = sp.Slast
+        var roundProbs: [MLXArray] = []
+        if tracing { model.draftProbSink = { roundProbs.append($0.reshaped(-1)) } }
         for _ in 1 ..< K {
             let (m, s2) = mtp(hidden: Slast, tokens: draftArrs.last![.newAxis], embed: embed, cache: sp.mtpCache)
             draftArrs.append(model.draftToken(m[0..., -1, 0...]))
             Slast = s2
         }
+        if tracing { model.draftProbSink = nil; probArrs += roundProbs }
         asyncEval(draftArrs.last!)
     }
     sp.pre = nil
+    sp.preP = nil
     let T = (cache.first { $0 is CacheList } as! CacheList)[0].offset      // committed length before the round
     let block = concatenated([MLXArray([Int32(sp.n0)])] + draftArrs, axis: 0)[.newAxis]
     let (vl, vh) = model.forwardHidden(block, cache: cache)
@@ -3325,8 +3631,15 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
         var bs = [Float](repeating: 0, count: rows)
         for j in 0 ..< rows { bs[j] = bias.bias(generated + j) }
         if bs.contains(where: { $0 > 0 }) {
+            var add = MLXArray(bs)
+            // T-0045: a gated row (before the deadline) gets its bias only when its input token -- the pending token or
+            // a draft, which only the GPU holds yet -- ends a line / paragraph
+            if bias.gate > 0, let mask = engineBoundaryMask {
+                let g = MLXArray((0 ..< rows).map { bias.gated(generated + $0) ? Float(1) : 0 })
+                add = add * (g * mask.take(block.reshaped(-1)) + (1 - g))
+            }
             let col = vlb[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)]
-            vlb[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + MLXArray(bs).reshaped([rows, 1]).asType(vlb.dtype)
+            vlb[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + add.reshaped([rows, 1]).asType(vlb.dtype)
         }
     }
     let predsArr = (sampler.isGreedy ? vlb.argMax(axis: -1) : sampler.sample(vlb.reshaped(-1, vlb.dim(-1)))).asType(.int32)
@@ -3346,6 +3659,11 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     if let si = (0 ..< a).first(where: { stopIds.contains(drafts[$0]) }) { a = si }
     let bonus = preds[a]
     let newTokens = Array(drafts.prefix(a)) + [bonus]
+    if tracing {
+        let c = concatenated(probArrs.map { $0.reshaped(-1).asType(.float32) }, axis: 0).asArray(Float.self)
+        specTraceWrite(["seq": traceSeq, "gen": generated, "d": drafts, "p": preds, "a": a, "c": c.map { (Double($0) * 1e4).rounded() / 1e4 },
+                        "look": lookupRound != nil])
+    }
     // P106 H60 (H56 for the serial round): the head re-prime reads only the head cache and the verify stream, so it is
     // queued FIRST and the trunk roll-back graph (36 GDN tape replays) is built while the GPU runs it -- the same
     // operations on the same inputs, only their construction order changes. ENGINE_SERIAL_REPRIME_FIRST=0 restores it.
@@ -3357,19 +3675,34 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     if !Qwen4ExpModel.indexerPooledBuffer, let p = idxc[1] { let r = model.configuration.text.indexerCompressRatio; if p.dim(1) > T / r { idxc[1] = p[0..., 0 ..< (T / r), 0...] } }
     let nextTokens = MLXArray(newTokens.map { Int32($0) })[.newAxis]
     let (m2, s3) = mtp(hidden: vh[0..., 0 ..< (a + 1), 0...], tokens: nextTokens, embed: embed, cache: sp.mtpCache)
+    var nextP1: MLXArray? = nil
+    let wantP1 = tracing || draftPolicy.conf
+    if wantP1 { model.draftProbSink = { nextP1 = $0.reshaped(-1) } }
     sp.d1 = model.draftToken(m2[0..., -1, 0...])
+    if wantP1 { model.draftProbSink = nil; sp.p1 = nextP1 }
     asyncEval(sp.d1)
     if serialReprimeFirst, a < K { model.rollback(cache, blockRows: K + 1, keep: a + 1) }
     sp.Slast = s3[0..., (s3.dim(1) - 1)..., 0...]
     sp.n0 = bonus
-    if serialPrequeueDrafts, serialReprimeFirst, K > 1, sp.chainFitsWithoutGrowth() {
+    if draftCopy.on, let ci = sp.copyIndex {
+        ci.append(newTokens)
+        let fullLookup = lookupRound != nil && a == K
+        let nextLen = fullLookup ? min(draftCopy.maxLen, max(1, sp.lookupLen) * 2) : draftCopy.startLen
+        if let (n, cont) = ci.lookup(nextLen), n >= (fullLookup ? 2 : draftCopy.minMatch) { sp.nextLookup = cont; sp.lookupLen = nextLen }
+        else { sp.lookupLen = 0 }
+        sp.lastWasLookup = lookupRound != nil
+    }
+    if sp.nextLookup == nil, !draftPolicy.conf, serialPrequeueDrafts, serialReprimeFirst, K > 1, sp.chainFitsWithoutGrowth() {
         var next: [MLXArray] = [sp.d1]
         var Sl = sp.Slast
+        var queuedProbs: [MLXArray] = []
+        if tracing { model.draftProbSink = { queuedProbs.append($0.reshaped(-1)) } }
         for _ in 1 ..< K {
             let (m, s2) = mtp(hidden: Sl, tokens: next.last![.newAxis], embed: embed, cache: sp.mtpCache)
             next.append(model.draftToken(m[0..., -1, 0...]))
             Sl = s2
         }
+        if tracing { model.draftProbSink = nil; sp.preP = queuedProbs }
         asyncEval(next.last!)
         sp.pre = Array(next.dropFirst())
     }
@@ -4341,6 +4674,7 @@ func tokBench(_ o: Options) throws {
                         toolsForTemplate = chatReq.rawTools.map(toSendableDict)
                     }
                     var extra: [String: any Sendable] = ["reasoning_effort": chatReq.reasoningEffort]
+                    if chatReq.thinkingOff { extra["enable_thinking"] = false }
                     if let pt = chatReq.preserveThinking { extra["preserve_thinking"] = pt }
                     let ids = try tokenizer.applyChatTemplate(messages: chatReq.messages,
                                                               tools: toolsForTemplate, additionalContext: extra)
@@ -4426,6 +4760,7 @@ private func tokPrepare(name: String, path: String, tokenizer: any MLXLMCommon.T
         toolsForTemplate = chatReq.rawTools.map(toSendableDict)
     }
     var extra: [String: any Sendable] = ["reasoning_effort": chatReq.reasoningEffort]
+    if chatReq.thinkingOff { extra["enable_thinking"] = false }
     if let pt = chatReq.preserveThinking { extra["preserve_thinking"] = pt }
     let r0 = DispatchTime.now().uptimeNanoseconds
     let rendered = try renderer.render(messages: chatReq.messages, tools: toolsForTemplate, extra: extra)

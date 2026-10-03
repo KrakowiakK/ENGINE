@@ -481,6 +481,69 @@ func bench(_ o: Options) async throws {
         FileHandle.standardError.write("engine bench: snapshot \(snapshotURL!.path) \(FileManager.default.fileExists(atPath: snapshotURL!.path) ? "(load)" : "(will be written)")\n".data(using: .utf8)!)
     }
 
+    if ProcessInfo.processInfo.environment["ENGINE_PROJ_PROBE"] == "1", let qm = context.model as? Qwen4ExpModel {
+        for line in qm.projProbe(rows: (ProcessInfo.processInfo.environment["ENGINE_PROJ_ROWS"] ?? "1,2,4,8,12,16,32").split(separator: ",").compactMap { Int($0) }) { FileHandle.standardError.write((line + "\n").data(using: .utf8)!) }
+        return
+    }
+    if ProcessInfo.processInfo.environment["ENGINE_HC_PROBE"] == "1", let qm = context.model as? Qwen4ExpModel {
+        for line in qm.hcProbe(rows: [1, 4, 8]) { FileHandle.standardError.write((line + "\n").data(using: .utf8)!) }
+        return
+    }
+    if ProcessInfo.processInfo.environment["ENGINE_MOE_PROBE"] == "1", let qm = context.model as? Qwen4ExpModel {
+        for line in qm.moeProbe(tokens: tokens, rows: [1, 4, 8, 16]) { FileHandle.standardError.write((line + "\n").data(using: .utf8)!) }
+        return
+    }
+    // ENGINE_MTP_CHAIN_PROBE=1 (diagnostic): wall time per op, each op evaluated alone, 64 reps after 8 warm reps --
+    // a trunk forward of 1 and of 4 tokens, and one draft step (MTP head forward + draft head argmax), on the prompt.
+    if ProcessInfo.processInfo.environment["ENGINE_MTP_CHAIN_PROBE"] == "1", let qm = context.model as? Qwen4ExpModel, let mtp = qm.mtp {
+        func timeIt(_ label: String, _ body: () -> MLXArray) {
+            for _ in 0 ..< 8 { eval(body()) }
+            let t0 = Date(); for _ in 0 ..< 64 { eval(body()) }
+            FileHandle.standardError.write(String(format: "chain probe: %@ %.3f ms\n", label, Date().timeIntervalSince(t0) * 1000 / 64).data(using: .utf8)!)
+        }
+        let ids = MLXArray(tokens.map { Int32($0) })[.newAxis]
+        let cache = qm.newCache(parameters: nil), mtpCache = mtp.newCache()
+        let (lg, h) = qm.forwardHidden(ids, cache: cache)
+        let n0 = lg[0..., -1, 0...].argMax(axis: -1).item(Int.self)
+        let toks = Array(tokens.dropFirst()) + [n0]
+        let (_, S) = mtp(hidden: h, tokens: MLXArray(toks.map { Int32($0) })[.newAxis], embed: qm.model.embedTokens, cache: mtpCache)
+        var slast = S[0..., (S.dim(1) - 1)..., 0...]; eval(slast)
+        let one = MLXArray([Int32(n0)])[.newAxis], four = MLXArray([Int32(n0), 11, 13, 17])[.newAxis]
+        // dependent-dispatch latency: N element-wise adds on a [1, 2560] bf16 row, each consuming the previous result
+        // (one dispatch each, no fusion outside compile); reported per dispatch
+        for n in [96, 384, 1536] {
+            let x0 = MLXArray.zeros([1, 2560], dtype: .bfloat16); eval(x0)
+            let one16 = MLXArray(Float(1)).asType(.bfloat16)
+            func chainOf() -> MLXArray { var x = x0; for _ in 0 ..< n { x = x + one16 }; return x }
+            for _ in 0 ..< 4 { eval(chainOf()) }
+            let t0 = Date(); for _ in 0 ..< 16 { eval(chainOf()) }
+            let ms = Date().timeIntervalSince(t0) * 1000 / 16
+            FileHandle.standardError.write(String(format: "chain probe: %d dependent tiny dispatches %.3f ms  = %.2f us each\n", n, ms, ms * 1000 / Double(n)).data(using: .utf8)!)
+        }
+        if let sw = ProcessInfo.processInfo.environment["ENGINE_PROBE_SWEEP_S"] {
+            // trunk forward at several block widths (verify-shaped: S rows per call), each evaluated alone
+            for S in sw.split(separator: ",").compactMap({ Int($0) }) {
+                let blk = MLXArray((0 ..< S).map { Int32(S == 1 ? n0 : (11 + 2 * $0)) })[.newAxis]
+                FileHandle.standardError.write("=== sweep S=\(S) begin\n".data(using: .utf8)!)
+                timeIt("trunk forward S=\(S)", { qm.forwardHidden(blk, cache: cache).0 })
+                FileHandle.standardError.write("=== sweep S=\(S) end\n".data(using: .utf8)!)
+                if Q4Prof.enabled {   // ENGINE_PREFILL_PROFILE=1 ENGINE_PROFILE_MIN_ROWS=1: the stage census of 8 forwards at this width
+                    Q4Prof.reset(); for _ in 0 ..< 8 { eval(qm.forwardHidden(blk, cache: cache).0) }
+                    FileHandle.standardError.write("stage census S=\(S):\n".data(using: .utf8)!); Q4Prof.report(); Q4Prof.reset()
+                }
+            }
+            return
+        }
+        timeIt("trunk forward S=1", { qm.forwardHidden(one, cache: cache).0 })
+        timeIt("trunk forward S=4", { qm.forwardHidden(four, cache: cache).0 })
+        timeIt("draft step (head fwd + draft argmax)", {
+            let (m, s2) = mtp(hidden: slast, tokens: one, embed: qm.model.embedTokens, cache: mtpCache)
+            slast = s2; return qm.draftToken(m[0..., -1, 0...]) })
+        timeIt("draft step, head fwd only", {
+            let (m, s2) = mtp(hidden: slast, tokens: one, embed: qm.model.embedTokens, cache: mtpCache)
+            slast = s2; return m })
+        return
+    }
     if let kStr = o.values["--mtp"], let K = Int(kStr), K >= 1, let qm = context.model as? Qwen4ExpModel {
         // speculative decode benchmark: same prompt, `decodeSteps` tokens per run, wall over the loop
         var runs: [RunResult] = []
@@ -489,10 +552,13 @@ func bench(_ o: Options) async throws {
         // compile landed in run 1 -- OBS-ENG-034), else a 64-token prefix
         if let s = snapshotURL, FileManager.default.fileExists(atPath: s.path) { _ = speculativeGenerate(model: qm, prompt: tokens, maxTokens: 8, depth: K, snapshotURL: s) }
         else { _ = speculativeGenerate(model: qm, prompt: Array(tokens.prefix(64)), maxTokens: 8, depth: K) }
+        Q4Prof.reset()   // the warm-up's marks are not the measured run's
         for i in 0..<repeats {
             var ttft = 0.0
             let g0 = Date()
-            let (toks, st) = speculativeGenerate(model: qm, prompt: tokens, maxTokens: decodeSteps, depth: K, onPrefill: { ttft = Date().timeIntervalSince(g0) }, snapshotURL: snapshotURL)
+            // the profiler's books then hold the decode rounds' verify forwards only (S = K+1 counts as "prefill" there)
+            let (toks, st) = speculativeGenerate(model: qm, prompt: tokens, maxTokens: decodeSteps, depth: K, onPrefill: {
+                ttft = Date().timeIntervalSince(g0); if Q4Prof.enabled { Q4Prof.report(); Q4Prof.reset() } }, snapshotURL: snapshotURL)
             let total = Date().timeIntervalSince(g0)
             let r = RunResult(prefill_seconds: ttft, decode_seconds: total - ttft, prefill_tps: st.prefillRows > 0 ? Double(st.prefillRows) / st.prefillSeconds : Double(tokens.count) / ttft,
                               decode_tps: Double(toks.count) / (total - ttft), generated_head: Array(toks.prefix(32)), generated_ids: toks)
@@ -1692,6 +1758,16 @@ struct EngineThinkBias {
     /// P076 measured the worst case: at mid-derivation positions `</think>` sits ~24 logits under the
     /// argmax. 40 is above every gap observed on the six chains, so the deadline is a real bound.
     static let deadlineTop: Float = 40
+    /// T-0045: where the bias may act before the deadline. 0 = at every position (P077/P078 as measured); 1 = only on
+    /// a position right after a token that ends a line; 2 = only right after one that ends a paragraph ("\n\n").
+    /// MEASURED (C-0103): at bias 16-20 the ramp wins mid-sentence too, and every stop-caused failure was a `</think>`
+    /// forced mid-sentence after which the model went on deliberating in the answer. Past the deadline the bias acts
+    /// everywhere again, so the block still ends.
+    var gate = 0
+    func gated(_ generated: Int) -> Bool { gate > 0 && (deadline <= full || generated < deadline) }
+    func bias(_ generated: Int, after token: Int) -> Float {
+        gated(generated) && !engineBoundaryIds.contains(token) ? 0 : bias(generated)
+    }
     func bias(_ generated: Int) -> Float {
         guard maxBias > 0, full > start else { return 0 }
         if generated <= start { return 0 }
@@ -1706,6 +1782,29 @@ struct EngineThinkBias {
     var active: Bool { maxBias > 0 && full > start }
 }
 nonisolated(unsafe) var engineThinkBias = EngineThinkBias()
+
+/// T-0045: the token ids after which a gated think bias may act (EngineThinkBias.gate), read from the byte-level BPE
+/// vocabulary in tokenizer.json, where "Ċ" is the newline byte: gate 1 = tokens ending in a newline, gate 2 = tokens
+/// ending in two. The mask is the same set as floats indexed by token id (length = the config's vocab_size, which
+/// bounds every input id), for verify rows whose input tokens are drafts that only the GPU holds.
+nonisolated(unsafe) var engineBoundaryIds = Set<Int>()
+nonisolated(unsafe) var engineBoundaryMask: MLXArray? = nil
+func engineLoadBoundaryTokens(modelDir: URL, gate: Int) throws {
+    guard gate > 0 else { return }
+    let tok = try JSONSerialization.jsonObject(with: Data(contentsOf: modelDir.appendingPathComponent("tokenizer.json"))) as? [String: Any]
+    guard let vocab = (tok?["model"] as? [String: Any])?["vocab"] as? [String: Int] else {
+        throw EngineError.invalid("--think-bias-gate: no model.vocab in tokenizer.json")
+    }
+    let cfg = try JSONSerialization.jsonObject(with: Data(contentsOf: modelDir.appendingPathComponent("config.json"))) as? [String: Any]
+    let V = (cfg?["vocab_size"] as? Int) ?? ((cfg?["text_config"] as? [String: Any])?["vocab_size"] as? Int) ?? 0
+    guard V > 0, let maxId = vocab.values.max(), maxId < V else { throw EngineError.invalid("--think-bias-gate: vocab_size missing or below the vocabulary") }
+    let suffix = gate == 1 ? "Ċ" : "ĊĊ"
+    engineBoundaryIds = Set(vocab.filter { $0.key.hasSuffix(suffix) }.map { $0.value })
+    var m = [Float](repeating: 0, count: V)
+    for i in engineBoundaryIds { m[i] = 1 }
+    engineBoundaryMask = MLXArray(m)
+    FileHandle.standardError.write("engine: think bias gate \(gate == 1 ? "line" : "para"): \(engineBoundaryIds.count) boundary tokens of \(vocab.count)\n".data(using: .utf8)!)
+}
 
 /// Adds the ramped bias to the `</think>` logit while the think block is open. Nothing else is touched,
 /// so with the knob unset the returned array is the input array.
@@ -2812,6 +2911,15 @@ if let gb = ProcessInfo.processInfo.environment["ENGINE_GPU_CACHE_LIMIT_GB"].fla
 if let gb = ProcessInfo.processInfo.environment["ENGINE_GPU_MEMORY_LIMIT_GB"].flatMap(Double.init) {
     GPU.set(memoryLimit: Int(gb * 1e9))
     FileHandle.standardError.write("engine: GPU memory limit -> \(GPU.memoryLimit / 1_000_000) MB\n".data(using: .utf8)!)
+}
+
+// Quality gate G1 (tools/profile, docs/PROFILING.md): under a profiling config the process states every ENGINE_* / MLX_*
+// variable it actually received, so the harness can prove the config reached it (a zsh `env $VARS` once passed one
+// variable with the others glued to its value, and a whole A/B measured the wrong configuration).
+if let cfg = ProcessInfo.processInfo.environment["ENGINE_PROFILE_CFG"] {
+    let seen = ProcessInfo.processInfo.environment.filter { $0.key.hasPrefix("ENGINE_") || $0.key.hasPrefix("MLX_") }
+        .map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " ")
+    FileHandle.standardError.write("engine: profile cfg \(cfg) effective env: \(seen)\n".data(using: .utf8)!)
 }
 
 do {

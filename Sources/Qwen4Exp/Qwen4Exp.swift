@@ -576,6 +576,11 @@ enum Qwen4ExpVariants {
 // MARK: - QSA indexer
 
 final class Qwen4ExpQSAIndexer: Module {
+    /// Short-row batching: rows of a ROW-RESIDENT ragged batch may sit at or below the budget once their context
+    /// passes this floor (ENGINE_BATCH_FLOOR; unset = the budget, the pre-change behaviour). Such a row selects
+    /// every completed block, so its attention covers every position, as the solo dense window does (same keys,
+    /// another reduction order). The stacked pool keeps the budget floor.
+    static let batchFloor: Int? = ProcessInfo.processInfo.environment["ENGINE_BATCH_FLOOR"].flatMap { Int($0) }
     let nHeads: Int
     let kvHeads: Int
     let headDim: Int
@@ -844,7 +849,8 @@ final class Qwen4ExpQSAIndexer: Module {
         }
         let nBlocksRow = kvLenRow.map { $0 / ratio }
         let nBlocksMax = nBlocksRow.max()!
-        guard kvLenRow.min()! > budget, nBlocksMax > 0 else { return nil }
+        let floor = rowCaches != nil ? max(ratio, Self.batchFloor ?? budget) : budget
+        guard kvLenRow.min()! > floor, nBlocksMax > 0 else { return nil }
         // P080 U2 -- ONE WATERMARK PER ROW, and it is a correctness fix, not only a cost one.
         // The first cut used a single `min` over the batch and re-pooled every block of every row on
         // every step, trusting that re-pooling is idempotent. The values are the same function of the
@@ -1186,7 +1192,13 @@ final class Qwen4ExpQSAIndexer: Module {
             }
             keyCache[2]?[0..., 0..., offset ..< kvLen] = pos3.asType(.int32)
         }
-        if kvLen <= budget { return nil }
+        if kvLen <= budget {
+            // A batched short row pooled its blocks into slot 1; solo short steps pool nothing, so that pool goes
+            // stale and the crossing step would take its unpooled tail as pooled (`done` reads the capacity). Drop
+            // it: the crossing then pools every block from the raw keys, as for a row that was never batched.
+            if Self.batchFloor != nil, let kc = keyCache, kc[1] != nil { kc[1] = nil }
+            return nil
+        }
         // P037's REFUSAL STOOD HERE and its premise was wrong (REFUT-ENG-024 retracted by P039). It
         // read: "a block start is not a scalar position once the T/H/W axes disagree inside the
         // block". True, and irrelevant -- the reference never ropes a block start FROM a scalar. HF
@@ -1859,6 +1871,14 @@ final class Qwen4ExpGatedDeltaNet: Module {
             k = qkv[0..., keyDim ..< (2 * keyDim)].reshaped(B, S, nK, dK)
             v = qkv[0..., (2 * keyDim)...].reshaped(B, S, nV, dV)
             convInput = newConv      // only read by the S > 1 tape below (never for S == 1)
+        } else if Qwen4ExpDecoderLayer.ablSkip.contains("gdnfront") {
+            // timing ablation only (output garbage): no conv / silu / split copies / head norms
+            // q = k = 0 keeps the recurrence finite (unnormalised keys blow the state up to NaN, and NaN routing would
+            // collapse the MoE to one expert and fake a saving); one multiply each replaces the front end
+            q = mixedQKV[.ellipsis, 0 ..< keyDim].reshaped(B, S, nK, dK) * 0
+            k = mixedQKV[.ellipsis, keyDim ..< (2 * keyDim)].reshaped(B, S, nK, dK) * 0
+            v = mixedQKV[.ellipsis, (2 * keyDim)...].reshaped(B, S, nV, dV)
+            convInput = mixedQKV
         } else {
         // P019 unit 7: for a prefill chunk the concatenate + Conv1d + silu chain is three passes over an 84 MB tensor at
         // a 4096-row chunk; one kernel reads the mixed q|k|v straight out of qkvz and the K-1 cached rows instead. The
@@ -1901,7 +1921,14 @@ final class Qwen4ExpGatedDeltaNet: Module {
         }
         Q4Prof.mark("gdn.headnorm", [q, k, v])
         let out: MLXArray, newState: MLXArray
-        if Q4Fused.gdnGate {
+        let ablG = Qwen4ExpDecoderLayer.ablSkip
+        if ablG.contains("gdnrecur") {
+            // timing ablation only: no gate math, no recurrence
+            out = v; newState = cache?[1] ?? MLXArray.zeros([B, nV, dV, dK], dtype: .float32)
+        } else if ablG.contains("gdngate") {
+            // timing ablation only: the recurrence on raw a / b in place of the gate math
+            (out, newState) = gatedDeltaUpdatePrecomputed(q: q, k: k, v: v, g: a * 0, beta: b * 0, state: cache?[1], mask: nil)   // decay 1, no write: finite
+        } else if Q4Fused.gdnGate {
             if aLogT == nil || aLogT!.dtype != x.dtype { aLogT = aLogEff.asType(x.dtype); dtBiasT = dtBias.asType(x.dtype); eval(aLogT!, dtBiasT!) }
             let (g, beta) = q4GDNGate(ba: ba, aLog: aLogT!, dtBias: dtBiasT!, nV: nV)
             (out, newState) = gatedDeltaUpdatePrecomputed(q: q, k: k, v: v, g: g, beta: beta, state: cache?[1], mask: nil)
@@ -1924,7 +1951,9 @@ final class Qwen4ExpGatedDeltaNet: Module {
         }
         // the recurrence runs in float32; the model runs in x.dtype (bf16) -- do not let fp32 leak out
         let r: MLXArray
-        if Q4Fused.gdnFront {
+        if Qwen4ExpDecoderLayer.ablSkip.contains("gdnnorm") {
+            r = q8Proj(outProj, out.reshaped(B, S, valueDim))   // timing ablation only: no gated norm
+        } else if Q4Fused.gdnFront {
             let n = q4GatedNormSG(out, weight: norm.weight, gate: z, headDim: dV, eps: norm.eps, sigmoidGate: norm.sigmoidGate, outDType: x.dtype)
             r = q8Proj(outProj, n.reshaped(B, S, valueDim))
         } else if Q4Fused.gatedNorm {
@@ -2930,8 +2959,8 @@ public final class Qwen4ExpModelInner: Module {
             h = hh; normedNext = nn
         }
         layers[0].attnHC.debugSink = nil
+        lastHidden = h   // before the profiler's early return: the MTP head reads it (forwardHidden trapped under ENGINE_PREFILL_PROFILE)
         if Q4Prof.active { let r = mixer(h, normed: normedNext).0; Q4Prof.mark("final_mixer", [r]); Q4Prof.end(); return r }
-        lastHidden = h
         return mixer(h, normed: normedNext).0
     }
 
@@ -3192,10 +3221,19 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
                 var rows = Array(0 ..< N)
                 if specialsFrom > N && specialsFrom < V { rows += Array(specialsFrom ..< V) }
                 let idx = MLXArray(rows.map { Int32($0) })
-                let w = q.weight[idx], sc = q.scales[idx], bi = b[idx]
+                var w = q.weight[idx], sc = q.scales[idx], bi = b[idx]
+                var bits = q.bits, gs = q.groupSize
+                // ENGINE_MTP_DRAFT_HEAD_BITS=4: a 4-bit copy of the trimmed rows for DRAFTING only (half the bytes of the
+                // draft argmax); the verify step still scores the checkpoint's head, so the output is unchanged.
+                if let hb = Int(ProcessInfo.processInfo.environment["ENGINE_MTP_DRAFT_HEAD_BITS"] ?? ""), hb < bits {
+                    let full = dequantized(w, scales: sc, biases: bi, groupSize: gs, bits: bits)
+                    let r = quantized(full, groupSize: 64, bits: hb)
+                    w = r.wq; sc = r.scales; bi = r.biases!
+                    bits = hb; gs = 64
+                }
                 eval(w, sc, bi)
-                draftHead = (w, sc, bi, idx, q.bits, q.groupSize)
-                FileHandle.standardError.write("mtp draft head: \(rows.count) of \(V) rows (\(N) + \(rows.count - N) specials)\n".data(using: .utf8)!)
+                draftHead = (w, sc, bi, idx, bits, gs)
+                FileHandle.standardError.write("mtp draft head: \(rows.count) of \(V) rows (\(N) + \(rows.count - N) specials), \(draftHead!.bits)-bit\n".data(using: .utf8)!)
             }
         }
         guard let d = draftHead else {
@@ -3522,6 +3560,8 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     /// ENGINE_IDX_POOL_BUF=0 (the P020 concatenation arm) makes the single-sequence indexer read slot 1's
     /// LENGTH as its pooled count, which only the stacked unstack's exact-size slice satisfies, so it keeps the
     /// stacked pool too.
+    /// ENGINE_BATCH_FLOOR (the indexer's short-row batching floor), nil when unset.
+    public static var shortRowBatchFloor: Int? { Qwen4ExpQSAIndexer.batchFloor }
     public static var rowResidentEligible: Bool {
         Qwen4ExpQSAIndexer.pooledBuffer
             && !Qwen4ExpQSAIndexer.raggedSelectMasked && !Qwen4ExpQSAIndexer.ablTopK && !Qwen4ExpQSAIndexer.ablTopKSpread
@@ -3855,5 +3895,122 @@ public enum Q4Prof {
             }
         }
         FileHandle.standardError.write((lines.joined(separator: "\n") + "\n").data(using: .utf8)!)
+    }
+}
+
+// MARK: - MoE bandwidth probe (diagnostic, engine bench ENGINE_MOE_PROBE=1)
+extension Qwen4ExpModel {
+    /// Times the 48 layers' MoE blocks chained in ONE evaluation (as the forward runs them) for `rows` tokens, counts the
+    /// distinct experts the routers pick, and reports the bytes those experts (+ shared expert + router) hold per layer
+    /// and the implied bandwidth; plus a reference read of one contiguous expert bank (an MLX sum) on this machine.
+    public func moeProbe(tokens: [Int], rows: [Int], reps: Int = 16, referenceOnly: Bool = false) -> [String] {
+        var out: [String] = []
+        let layers = model.layers
+        let D = configuration.text.hiddenSize
+        var x0 = model.embedTokens(MLXArray(tokens.map { Int32($0) })[.newAxis])
+        if x0.dim(-1) != D { x0 = x0[.ellipsis, 0 ..< D] }
+        func norm(_ y: MLXArray) -> MLXArray { y * rsqrt((y.asType(.float32) * y.asType(.float32)).mean(axis: -1, keepDims: true) + 1e-6).asType(y.dtype) }
+        x0 = norm(x0); eval(x0)
+        let first = layers[0].mlp
+        let bankBytes = first.switchMLP.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+        let perExpert = Double(bankBytes) / Double(first.numExperts)
+        let fixedBytes = Double(first.sharedExpert.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+                                + first.gateSG.parameters().flattened().reduce(0) { $0 + $1.1.nbytes })
+        for S in (referenceOnly ? [] : rows) {
+            let xs = x0[0..., 0 ..< S, 0...]
+            func chain() -> MLXArray { var y = xs; for l in layers { y = norm(l.mlp(y)) }; return y }
+            for _ in 0 ..< 4 { eval(chain()) }
+            let t0 = Date(); for _ in 0 ..< reps { eval(chain()) }
+            let ms = Date().timeIntervalSince(t0) * 1000 / Double(reps) / Double(layers.count)
+            var distinct = 0.0; var y = xs
+            for l in layers {
+                let (idx, _, _) = q4MoETopK(logits: l.mlp.routerLogits(y), experts: l.mlp.numExperts, topK: l.mlp.topK, sharedGate: true)
+                distinct += Double(Set(idx.reshaped(-1).asType(.int32).asArray(Int32.self)).count)
+                y = norm(l.mlp(y))
+            }
+            distinct /= Double(layers.count)
+            let bytes = distinct * perExpert + fixedBytes
+            out.append(String(format: "moe probe: rows %d  %.3f ms per layer (chained)  distinct experts %.1f  %.1f MB per layer  %.0f GB/s",
+                              S, ms, distinct, bytes / 1e6, bytes / (ms / 1000) / 1e9))
+        }
+        let bank = first.switchMLP.parameters().flattened().map { $0.1 }.max { $0.nbytes < $1.nbytes }!
+        for _ in 0 ..< 3 { eval(bank.sum()) }
+        let t0 = Date(); for _ in 0 ..< 16 { eval(bank.sum()) }
+        let ms = Date().timeIntervalSince(t0) * 1000 / 16
+        out.append(String(format: "moe probe: reference sum over one %.0f MB expert bank %.3f ms  %.0f GB/s", Double(bank.nbytes) / 1e6, ms, Double(bank.nbytes) / (ms / 1000) / 1e9))
+        if bank.dtype == .uint32 {
+            for threads in [1 << 16, 1 << 18, 1 << 20] {
+                for _ in 0 ..< 3 { eval(q4ReadBW(bank, threads: threads)) }
+                let t1 = Date(); for _ in 0 ..< 16 { eval(q4ReadBW(bank, threads: threads)) }
+                let m1 = Date().timeIntervalSince(t1) * 1000 / 16
+                out.append(String(format: "moe probe: reference vector read (%d threads) %.3f ms  %.0f GB/s", threads, m1, Double(bank.nbytes) / (m1 / 1000) / 1e9))
+            }
+        }
+        return out
+    }
+}
+
+// MARK: - Hyper-connection probe (diagnostic, engine bench ENGINE_HC_PROBE=1)
+extension Qwen4ExpModel {
+    /// Times the 96 hyper-connection blocks (attention + MLP side of every layer: norm, down projection, up-mix + inject
+    /// partials) chained in one evaluation for `rows` tokens; the chain feeds each block's mixed output back into the
+    /// stream (one add + tile per block), as the layer's combine would.
+    public func hcProbe(rows: [Int], reps: Int = 32) -> [String] {
+        var out: [String] = []
+        let blocks = model.layers.flatMap { [$0.attnHC, $0.mlpHC] }
+        let hc = blocks[0].hc, d = blocks[0].d
+        for S in rows {
+            let h0 = (MLXRandom.normal([1, S, hc * d]) * 0.1).asType(.bfloat16); eval(h0)
+            func chain() -> MLXArray {
+                var h = h0
+                for b in blocks { let (m, _) = b(h); h = h + tiled(m, repetitions: [1, 1, hc]) }
+                return h
+            }
+            for _ in 0 ..< 4 { eval(chain()) }
+            let t0 = Date(); for _ in 0 ..< reps { eval(chain()) }
+            let ms = Date().timeIntervalSince(t0) * 1000 / Double(reps)
+            out.append(String(format: "hc probe: rows %d  %.3f ms per 96 blocks  %.1f us per block (fused chain %@)", S, ms, ms * 1000 / Double(blocks.count),
+                              blocks[0].fusedChainActive(rows: S) ? "on" : "off"))
+        }
+        return out
+    }
+}
+
+// MARK: - Dense projection probe (diagnostic, engine bench ENGINE_PROJ_PROBE=1)
+extension Qwen4ExpModel {
+    /// Times the GDN layers' in_proj_qkvz and out_proj (the engine's q8Proj path, i.e. MLX quantized matmul) for M rows,
+    /// every layer's projection in ONE evaluation (distinct weights, so no cache reuse), and reports us per projection and
+    /// the weight bandwidth that implies.
+    public func projProbe(rows: [Int], reps: Int = 16) -> [String] {
+        var out: [String] = []
+        let gdn = model.layers.compactMap { $0.linearAttn }
+        func bytes(_ l: Linear) -> Int { l.parameters().flattened().reduce(0) { $0 + $1.1.nbytes } }
+        let attn = model.layers.compactMap { $0.selfAttn }
+        let moe = model.layers.map { $0.mlp }
+        func inDim(_ l: Linear) -> Int { (l as? QuantizedLinear).map { $0.weight.dim(1) * 32 / $0.bits } ?? l.weight.dim(1) }
+        let sets: [(String, [Linear])] = [("gdn.qkvz", gdn.map { $0.inProjQKVZ }), ("gdn.out", gdn.map { $0.outProj }),
+                                          ("attn.qkvi", attn.map { $0.qkviProj }), ("attn.o", attn.map { $0.oProj }),
+                                          ("shared.gate_up", moe.map { $0.sharedExpert.gateUpProj }), ("shared.down", moe.map { $0.sharedExpert.downProj }),
+                                          ("lm_head", lmHead.map { [$0] } ?? [])]
+        for (name, lins) in sets {
+            let inDim = inDim(lins[0])
+            let wb = Double(bytes(lins[0]))
+            for M in rows {
+                let x = (MLXRandom.normal([1, M, inDim]) * 0.1).asType(.bfloat16); eval(x)
+                // DEPENDENT chain, as in the forward: each projection's input waits for the previous output (a zero-weighted
+                // add of one output element); independent projections in one evaluation overlap on the GPU and flatter
+                // kernels that leave it underused (C-0063 follow-up: that misranked the small-M qmm tiles)
+                func run() -> [MLXArray] {
+                    var xi = x; var outs: [MLXArray] = []
+                    for l in lins { let y = q8Proj(l, xi); outs.append(y); xi = x + y[.ellipsis, 0 ..< 1] * 0 }
+                    return outs
+                }
+                for _ in 0 ..< 3 { eval(run()) }
+                let t0 = Date(); for _ in 0 ..< reps { eval(run()) }
+                let us = Date().timeIntervalSince(t0) * 1e6 / Double(reps) / Double(lins.count)
+                out.append(String(format: "proj probe: %@ %dx%d x%d M=%2d  %7.1f us per projection  %.0f GB/s  (%.1f MB)", name, lins[0].weight.dim(0), inDim, lins.count, M, us, wb / (us * 1e-6) / 1e9, wb / 1e6))
+            }
+        }
+        return out
     }
 }

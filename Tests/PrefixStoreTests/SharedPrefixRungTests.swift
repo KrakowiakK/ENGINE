@@ -446,7 +446,10 @@ final class SharedPrefixRungTests: XCTestCase {
     func testTheHotCacheSnapshotSaysWhatIsSharedAndIsTodaysWithTheKnobOff() throws {
         // Review F5: the shared bytes are in logical/charged_bytes while entries/rungs count ordinary entries only.
         let todayKeys: Set<String> = ["ceiling_bytes", "target_bytes", "logical_bytes", "charged_bytes", "entries", "rungs",
-                                      "strict_budget", "rejected_stores", "pre_copy_evictions", "copy_attempts", "inflight_entries"]
+                                      "strict_budget", "rejected_stores", "pre_copy_evictions", "copy_attempts", "inflight_entries",
+                                      // 2026-10-01: eviction regret and rung sharing (always reported, knob or not)
+                                      "eviction_regret_requests", "eviction_regret_tokens", "evicted_ledger",
+                                      "rung_dedup_hits", "rung_refs", "rung_unique", "rungs_trimmed", "inflight_replaced"]
         XCTAssertEqual(Set(HotPrefixStore(capBytes: 1 << 30, strictBudget: true).snapshot().keys), todayKeys)
         let s = store(cap: 1 << 30, strict: true)
         capture(s, prompt(head: 1, tail: [7, 1]), mtp: true)

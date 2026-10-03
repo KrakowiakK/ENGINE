@@ -340,6 +340,129 @@ extension ModelThreadTests {
         XCTAssertEqual(order.value, ["d0", "d1", "p0", "d2", "d3", "p1", "d4", "d5"])
     }
 
+    /// Decode affinity: a decoder that resubmits 1 ms after each result, while two prefill callers keep a chunk waiting.
+    /// Off (the shipped behaviour) it gets one dispatch per prefill; on, it gets the whole burst before the next prefill.
+    func testDecodeAffinityLetsADecoderUseItsBurstWhilePrefillWaits() {
+        func run(affinity: TimeInterval) -> (runs: [Int], stats: (waits: Int, hits: Int)) {
+            let mt = ModelThread(minBatch: 1, gatherWindow: 0, maxBatch: 8, maxConsecutiveDecodeDispatches: 4,
+                                 decodeAffinity: affinity) { $0.map(\.key) }
+            defer { mt.shutdown() }
+            let order = Shared([Character]()), decoding = Shared(true)
+            let done = expectation(description: "decoder and prefill callers"); done.expectedFulfillmentCount = 3
+            for _ in 0..<2 {
+                Thread {
+                    while decoding.value { mt.prefill { order.with { $0.append("p") }; Thread.sleep(forTimeInterval: 0.01) } }
+                    done.fulfill()
+                }.start()
+            }
+            waitForQueued(1, on: mt)
+            Thread {
+                mt.enterDecode()
+                for _ in 0..<16 { mt.decode { order.with { $0.append("d") } }; Thread.sleep(forTimeInterval: 0.001) }
+                mt.leaveDecode()
+                decoding.with { $0 = false }
+                done.fulfill()
+            }.start()
+            wait(for: [done], timeout: 20)
+            // lengths of the decode runs that sit between two prefills
+            let text = String(order.value), parts = text.split(separator: "p", omittingEmptySubsequences: false)
+            let interior = parts.dropFirst().dropLast().map(\.count).filter { $0 > 0 }
+            return (interior, mt.decodeAffinityStats)
+        }
+        // thread start-up can leave a moment with no prefill queued, so the shape is asserted on most runs, the burst
+        // bound on every run
+        let off = run(affinity: 0)
+        XCTAssertFalse(off.runs.isEmpty)
+        XCTAssertTrue(off.runs.allSatisfy { $0 <= 4 }, "the burst bound holds: \(off.runs)")
+        XCTAssertGreaterThanOrEqual(off.runs.filter { $0 == 1 }.count * 10, off.runs.count * 7,
+                                    "without affinity a resubmitting decoder gets one dispatch per prefill: \(off.runs)")
+        XCTAssertEqual(off.stats.waits, 0); XCTAssertEqual(off.stats.hits, 0)
+        let on = run(affinity: 1.0)
+        XCTAssertFalse(on.runs.isEmpty)
+        XCTAssertTrue(on.runs.allSatisfy { $0 <= 4 }, "the burst bound holds: \(on.runs)")
+        XCTAssertGreaterThanOrEqual(on.runs.filter { $0 == 4 }.count * 10, on.runs.count * 7,
+                                    "with affinity it uses the burst of 4 between prefills: \(on.runs)")
+        XCTAssertGreaterThan(on.stats.hits, 0); XCTAssertLessThanOrEqual(on.stats.hits, on.stats.waits)
+    }
+
+    /// The server's shape: ONE long prefill that resubmits its next chunk only after the previous ends, and one decoder.
+    /// Without affinity the decoder gets one dispatch per chunk; with it, the burst -- even though no prefill is queued at
+    /// the moment the first decode after a chunk is taken (the case the first version missed).
+    func testDecodeAffinityWorksWithASequentialPrefillCaller() {
+        func run(affinity: TimeInterval) -> [Int] {
+            let mt = ModelThread(minBatch: 1, gatherWindow: 0, maxBatch: 8, maxConsecutiveDecodeDispatches: 4,
+                                 decodeAffinity: affinity) { $0.map(\.key) }
+            defer { mt.shutdown() }
+            let order = Shared([Character]()), decoding = Shared(true), started = DispatchSemaphore(value: 0)
+            let done = expectation(description: "decoder and one prefill caller"); done.expectedFulfillmentCount = 2
+            Thread {
+                // resubmits at once, but only after its chunk ended: at the decode taken right after a chunk the next chunk
+                // is usually not queued yet, which is what made the first version's counter read 0
+                var first = true
+                while decoding.value {
+                    mt.prefill { order.with { $0.append("p") }; Thread.sleep(forTimeInterval: 0.01) }
+                    if first { first = false; started.signal() }
+                }
+                done.fulfill()
+            }.start()
+            XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+            Thread {
+                mt.enterDecode()
+                for _ in 0..<16 { mt.decode { order.with { $0.append("d") } }; Thread.sleep(forTimeInterval: 0.001) }
+                mt.leaveDecode()
+                decoding.with { $0 = false }
+                done.fulfill()
+            }.start()
+            wait(for: [done], timeout: 20)
+            let parts = String(order.value).split(separator: "p", omittingEmptySubsequences: false)
+            return parts.dropFirst().dropLast().map(\.count).filter { $0 > 0 }
+        }
+        let off = run(affinity: 0), on = run(affinity: 1.0)
+        XCTAssertFalse(off.isEmpty); XCTAssertFalse(on.isEmpty)
+        XCTAssertGreaterThanOrEqual(off.filter { $0 == 1 }.count * 10, off.count * 7, "without affinity: \(off)")
+        XCTAssertGreaterThanOrEqual(on.filter { $0 >= 4 }.count * 10, on.count * 7, "with affinity the burst is used: \(on)")
+    }
+
+    /// Time share: with one sequential prefill caller and a decoder that resubmits 1 ms after each 1 ms step, a long chunk
+    /// (20 ms, share 0.5) leaves room for several decode steps per chunk, a short chunk (1 ms) for none -- the short-context
+    /// behaviour stays the shipped one, where a fixed burst of 16 had starved prefill.
+    func testDecodeShareScalesTheBurstWithThePrefillChunk() {
+        func run(chunk: TimeInterval, minWork: Double = 0) -> [Int] {
+            let mt = ModelThread(minBatch: 1, gatherWindow: 0, maxBatch: 8, maxConsecutiveDecodeDispatches: 4,
+                                 decodeAffinity: 1.0, decodeShare: 0.5, decodeShareMinWork: minWork) { $0.map(\.key) }
+            defer { mt.shutdown() }
+            let order = Shared([Character]()), decoding = Shared(true), started = DispatchSemaphore(value: 0)
+            let done = expectation(description: "decoder and one prefill caller"); done.expectedFulfillmentCount = 2
+            Thread {
+                var first = true
+                while decoding.value {
+                    mt.prefill { order.with { $0.append("p") }; Thread.sleep(forTimeInterval: chunk) }
+                    if first { first = false; started.signal() }
+                }
+                done.fulfill()
+            }.start()
+            XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+            Thread {
+                mt.enterDecode()
+                for _ in 0..<30 { mt.decode { order.with { $0.append("d") }; Thread.sleep(forTimeInterval: 0.001) }; Thread.sleep(forTimeInterval: 0.001) }
+                mt.leaveDecode()
+                decoding.with { $0 = false }
+                done.fulfill()
+            }.start()
+            wait(for: [done], timeout: 30)
+            let parts = String(order.value).split(separator: "p", omittingEmptySubsequences: false)
+            return parts.dropFirst().dropLast().map(\.count).filter { $0 > 0 }
+        }
+        let long = run(chunk: 0.02), short = run(chunk: 0.001)
+        XCTAssertFalse(long.isEmpty); XCTAssertFalse(short.isEmpty)
+        XCTAssertTrue(long.allSatisfy { $0 <= 64 }, "the share has a hard cap: \(long)")
+        XCTAssertGreaterThanOrEqual(long.sorted()[long.count / 2], 6, "a 20 ms chunk leaves room for ~10 steps of 1 ms, past the burst of 4: \(long)")
+        XCTAssertGreaterThanOrEqual(short.filter { $0 == 1 }.count * 10, short.count * 7, "a 1 ms chunk leaves none: \(short)")
+        // below the minimum dispatch length the share stays shut even for the 20 ms chunk
+        let gated = run(chunk: 0.02, minWork: 0.05)
+        XCTAssertGreaterThanOrEqual(gated.filter { $0 == 1 }.count * 10, gated.count * 7, "a chunk under decodeShareMinWork opens no share: \(gated)")
+    }
+
     func testBatchGatherCanPassPrefillsButNotDecodeClosures() {
         let order = Shared([String]())
         let mt = ModelThread(minBatch: 2, gatherWindow: 1, maxBatch: 8) { reqs in

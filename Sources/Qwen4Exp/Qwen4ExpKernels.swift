@@ -1501,6 +1501,17 @@ func q4TopK(scores: MLXArray, k K: Int) -> MLXArray {
         FileHandle.standardError.write((line + " distinct_top12bits=\(uniqTop)\n").data(using: .utf8)!)
     }
     if let p = q4TopKParts(rows: B * S, n: n, k: K) { return q4TopKTwoPhase(scores: scores, k: K, parts: p) }
+    // The block count n grows by one every `ratio` tokens, so `n % P == 0` held on one decode step in P and every other
+    // step selected the whole row in ONE threadgroup (250k blocks at 1M). Pad the row with -inf to a multiple of P:
+    // the padding sits at the highest indices, so under the selection's order (key, then lower index first) it ranks
+    // after every real element, and n >= K real elements exist -- the result is the unpadded selection, exactly.
+    if q4TopKPad, n % q4TopKPartsEnv != 0 {
+        let padded = ((n + q4TopKPartsEnv - 1) / q4TopKPartsEnv) * q4TopKPartsEnv
+        if let p = q4TopKParts(rows: B * S, n: padded, k: K) {
+            let fill = MLXArray.full([B, S, padded - n], values: MLXArray(-Float.infinity))
+            return q4TopKTwoPhase(scores: concatenated([scores, fill], axis: 2), k: K, parts: p)
+        }
+    }
     let params = MLXArray([Int32(n), Int32(K)])
     return q4TopKKernel([scores.reshaped(B * S, n), params], template: [("K", K), ("TG", TG)],
                         grid: (B * S * TG, 1, 1), threadGroup: (TG, 1, 1), outputShapes: [[B * S, K]], outputDTypes: [.int32])[0].reshaped(B, S, K)
@@ -1539,6 +1550,9 @@ let q4TopKFoldOffset: Bool = (ProcessInfo.processInfo.environment["ENGINE_QSA_TO
 /// P096 (OBS-ENG-184): below this universe size one 1024-thread group per row beats the two-phase split on real
 /// scores (n = 1024..4096: 40-48 us vs 63-69 per call, the same id set in the same order); in situ at B = 8 rows of
 /// 8192+512i the split cost +1.3-1.4% of the step, at 262144 serial (n = 65536) it is worth +1.3% (P023).
+/// ENGINE_QSA_TOPK_PAD (default on; 0 = off): pad a row whose block count is not a multiple of the part count so the
+/// two-phase selection runs on every step, not on one step in P.
+let q4TopKPad: Bool = ProcessInfo.processInfo.environment["ENGINE_QSA_TOPK_PAD"] != "0"
 let q4TopKPartsMinN: Int = Int(ProcessInfo.processInfo.environment["ENGINE_QSA_TOPK_PARTS_MIN_N"] ?? "32768") ?? 32768
 func q4TopKParts(rows: Int, n: Int, k K: Int) -> Int? {
     let P = q4TopKPartsEnv
@@ -1602,4 +1616,22 @@ func q4TopKTwoPhase(scores: MLXArray, k K: Int, parts P: Int, oneDispatch: Bool 
                             grid: (R * TG, 1, 1), threadGroup: (TG, 1, 1),
                             outputShapes: [[R, K]], outputDTypes: [.int32])[0]
     return c2.reshaped(B, S, K)
+}
+
+/// Diagnostic (ENGINE_MOE_PROBE): a pure read of a uint32 buffer in 16-byte vectors, grid-stride, one xor per thread
+/// written out -- the machine's streaming-read ceiling for the MoE probe to compare against.
+private let q4ReadBWKernel = MLXFast.metalKernel(
+    name: "q4_read_bw", inputNames: ["w", "n4"], outputNames: ["o"],
+    source: """
+        uint gid = thread_position_in_grid.x, nth = threads_per_grid.x;
+        const device uint4* w4 = (const device uint4*)w;
+        uint4 acc = uint4(0);
+        for (ulong i = gid; i < (ulong)n4[0]; i += nth) acc ^= w4[i];
+        o[gid] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+        """)
+func q4ReadBW(_ w: MLXArray, threads: Int = 1 << 18, tg: Int = 256) -> MLXArray {
+    let flat = w.reshaped(-1)
+    precondition(flat.dtype == .uint32 && flat.size % 4 == 0)
+    return q4ReadBWKernel([flat, MLXArray([Int32(flat.size / 4)])], template: [],
+                          grid: (threads, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[threads]], outputDTypes: [.uint32])[0]
 }

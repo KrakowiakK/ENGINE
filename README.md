@@ -8,8 +8,9 @@ machine, a Mac Studio with M3 Ultra and 512 GB of unified memory, where it serve
 
 What it does:
 
-- **Continuous batching** of up to 8 concurrent sessions: requests join and leave a running batch; decode and
-  prefill are scheduled in phases, and compatible prefills are batched natively.
+- **Continuous batching** of up to 16 concurrent sessions: requests join and leave a running batch; decode and
+  prefill are scheduled in phases, compatible prefills are batched natively, and while a long prompt prefills the
+  decoding rows keep getting up to half of its time (`ENGINE_DECODE_SHARE=0.5`, `ENGINE_DECODE_AFFINITY_MS=5`).
 - **MTP speculative decoding** in the production launcher's profile (`engine serve` itself defaults to `--mtp 0`,
   no MTP), using the model's own multi-token-prediction head: K = 3 for a lone request; batched rows draft up to
   K = 3, with the depth (or a plain step) chosen adaptively from measured acceptance and round cost. Some requests
@@ -19,21 +20,29 @@ What it does:
   state. A forced tool-call prefix switches a request to serial decoding at that point.
 - **Hot prefix cache in GPU memory**: a new turn can resume from the previous turn's state instead of re-prefilling
   the conversation, as long as that state is still in the cache. It shares one RAM budget with the live requests
-  (ceiling 128 GB) and only gets what live reservations leave: with the default rest-of-context reservation, about
-  22 GB at 8 concurrent requests (DERIVED from the admission formula, not measured under load). An optional disk
-  cache can be enabled.
-- **262,144-token context** (the checkpoint's `max_position_embeddings`), with admission control that reserves
-  memory before a request starts and answers `503` + `Retry-After` instead of running out of memory.
+  (ceiling 192 GB) and only gets what live reservations leave. An optional disk cache can be enabled.
+- **1,048,576-token context** (`--max-context 1048576` in `tools/serve.sh`, four times the checkpoint's
+  `max_position_embeddings` of 262,144). In our tests at about 1M tokens, facts were recalled verbatim, but the order of
+  two far-apart facts could come out swapped (the same answer without any engine feature involved: a model limit).
+- **Admission control** reserves memory before a request starts. A request that does not fit yet waits for room (up
+  to the queue timeout) instead of failing at once, and only then answers `503` + `Retry-After`. The bound prices two
+  copies of each row's history (`ENGINE_ADMISSION_HISTORY_FACTOR=2` in `tools/serve.sh`; the binary's default is 3):
+  rows keep their own KV, written in place.
 - **Memory guard** for a Mac that also runs other things: the engine never plans for more than the memory that was free
   when it started (and refuses to start, with the numbers, if the weights cannot fit), and it follows macOS's
   memory-pressure signal plus the free memory every 2 s. Under pressure the hot prefix cache first shrinks to half, then
-  empties, and new requests get `503` while running ones finish; it recovers on its own. The level is shown in
+  empties, and new requests wait (up to the queue timeout, then `503`) while running ones finish; it recovers on its own. The level is shown in
   `/v1/engine/sessions` (`memory_guard`) and logged. `ENGINE_MEMORY_GUARD=0` turns it off.
-- **Thinking soft stop**: instead of a hard thinking budget, a bias on `</think>` ramps up to +12 logits between
-  2,000 and 8,000 thinking tokens so the model closes its reasoning at a sentence boundary. After 8,000 tokens the bias keeps
-  climbing, quadratically, to +52 logits at a deadline of 14,000 thinking tokens. That exceeds every `</think>` gap
-  measured (about 24 logits), so the block closes in practice (DERIVED, not a measured guarantee). A smaller
-  `max_tokens` ends the reply first.
+- **Thinking soft stop**: instead of a hard thinking budget, a bias on `</think>` ramps up to +16 logits between
+  1,000 and 4,000 thinking tokens, and until a deadline of 8,000 thinking tokens it acts only right after a token that
+  ends a line (`--think-bias-gate line`), so the model closes its reasoning at a line break, never mid-sentence. After
+  4,000 tokens the bias keeps climbing, quadratically, to +56 logits at the deadline, where it acts at every token. That
+  exceeds every `</think>` gap measured (about 24 logits), so the block closes in practice (DERIVED, not a measured
+  guarantee). On 38 graded coding tasks at `xhigh` this profile passed 38/38 in 850 s, against 35/38 in 1,646 s for the
+  previous one. A smaller `max_tokens` ends the reply first.
+- **Copy mode** (`ENGINE_DRAFT_COPY=1` in `tools/serve.sh`, contexts up to 64k tokens): when the answer repeats text
+  from the context (code edits), a lone request verifies blocks of up to 12 tokens looked up in the context instead of
+  drafted ones; code edits decoded ~25% faster (120 -> 151 tok/s) with the same graded results.
 - **Reasoning effort levels** from the checkpoint's chat template: `xhigh` (default), `medium`, `low`.
 - Custom Metal kernels for the model's hyper-connection chain, MoE experts, gated-delta-net layers and
   sparse-attention gather, in `Sources/Qwen4Exp`, on a modified fork of mlx-swift / mlx-swift-lm (`Vendor/`).
@@ -57,7 +66,9 @@ What it does:
 - Memory: the weights take 194.9 GB. A single 262,144-token prefill (chunk 4096, `engine nll`, build B44) peaked at
   252.6 GB (OBS-ENG-204), and the B50 production build peaked at 292.8 GB in the release gate's concurrent
   long-context soak test (SOAK900) and at 344.9 GB in the full-context (258k-token) gate run, where the hot prefix
-  cache held about 127 GB. These are observed peaks, not an upper bound. `tools/serve.sh` caps the MLX buffer cache at 32 GB.
+  cache held about 127 GB. On 2026-10-03, 16 parallel sessions peaked at 366.9 GB of MLX memory at 32k tokens each
+  (free memory never below 114 GB). These are observed peaks, not an upper bound. `tools/serve.sh` caps the MLX buffer
+  cache at 32 GB.
 - Xcode with the Swift 6.3 toolchain (`swift-tools-version: 6.3`), Xcode's Metal Toolchain
   (`xcodebuild -downloadComponent MetalToolchain`) and `cmake` (`brew install cmake`) for the Metal library.
 - Network access for the first build: SwiftPM fetches the Swift package dependencies (for example
@@ -111,10 +122,11 @@ curl http://127.0.0.1:8099/v1/models
 ```
 
 `tools/serve.sh` is the production launcher. It runs one foreground process and pins the tested profile: MTP K = 3
-(batched rows up to K = 3, adaptively), up to 8 concurrent requests with up to 32 more waiting in a first-in-first-out
-queue (at most 1,500 s each), batching from 4 ready rows up to 8 rows with a 25 ms gather window,
-phase scheduling with native batched prefill, a shared RAM budget with a 128 GB hot-cache ceiling, the thinking
-soft stop, `reasoning_effort` default `xhigh`, no default `max_tokens` cap, and oversized `max_tokens` clamped. It
+(batched rows up to K = 3, adaptively), up to 16 concurrent requests with up to 32 more waiting in a first-in-first-out
+queue (at most 1,500 s each), batching from 2 ready rows up to 16 rows with a 25 ms gather window,
+phase scheduling with native batched prefill and the decode time share, a shared RAM budget with a 192 GB hot-cache
+ceiling, copy mode, the thinking soft stop, `reasoning_effort` default `xhigh`, a 1,048,576-token context, no default
+`max_tokens` cap, and oversized `max_tokens` clamped. It
 refuses overrides of the batching, prefill, hot-cache, concurrency, MTP and state-cache flags and of the scheduler
 environment. Other trailing arguments (for example reasoning effort, the soft-stop settings, the `max_tokens`
 policy or the request queue's `--queue-max` / `--queue-timeout-s`) are passed through and override the defaults, as do `ENGINE_CACHE_LIMIT_GB` and `ENGINE_WIRED_LIMIT_GB`.
@@ -159,7 +171,7 @@ restarting it, and without authentication.
 
 Request defaults (production launcher):
 
-- **No `max_tokens`**: the reply may use the rest of the context (262,144 − prompt − speculative lookahead).
+- **No `max_tokens`**: the reply may use the rest of the context (1,048,576 − prompt − speculative lookahead).
 - **Oversized `max_tokens`**: clamped to the room left instead of refused. A prompt that leaves no room at all is
   refused with HTTP 400.
 - **`reasoning_effort`**: default `xhigh`. `high`, `max` and `maximum` map to `xhigh`, and `minimal`, `none` and `off`
@@ -172,12 +184,12 @@ Request defaults (production launcher):
   request's argmax; `min_p` does nothing to a greedy request. Out-of-range values are refused with `400`. A request
   that uses a penalty or `logit_bias` (or `min_p` with sampling) decodes serially without MTP, like `logprobs`, so
   it is slower; default values (0, 1, empty) keep the fast batched path. Logprobs are those of the raw logits.
-- Limits: HTTP headers 64 KiB, body 32 MiB. A request that finds all 8 slots busy waits in a first-in-first-out queue
-  and starts as soon as a slot frees (`tools/serve.sh`: `--queue-max 32 --queue-timeout-s 1500`). A full queue, a wait
-  past the limit, or no memory for the request's reservation answers `503` with `Retry-After: 1`. Run directly
-  without `--queue-max` (the binary's default is 0; its default `--queue-timeout-s` is 1800), `engine serve` answers
-  the 9th concurrent request with the `503` at once. The live queue counters are in `GET /v1/engine/sessions` under
-  `queue`.
+- Limits: HTTP headers 64 KiB, body 32 MiB. A request that finds all 16 slots busy waits in a first-in-first-out
+  queue and starts as soon as a slot frees (`tools/serve.sh`: `--queue-max 32 --queue-timeout-s 1500`); a request
+  whose KV reservation does not fit yet waits for memory the same way (`ENGINE_ADMISSION_WAIT`, on by default). A full
+  queue or a wait past the limit answers `503` with `Retry-After: 1`. Run directly without `--queue-max` (the binary's
+  default is 0; its default `--queue-timeout-s` is 1800), `engine serve` answers the 17th concurrent request with the
+  `503` at once. The live counters are in `GET /v1/engine/sessions` under `queue` and `admission_wait`.
 
 ## Engine Studio and the dashboard
 
@@ -191,7 +203,7 @@ It attaches to an engine already serving on port 8099 and never starts a second 
 that requires `ENGINE_API_KEY`: Studio sends no key, so the engine answers 401 and Studio reports it as alive but
 not answering. It starts an engine itself only when none is running. An engine launched by Studio uses Studio's own
 argument list, not the gated production profile. Compared with `tools/serve.sh` it has a 48 GB hot cache instead of
-128 GB, the disk cache on and loop guard 3, and it lacks native batched prefill (`ENGINE_BATCH_PREFILL` /
+192 GB, the disk cache on and loop guard 3, and it lacks native batched prefill (`ENGINE_BATCH_PREFILL` /
 `ENGINE_PREFILL_ROW_PROJECTIONS` unset), the shared RAM budget, the pooled private-history release and the
 width-canonical prefill (`ENGINE_PREFILL_WIDTH_CANONICAL`). Phase scheduling and batching from 4 rows come from the
 binary's defaults. MTP does not: `engine serve` defaults to `--mtp 0`. Studio passes `--mtp 3` (its `mtp_depth`
@@ -207,59 +219,56 @@ sessions payload. See [apps/engine-studio/README.md](apps/engine-studio/README.m
 
 ## Performance
 
-All numbers below were **measured on build B50** (the production build before this export) on one Mac Studio with
-M3 Ultra (80-core GPU) and 512 GB, macOS 27.2, `iogpu.disable_wired_collector=1`. This export is build B56: B52
-changed the request defaults above, B53 added the request queue, B54 the shared-prefix rung (a repeated 1024-token
-prompt head is prefilled once) and the admission growth window (the hot cache is not squeezed by output a request has
-not generated yet), B56 the sampling parameters `min_p`, the penalties and `logit_bias`, and the memory guard; greedy
-output of requests without the new parameters was checked identical to the previous build before each deployment. B50 served with a
-default `reasoning_effort` of `medium` and a default `max_tokens` of 32,000. None of the clients below set
-`reasoning_effort`, so every figure ran at `medium`, and every client set `max_tokens` explicitly. The figures were
-not re-measured on B52-B54 (except the llm_context_benchmarks run in the requirements section). Generated tokens include the
-reasoning tokens. Treat the figures as indicative, not as guarantees.
+Measured on 2026-10-03 on one Mac Studio with M3 Ultra (80-core GPU) and 512 GB, macOS 27.2,
+`iogpu.disable_wired_collector=1`, behind `tools/serve.sh`, with the prose files of the `llm_context_benchmarks`
+client (commit 5574d0b): a novel cut to the given length in cl100k tokens, a unique cache-busting prefix per request
+(every prompt is cold) and the request "Please provide a summary of the above text.", at most 512 generated tokens.
+The single-stream figures ran on the production build just before this export; this export adds the model-thread
+autorelease pool and the admission factor, and its quality gates measured the same speed (real suite 90.89 against
+90.90 tok/s; 16 concurrent streams 189.7 against 191.2 tok/s). Generated tokens include the reasoning tokens (default
+`reasoning_effort` `xhigh`). Treat the figures as indicative, not as guarantees.
 
-**One request at a time**: B50 behind the production launcher `tools/serve.sh` (MTP on), measured with the
-`llm_context_benchmarks` client (commit 5574d0b). Each request is a cold prompt of the given length (the client
-busts the cache per prompt), 256 generated tokens, `temperature` 1.0 (the client's default). Two runs per point;
-each figure is the better of the two runs for that metric, so the three figures in one column can come from
-different runs. Generation differed by up to 11 % between the two runs; at 0.5k, prefill and time to first token
-differed by about 25 %. Client-side timing: prefill = prompt
-tokens ÷ the client's prompt time, generation = (generated tokens − 1) ÷ the time after the first token, time to
-first token end to end:
+**One request at a time** (`openai_benchmark.py`): server-reported prefill and generation rates, time to first token
+end to end. At the client's default `temperature` 1.0 two runs per point up to 256k (each figure the better of the
+two), one run at 512k and 1000k; greedy (`temperature` 0) one run per point:
 
-| Context | 0.5k | 8k | 32k | 64k | 256k |
-|---|---|---|---|---|---|
-| Generation, tok/s | 102.7 | 91.3 | 88.6 | 80.4 | 77.0 |
-| Prefill, tok/s | 765 | 1,185 | 1,255 | 1,251 | 1,196 |
-| Time to first token, s | 0.67 | 6.95 | 26.1 | 52.1 | 218.0 |
+| Context (cl100k) | 0.5k | 8k | 32k | 128k | 256k | 512k | 1000k |
+|---|---|---|---|---|---|---|---|
+| Prompt tokens (E9) | 554 | 8,281 | 32,759 | 129,264 | 260,636 | 521,241 | 1,017,845 |
+| Prefill, tok/s | 826 | 1,212 | 1,261 | 1,249 | 1,223 | 1,027 | 855 |
+| Time to first token, s | 0.70 | 6.90 | 26.1 | 104.0 | 214.1 | 509.3 | 1,193.5 |
+| Generation at temperature 1.0, tok/s | 83.6 | 61.3 | 62.8 | 59.8 | 54.1 | 63.7 | 59.4 |
+| Generation greedy, tok/s | 85.4 | 79.0 | 76.6 | 71.8 | 68.3 | - | - |
 
-The 0.5k generation figure rests on a delayed first token.
+Greedy generation is faster because a draft token is accepted only when it matches the token the target picks, and a
+sampled pick matches the draft less often than the argmax does. A 1M-token prompt takes about 20 minutes to prefill
+cold; a later turn of the same conversation resumes from the hot prefix cache as long as its state is still there.
 
-**N concurrent sessions**: B50 behind `tools/serve.sh`, measured with the project's own concurrent client. N
-requests are released together, each a cold prompt of the given length (a unique prefix per request defeats the
-cache) followed by a summarisation question, 256 generated tokens each, greedy (`temperature` 0), one run per
-point. Summed decode = the sum over sessions of (generated tokens ÷ time after the first token), client-side:
+**16 parallel sessions** (the project's concurrent client, the same prose files and settings, `temperature` 1.0, one
+run per point, all 16 requests released together): aggregate prefill = all prompt tokens ÷ the slowest session's time
+to first token; generation = the sum over sessions of their server-reported decode rates.
 
-| Context per session | 2k | 8k | 32k | 64k | 256k |
-|---|---|---|---|---|---|
-| N = 8, tok/s | 226.0 | 221.7 | 206.4 | - | - |
-| N = 4, tok/s | 147.8 | 152.4 | 146.4 | 151.5 | - |
-| N = 1, tok/s | 89.4 | 90.5 | 92.5 | 79.5 | 79.7 |
+| Context per session (cl100k) | 0.5k | 2k | 8k | 32k | 64k | 128k |
+|---|---|---|---|---|---|---|
+| Prompt tokens per session (E9) | 552 | 2,172 | 8,280 | 32,758 | 65,265 | 129,262 |
+| Aggregate prefill, tok/s | 631 | 844 | 1,194 | 1,223 | 1,205 | 1,138 |
+| Aggregate generation, tok/s | 272 | 260 | 236 | 218 | 204 | 189 |
+| Generation per session (median), tok/s | 16.8 | 15.8 | 14.6 | 13.7 | 12.8 | 11.9 |
+| Time to first token (median), s | 13.8 | 41.2 | 109.5 | 427.3 | 865.3 | 1,815.5 |
+| Peak MLX memory, GB | 288 | 305 | 333 | 390 | 367 | 342 |
 
-In the same runs, aggregate prefill of the concurrent cold prompts (all prompt tokens ÷ the slowest session's time
-to first token) was 1,143 tok/s (N = 8, 8k), 1,159 tok/s (N = 8, 32k) and 864 tok/s (N = 4, 2k).
+All 16 requests were admitted together at every size, this export's build (at 128k: 176 GB of the 219.5 GB KV
+budget reserved, free memory never below 137 GB).
 
-**Full context, cold**: the server-reported time to first token for a 258,089-token prompt (a novel plus one
-question, greedy, 64 output tokens) was 210.80 s and 210.49 s in two runs on B50. These come from the project's
-release-gate harness, which starts a fresh `engine serve` for each run with its own copy of the serving flags and
-sends that one request; it is not `tools/serve.sh` under a production workload.
+The requests of a burst do not start decoding one by one: up to 4k tokens one of them decodes at once and the other
+15 get their first token together once every prefill in the burst has finished; from 8k tokens on all 16 wait for the
+whole burst (a scheduling property, noted below).
 
-A later turn of the same conversation can avoid paying this again for the part already seen, but only if the
-previous turn's state is still in the hot prefix cache: the engine then restores it from GPU memory and prefills
-only the tokens after the cached point. The cache is bounded by its 128 GB ceiling and by what live requests' RAM
-reservations leave (about 22 GB at 8 concurrent rest-of-context requests, DERIVED), and it evicts entries to make
-room; a turn whose entry was evicted pays the cold prefill again. Hit rates under load are not part of the
-measurements above.
+A later turn of the same conversation can avoid paying the prefill again for the part already seen, but only if the
+previous turn's state is still in the hot prefix cache: the engine then restores it from GPU memory and prefills only
+the tokens after the cached point. The cache is bounded by its 192 GB ceiling and by what live requests' RAM
+reservations leave, and it evicts entries to make room; a turn whose entry was evicted pays the cold prefill again.
+Hit rates under load are not part of the measurements above.
 
 ## Known limitations
 
@@ -274,6 +283,8 @@ measurements above.
 - A continuation resumed from the hot cache is not guaranteed to be token-identical to a cold prefill of the same
   prompt. This is a design trade-off: the launcher reuses the live decode state as the prefix, which avoids
   re-prefilling but is not bit-identical to a cold prefill.
+- When many cold requests arrive together, the ones whose prefill finishes early wait for the whole burst's prefill
+  before their first token (see the 16-session table); a single request or a trickle of requests is not affected.
 - Only E9 (`qwen4_exp`) is supported by the serving path. Other models are untested.
 - The HTTP server is text-only. Image and video input exist only in the `engine generate` development command
   (`--image`, `--video`); that path was last tested with E9 on ENGINE builds of 2026-08-31 and 2026-09-01, not on B50 or B52.

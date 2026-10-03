@@ -179,6 +179,21 @@ final class SharedRAMBudgetTests: XCTestCase {
         XCTAssertEqual(cache.snapshot()["inflight_entries"], 0)
     }
 
+    /// A long prefill stores its state at every chunk end for coalescing: each store replaces the same request's
+    /// previous partial entry, so one prompt never holds more than one partial copy (nor evicts others for its own).
+    func testInflightStoreReplacesTheSameRequestsPreviousPartialEntry() {
+        let cache = HotPrefixStore(capBytes: 10_000_000, strictBudget: true)
+        store(cache, Array(500..<564), row(64, salt: 5))
+        for end in stride(from: 16, through: 64, by: 16) {
+            store(cache, Array(0..<end), row(end), inFlight: true, owner: 4)
+        }
+        store(cache, Array(0..<32), row(32, salt: 7), inFlight: true, owner: 8)
+        XCTAssertEqual(cache.entries.filter { $0.inFlight && $0.owner == 4 }.map(\.tokens.count), [64])
+        XCTAssertEqual(cache.snapshot()["inflight_entries"], 2, "another request's partial entry stays")
+        XCTAssertEqual(cache.snapshot()["inflight_replaced"], 3)
+        XCTAssertEqual(cache.count, 3, "the finished entry is untouched")
+    }
+
     func testPhysicalReclaimRefusalSkipsCacheCopy() {
         let cache = HotPrefixStore(capBytes: 300_000, strictBudget: true)
         cache.permitAllocation = { _ in false }

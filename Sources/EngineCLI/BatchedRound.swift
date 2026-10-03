@@ -145,6 +145,7 @@ func primeRowSpec(_ qm: Qwen4ExpModel, ids: [Int], cache: [KVCache], chunk: Int)
 struct BatchRoundRow {
     var greedy: Bool = true
     var bias: Float = 0                // the row's soft-stop bias at this position (applied to every verify row)
+    var biasGated = false              // T-0045: the bias acts only on verify rows whose input token ends a line / paragraph
     var thinkOpen: Bool = false
     var stopIds: Set<Int> = []
     var drawKey: (() -> MLXArray?)? = nil
@@ -182,8 +183,13 @@ func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecP
     var l = vl
     let biases = rows.map { $0.bias }
     if biases.contains(where: { $0 > 0 }) {
+        var add = MLXArray(biases).reshaped([B, 1])
+        if rows.contains(where: { $0.biasGated }), let mask = engineBoundaryMask {
+            let g = MLXArray(rows.map { $0.biasGated ? Float(1) : 0 }).reshaped([B, 1])
+            add = add * (g * mask.take(block) + (1 - g))                  // (B, K+1)
+        }
         let col = l[0..., 0..., engineThinkCloseId ..< (engineThinkCloseId + 1)]
-        l[0..., 0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + MLXArray(biases).reshaped([B, 1, 1]).asType(l.dtype)
+        l[0..., 0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + add.reshaped([B, -1, 1]).asType(l.dtype)
     }
     let V = l.dim(-1)
     let preds: MLXArray

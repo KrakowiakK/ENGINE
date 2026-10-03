@@ -1,6 +1,10 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <array>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
 
 #include "mlx/backend/common/broadcasting.h"
 #include "mlx/backend/common/compiled.h"
@@ -15,6 +19,45 @@
 #include "mlx/utils.h"
 
 namespace mlx::core {
+
+// ENGINE_QMM_TRACE=1 (tools/profile/qmm_paths.sh, gate G2): one line per quantized-matmul DISPATCH of 2..64 rows naming the
+// kernel that actually runs (tile and split-K included) -- a decision-level trace once said "qmm" while MLX's split-K
+// kernel, not the tile under test, ran those shapes.
+// ENGINE_QMM_TRACE=1: one line per quantized matmul dispatch of 2..64 rows; ENGINE_QMM_TRACE=unique: each distinct
+// (path, kernel, M, N, K, split) once (microbenchmarks dispatch the same shape thousands of times).
+static void engine_qmm_trace(const char* fn, const std::string& kname, int M, int N, int K, int split) {
+  static const char* mode = std::getenv("ENGINE_QMM_TRACE");
+  if (!mode || M < 2 || M > 64) return;
+  if (std::strcmp(mode, "unique") == 0) {
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    std::string key = std::string(fn) + "|" + kname + "|" + std::to_string(M) + "|" + std::to_string(N) + "|" +
+        std::to_string(K) + "|" + std::to_string(split);
+    std::lock_guard<std::mutex> lock(mu);
+    if (!seen.insert(key).second) return;
+  }
+  std::fprintf(stderr, "qmm trace: M=%d N=%d K=%d fn=%s kernel=%s split=%d\n", M, N, K, fn, kname.c_str(), split);
+}
+
+// ENGINE quantized-matmul policy (measured on the M3 Ultra, KB C-0064..C-0069): transposed 8-bit products of 5..16 rows
+// with WIDE outputs (N >= 8192) take a 16x32x32 qmm tile, NARROW outputs take split-K with a 16x32x32 tile from 9 rows;
+// 1..4 rows and 17+ rows keep MLX's choice (xr8 qmv beats every tile at 2..4 rows; a 16-row tile loses from 17 rows).
+// ENGINE_QMM_POLICY=mlx restores MLX's choices everywhere; each ENGINE_Q* knob still overrides its own default.
+static bool engine_qmm_policy() {
+  static const bool on = [] { const char* e = std::getenv("ENGINE_QMM_POLICY"); return !(e && std::strcmp(e, "mlx") == 0); }();
+  return on;
+}
+static int engine_qmm_int(const char* name, int policy_value, int mlx_value) {
+  const char* e = std::getenv(name);
+  if (e && e[0]) return std::atoi(e);
+  return engine_qmm_policy() ? policy_value : mlx_value;
+}
+static std::array<int, 3> engine_qmm_tile(const char* name, std::array<int, 3> policy_value, std::array<int, 3> mlx_value) {
+  std::array<int, 3> t = engine_qmm_policy() ? policy_value : mlx_value;
+  if (const char* e = std::getenv(name); e && e[0]) { std::sscanf(e, "%d,%d,%d", &t[0], &t[1], &t[2]); }
+  return t;
+}
+
 
 namespace {
 
@@ -231,6 +274,7 @@ void qmv_quad(
   compute_encoder.set_bytes(N, c++);
   add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c++);
 
+  engine_qmm_trace("qmv_quad", kname, M, N, K, 1);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -318,6 +362,7 @@ void qmv(
   compute_encoder.set_bytes(N, c++);
   add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
 
+  engine_qmm_trace("qmv", kname, M, N, K, 1);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -745,12 +790,24 @@ void qmm(
   int wn = 2;
   int bm = 32;
   int bn = 32;
+  int bk = 32;
+  // ENGINE: small-M tiles for the transposed qmm (verify blocks and batched rows of 5..16 rows ran in a 32-row tile, half
+  // of its MMA work on padding). ENGINE_QMM_SMALL_M = largest M routed here (policy 16, MLX 0 = off), ENGINE_QMM_TILE =
+  // "BM,BK,BN" (BM, BN multiples of 16; BK a multiple of 32). The kernel template already takes BM/BK/BN.
+  static const int small_m = engine_qmm_int("ENGINE_QMM_SMALL_M", 16, 0);
+  static const std::array<int, 3> small_tile = engine_qmm_tile("ENGINE_QMM_TILE", {16, 32, 32}, {16, 32, 32});
+  // ENGINE_QMM_SMALL_MIN_N: only outputs this wide take the small tile (default 8192). Without split-K a tile's time has a
+  // floor set by its serial K loop (~0.73..0.88 us per 32-wide step at any N up to 256 threadgroups), while qmv scales with
+  // the bytes, so the tile wins only on wide outputs (C-0065); narrow ones take split-K below.
+  static const int small_min_n = engine_qmm_int("ENGINE_QMM_SMALL_MIN_N", 8192, 8192);
+  const bool small = transpose && small_m > 0 && M <= small_m && N >= small_min_n && K % small_tile[1] == 0;
+  if (small) { bm = small_tile[0]; bk = small_tile[1]; bn = small_tile[2]; }
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
   std::string kname;
   kname.reserve(64);
-  bool aligned = N % 32 == 0;
+  bool aligned = N % bn == 0;
   bool batched = B > 1;
   std::string type_string = get_type_string(x.dtype());
   concatenate(
@@ -762,10 +819,14 @@ void qmm(
       "_b_",
       bits,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      batched ? "_batch_1" : "_batch_0");
+      batched ? "_batch_1" : "_batch_0",
+      small ? "_tile_" + std::to_string(bm) + "_" + std::to_string(bk) + "_" + std::to_string(bn) : "");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
-  if (transpose) {
+  if (transpose && small) {
+    kernel = get_quantized_kernel_wrapped(
+        d, kname, "qmm_t", mode, type_string, group_size, bits, aligned, batched, bm, bk, bn);
+  } else if (transpose) {
     kernel = get_quantized_kernel_wrapped(
         d,
         kname,
@@ -796,6 +857,7 @@ void qmm(
   compute_encoder.set_bytes(M, c++);
   add_strides_and_shapes(compute_encoder, B <= 1, x, w, scales, biases, c);
 
+  engine_qmm_trace("qmm", kname, M, N, K, 1);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
@@ -814,17 +876,32 @@ void qmm_splitk(
     const Stream& s,
     const std::string& mode) {
   // Choose split_k to target ~512 threadgroups
-  int bm = 32, bn = 32;
+  static const int nosplit_small = engine_qmm_int("ENGINE_QMM_SMALL_NOSPLIT", 0, 0);
+  if (nosplit_small > 0 && M <= nosplit_small) {
+    return qmm(x, w, scales, biases, out, true, group_size, bits, M, N, K, d, s, mode);
+  }
+  // ENGINE split-K knobs: ENGINE_QMM_SPLIT_TILE = "BM,BK,BN" of the split kernel (policy 16,32,32: 12..16-row narrow
+  // outputs 74 -> 52 us on 2560x6144, C-0066), ENGINE_QMM_SPLIT_K = a forced split factor, ENGINE_QMM_SPLIT_TGS = the
+  // threadgroup target of the automatic factor (MLX: 512), ENGINE_QMM_SPLIT_TILE_MAX_M = the custom tile only up to this
+  // many rows (policy 16: at 17..32 rows a 16-row tile makes two row tiles read every weight tile, 320x10240 M=20
+  // 24.9 -> 29.9 us, C-0068).
+  static const std::array<int, 3> split_tile = engine_qmm_tile("ENGINE_QMM_SPLIT_TILE", {16, 32, 32}, {32, 32, 32});
+  static const int split_forced = engine_qmm_int("ENGINE_QMM_SPLIT_K", 0, 0);
+  static const int split_tgs = engine_qmm_int("ENGINE_QMM_SPLIT_TGS", 512, 512);
+  static const int split_tile_max_m = engine_qmm_int("ENGINE_QMM_SPLIT_TILE_MAX_M", 16, 0);
+  const bool tile_applies = split_tile_max_m <= 0 || M <= split_tile_max_m;
+  int bm = tile_applies ? split_tile[0] : 32, bk = tile_applies ? split_tile[1] : 32, bn = tile_applies ? split_tile[2] : 32;
+  const bool split_custom = bm != 32 || bk != 32 || bn != 32;
   int n_tiles = (N + bn - 1) / bn;
   int m_tiles = (M + bm - 1) / bm;
   int current_tgs = n_tiles * m_tiles;
-  int split_k = std::max(1, 512 / current_tgs);
+  int split_k = split_forced > 0 ? split_forced : std::max(1, split_tgs / current_tgs);
 
   // Each K partition must be a whole number of BK-wide (32) K-tiles as well as
   // whole quantization groups. The qmm_t_splitk kernels tile K by BK=32 and do
   // not bound the K dimension, so a partition smaller than BK (e.g. nvfp4's
   // group_size=16) would over-read into the next group's weights/scales.
-  int k_align = std::max(group_size, 32);
+  int k_align = std::max(group_size, bk);
   split_k = std::min(split_k, K / k_align);
 
   // Ensure K divides evenly by split_k * k_align
@@ -855,7 +932,7 @@ void qmm_splitk(
   MTL::Size group_dims(32, 2, 2);
   MTL::Size grid_dims(n_tiles, m_tiles, split_k);
 
-  bool aligned = N % 32 == 0;
+  bool aligned = N % bn == 0;
   std::string type_string = get_type_string(x.dtype());
   std::string kname;
   kname.reserve(64);
@@ -867,9 +944,11 @@ void qmm_splitk(
       group_size,
       "_b_",
       bits,
-      aligned ? "_alN_true" : "_alN_false");
-  auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned);
+      aligned ? "_alN_true" : "_alN_false",
+      split_custom ? "_tile_" + std::to_string(bm) + "_" + std::to_string(bk) + "_" + std::to_string(bn) : "");
+  auto kernel = split_custom
+      ? get_quantized_kernel_wrapped(d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned, bm, bk, bn)
+      : get_quantized_kernel_wrapped(d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -887,6 +966,7 @@ void qmm_splitk(
   compute_encoder.set_bytes(k_partition_size, c++);
   compute_encoder.set_bytes(split_k_partition_stride, c++);
 
+  engine_qmm_trace("qmm_splitk", kname, M, N, K, split_k);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 
   // Sum across split_k dimension (axis 0)
@@ -1600,6 +1680,14 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int N = out.shape(-1);
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+  // ENGINE_QMV_LIMIT: rows from which a transposed quantized matmul with an output at least ENGINE_QMM_SMALL_MIN_N wide
+  // leaves qmv (policy 5, MLX 0 = its table); ENGINE_QMV_LIMIT_NARROW: the same for narrower outputs (policy 9: qmv stays
+  // best through 8 rows and ties at 9, split-K with a 16-row tile wins from 9..10 rows, C-0068)
+  static const int qmv_limit = engine_qmm_int("ENGINE_QMV_LIMIT", 5, 0);
+  static const int qmv_limit_min_n = engine_qmm_int("ENGINE_QMM_SMALL_MIN_N", 8192, 8192);
+  if (transpose_ && qmv_limit > 0 && N >= qmv_limit_min_n) vector_limit = qmv_limit;
+  static const int qmv_limit_narrow = engine_qmm_int("ENGINE_QMV_LIMIT_NARROW", 9, 0);
+  if (transpose_ && qmv_limit_narrow > 0 && N < qmv_limit_min_n) vector_limit = qmv_limit_narrow;
   auto mode = quantization_mode_to_string(mode_);
   // It is a matrix matrix product.
   if (M >= vector_limit) {

@@ -199,6 +199,18 @@ public final class ModelThread: @unchecked Sendable {
     private let prefillTokenBudget: Int
     private let prefillDecodeTokenBudget: Int
     private var consecutiveDecodeDispatches = 0
+    /// Decode affinity (see `decodeAffinity`): how often the owner waited for a decoder's next job, and how often it came.
+    private var decodeAffinityWaits = 0, decodeAffinityHits = 0
+    /// Decode dispatches since the last prefill dispatch, whether or not a prefill was queued at the time -- the burst the
+    /// affinity wait counts. `consecutiveDecodeDispatches` restarts when no prefill is queued, and a lone long prefill
+    /// resubmits its next chunk only after the previous one ends, so it read 0 at almost every decision: the first
+    /// version waited 6 times in a whole 300k prefill (night A/B 2026-10-03).
+    private var decodesSincePrefill = 0
+    /// Time share (see `decodeShare`): the owner-measured work of the last prefill dispatch and the decode work since.
+    private var lastPrefillWork = 0.0, decodeWorkSincePrefill = 0.0
+    private let decodeShare: Double, decodeShareMinWork: Double
+    private static let decodeShareCap = 64
+    private let decodeAffinity: TimeInterval
     private var consecutivePrefillReorders = 0
     private let runBatch: ([StepRequest]) -> [Int]
     private let snapshot: ((StepRequest, Int) -> StepResult)?
@@ -228,6 +240,17 @@ public final class ModelThread: @unchecked Sendable {
     ///   still runs its ordinary body, alone. Prefill batching adds no gathering delay.
     /// - prefillDecodeTokenBudget: tighter aggregate cap while any request is decoding. This
     ///   limits prefill grouping without changing a request's chunk width or arithmetic.
+    /// - decodeAffinity: right after a decode dispatch, with prefill waiting, the decode burst not used up and a decoder
+    ///   registered, wait up to this long for that decoder's next job before the prefill runs (0 = never wait). A
+    ///   decoding row submits its next step a moment after its last result, so without the wait it got ONE dispatch per
+    ///   prefill chunk: 2.4-3.0 tok/s for a short chat while a 1M-token document prefilled in ~1.3 s chunks (2026-10-02).
+    /// - decodeShare: 0 keeps the count rules above. Above 0, while a prefill waits, decode may run (and the affinity wait
+    ///   may hold the owner for it) as long as its work since the last prefill dispatch stays under decodeShare x that
+    ///   prefill dispatch's work, up to 64 dispatches; past the share the count bound applies as before. A long-context
+    ///   chunk (~1.3 s at 1M) then leaves room for a decoder's rounds, while a short prompt's chunk leaves none -- a fixed
+    ///   burst of 16 starved short-context prefill (N=8 aggregate 158.1 vs 169.7 tok/s, TTFT p50 4.72 vs 1.19 s).
+    /// - decodeShareMinWork: the share opens only after a prefill dispatch at least this long. Share 0.5 on every dispatch
+    ///   kept short-context aggregate but raised TTFT p50 at N=16 by ~1 s; short prompts' chunks (0.1-0.3 s) stay shipped.
     /// - runBatch: performs one decode step for the whole group and returns one token per request,
     ///   in the order given. Called ON the owner thread.
     public init(minBatch: Int, gatherWindow: TimeInterval, maxBatch: Int,
@@ -237,6 +260,9 @@ public final class ModelThread: @unchecked Sendable {
                 prefillMaxBatch: Int = 1,
                 prefillTokenBudget: Int = 4096,
                 prefillDecodeTokenBudget: Int = 1024,
+                decodeAffinity: TimeInterval = 0,
+                decodeShare: Double = 0,
+                decodeShareMinWork: Double = 0,
                 snapshot: ((StepRequest, Int) -> StepResult)? = nil,
                 ownerTrace: ((ModelOwnerTraceEvent) -> Void)? = nil,
                 runBatch: @escaping ([StepRequest]) -> [Int]) {
@@ -249,6 +275,9 @@ public final class ModelThread: @unchecked Sendable {
         self.prefillMaxBatch = max(1, prefillMaxBatch)
         self.prefillTokenBudget = max(1, prefillTokenBudget)
         self.prefillDecodeTokenBudget = max(1, prefillDecodeTokenBudget)
+        self.decodeAffinity = max(0, decodeAffinity)
+        self.decodeShare = max(0, decodeShare)
+        self.decodeShareMinWork = max(0, decodeShareMinWork)
         self.runBatch = runBatch
         self.snapshot = snapshot
         self.ownerTrace = ownerTrace
@@ -368,6 +397,8 @@ public final class ModelThread: @unchecked Sendable {
         cond.broadcast(); cond.unlock()
     }
     public var decoderCount: Int { cond.lock(); defer { cond.unlock() }; return decoders }
+    /// (waits, hits) of the decode-affinity wait; both stay 0 while `decodeAffinity` is 0.
+    public var decodeAffinityStats: (waits: Int, hits: Int) { cond.lock(); defer { cond.unlock() }; return (decodeAffinityWaits, decodeAffinityHits) }
 
     public func phaseStats() -> [String: ModelPhaseStats] {
         cond.lock(); defer { cond.unlock() }
@@ -436,12 +467,18 @@ public final class ModelThread: @unchecked Sendable {
             if phase == .prefill, batch.count > 1, batch[0].prefill != nil {
                 cond.unlock()
                 if let selectedTrace { ownerTrace?(selectedTrace) }
-                let eligible = batch.compactMap { job -> PrefillWork? in
-                    guard let work = job.prefill, work.prepare() else { return nil }
-                    return work
+                // Every job runs inside its own autorelease pool: this thread lives as long as the server and never drains
+                // one by itself, so Foundation/Metal objects autoreleased during a job (strings above all) piled up for the
+                // process lifetime -- ~986k CFStrings after one morning of batched traffic (2026-10-03, T-0050).
+                let eligible: [PrefillWork] = autoreleasepool {
+                    let eligible = batch.compactMap { job -> PrefillWork? in
+                        guard let work = job.prefill, work.prepare() else { return nil }
+                        return work
+                    }
+                    if eligible.count >= 2 { eligible[0].batch(eligible.map(\.key)) }
+                    for job in batch { job.body!() }
+                    return eligible
                 }
-                if eligible.count >= 2 { eligible[0].batch(eligible.map(\.key)) }
-                for job in batch { job.body!() }
                 cond.lock()
                 if batch.count >= 2 {
                     recordedPrefillBatches.gatheredGroups += 1
@@ -456,7 +493,7 @@ public final class ModelThread: @unchecked Sendable {
             } else if batch.count == 1, let body = batch[0].body {
                 cond.unlock()
                 if let selectedTrace { ownerTrace?(selectedTrace) }
-                body()
+                autoreleasepool { body() }
                 cond.lock()
             } else {
                 cond.unlock()
@@ -471,12 +508,14 @@ public final class ModelThread: @unchecked Sendable {
                     event.filteredKeys = batch.filter { $0.result.cancelled }.map { $0.req!.key }
                     ownerTrace?(event)
                 }
-                let tokens = live.isEmpty ? [] : runBatch(live.map { $0.req! })
                 // Snapshot and drain while still on the owner, BEFORE another job can dissolve
                 // the pool. Only immutable Sendable values return to connection threads.
-                let results = live.enumerated().map { i, j in
-                    let token = i < tokens.count ? tokens[i] : -1
-                    return snapshot?(j.req!, token) ?? StepResult(token: token)
+                let results: [StepResult] = autoreleasepool {
+                    let tokens = live.isEmpty ? [] : runBatch(live.map { $0.req! })
+                    return live.enumerated().map { i, j in
+                        let token = i < tokens.count ? tokens[i] : -1
+                        return snapshot?(j.req!, token) ?? StepResult(token: token)
+                    }
                 }
                 cond.lock()
                 metrics.cancelledJobs += batch.count - live.count
@@ -484,6 +523,8 @@ public final class ModelThread: @unchecked Sendable {
                 for (j, result) in zip(live, results) { j.result = result }
             }
             let work = max(0, ProcessInfo.processInfo.systemUptime - startedAt)
+            if phase == .prefill { lastPrefillWork = work; decodeWorkSincePrefill = 0 }
+            else if phase == .decode { decodeWorkSincePrefill += work }
             metrics.workSeconds += work
             metrics.maxWorkSeconds = max(metrics.maxWorkSeconds, work)
             recordedPhases[phase] = metrics
@@ -525,23 +566,40 @@ public final class ModelThread: @unchecked Sendable {
 
     /// Called and returned with the lock held. Only the prefix before the first control job can
     /// be reordered. Bounded decode priority and bounded prefill alignment prevent starvation.
-    private func takeFrontLocked() -> [Job] {
+    private func takeFrontLocked(mayWait: Bool = true) -> [Job] {
         if !phaseScheduling { return takeFIFOFrontLocked() }
         if queue[0].phase == .control {
             consecutiveDecodeDispatches = 0
             consecutivePrefillReorders = 0
+            decodesSincePrefill = 0
             return [queue.removeFirst()]
         }
         let barrier = queue.firstIndex { $0.phase == .control } ?? queue.count
         let prefill = queue[..<barrier].firstIndex { $0.phase == .prefill }
         let decode = queue[..<barrier].firstIndex { $0.phase == .decode }
         if prefill == nil { consecutivePrefillReorders = 0 }
-        if let prefill, decode == nil || consecutiveDecodeDispatches >= maxConsecutiveDecodeDispatches {
+        // the time share: decode work since the last prefill dispatch under decodeShare x that dispatch's work
+        let shareOpen = decodeShare > 0 && lastPrefillWork >= decodeShareMinWork && decodesSincePrefill < Self.decodeShareCap
+            && decodeWorkSincePrefill < decodeShare * lastPrefillWork
+        if let prefill, decode == nil || (consecutiveDecodeDispatches >= maxConsecutiveDecodeDispatches && !shareOpen) {
+            let affinityOpen = decodeShare > 0 ? shareOpen : decodesSincePrefill < maxConsecutiveDecodeDispatches
+            if mayWait, decode == nil, decodeAffinity > 0, decoders > 0, decodesSincePrefill > 0, affinityOpen {
+                decodeAffinityWaits += 1
+                let deadline = Date().addingTimeInterval(decodeAffinity)
+                while !stopping {
+                    let end = queue.firstIndex { $0.phase == .control } ?? queue.count
+                    if queue[..<end].contains(where: { $0.phase == .decode }) { decodeAffinityHits += 1; break }
+                    if !cond.wait(until: deadline) { break }
+                }
+                return takeFrontLocked(mayWait: false)       // the queue may have changed while the lock was released
+            }
             consecutiveDecodeDispatches = 0
+            decodesSincePrefill = 0
             return takeAlignedPrefillGroupLocked(at: prefill)
         }
         // There is a decode before the barrier, otherwise the prefill branch above handled it.
         let first = decode!
+        decodesSincePrefill += 1
         consecutiveDecodeDispatches = prefill == nil ? 0 : consecutiveDecodeDispatches + 1
         if queue[first].body != nil { return [queue.remove(at: first)] }
         func candidates() -> (indices: [Int], blocked: Bool) {
