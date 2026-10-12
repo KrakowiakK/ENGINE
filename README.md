@@ -17,7 +17,16 @@ What it does:
   are not armed for drafting and decode without MTP: requests that ask for `logprobs`; requests with a hard
   thinking guard (`thinking_budget` or `loop_guard` above 0, per request or as a server flag), because the chat
   template opens the thinking block on every request; and requests resumed from a cache entry saved without MTP
-  state. A forced tool-call prefix switches a request to serial decoding at that point.
+  state. A forced tool-call prefix switches a request to serial decoding at that point. A sampled request
+  (`temperature` above 0 with `top_k` 1-1024) drafts by sampling the head under its own temperature / top-k / top-p
+  and accepts a draft with probability min(1, p/q), resampling a rejected position from the residual: the output
+  follows the target distribution exactly, and at `temperature 1.0, top_p 0.95, top_k 20` the real-suite prompts
+  decoded at 86.8-89.3 tok/s against 73.0 with argmax drafts (`ENGINE_SPEC_SAMPLING=0` restores those).
+- **Image input** on `/v1/chat/completions`: OpenAI `image_url` content parts (also `input_image`, the Anthropic base64
+  `source` and Hugging Face `image` keys) go through the checkpoint's own vision tower with the chat template's
+  placeholders and 3-axis mRoPE positions. Image requests use the hot prefix cache (an image's rows are keyed by the
+  image bytes' SHA-256), MTP, and a cache of tower outputs per image, so a conversation that carries a screenshot
+  resumes from the previous turn like a text one (793-877 tokens resumed per turn, first token in ~0.1 s, in our test).
 - **Hot prefix cache in GPU memory**: a new turn can resume from the previous turn's state instead of re-prefilling
   the conversation, as long as that state is still in the cache. It shares one RAM budget with the live requests
   (ceiling 192 GB) and only gets what live reservations leave. An optional disk cache can be enabled.
@@ -152,8 +161,9 @@ restarting it, and without authentication.
 ## API
 
 - `POST /v1/chat/completions`: OpenAI chat completions, streaming (SSE) and non-streaming. Supported fields:
-  `messages` (text only: the text parts of `content` are concatenated, and image and other non-text content parts
-  are silently dropped, with no error; the server has no image or video input), `max_tokens` /
+  `messages` (text, and images as `image_url` / `input_image` parts with a `data:` URL or an http(s) URL; other
+  non-text parts are dropped; a video part, an image in a system message, an unreadable image or `n` > 1 with images
+  is refused with `400`), `max_tokens` /
   `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`,
   `repetition_penalty` (alias `repeat_penalty`), `logit_bias`, `seed`, `n` (1-8), `stop`, `stream`,
   `stream_options.include_usage`, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format` (best effort:
@@ -286,8 +296,14 @@ Hit rates under load are not part of the measurements above.
 - When many cold requests arrive together, the ones whose prefill finishes early wait for the whole burst's prefill
   before their first token (see the 16-session table); a single request or a trickle of requests is not affected.
 - Only E9 (`qwen4_exp`) is supported by the serving path. Other models are untested.
-- The HTTP server is text-only. Image and video input exist only in the `engine generate` development command
-  (`--image`, `--video`); that path was last tested with E9 on ENGINE builds of 2026-08-31 and 2026-09-01, not on B50 or B52.
+- Images, not video, on the HTTP server (video exists only in the `engine generate` development command, `--video`).
+  An image larger than 4,194,304 pixels is downscaled to that size (`ENGINE_SERVE_VISION_MAX_PIXELS`; the checkpoint
+  allows 16,777,216), a request may carry up to 65,536 vision patches in all (`ENGINE_SERVE_VISION_MAX_PATCHES`) and
+  32 MB per image (`ENGINE_SERVE_VISION_MAX_BYTES`); http(s) image URLs are fetched by the server unless
+  `ENGINE_VISION_FETCH=0`. The tower runs as one model-thread job (80 ms for a 512x384 image, 3.1 s at the pixel cap in
+  our tests), during which other requests wait. Image requests do not join batched decode rounds; they decode on the
+  serial MTP path, interleaved with the batch. The OMP agent sends images only to a model whose `models.yml` entry
+  declares `input: [text, image]`.
 - The other `engine` subcommands (`bench`, `generate`, `batchprobe`, `kernelbench`, `tokbench`, `nll`,
   `logits`, `ngram-ids`) are development tools. Their default input paths (`bench/`, `runs/`) point to research
   files that are not part of this repository, so pass explicit `--prompt` / `--file` arguments. Some `kernelbench`

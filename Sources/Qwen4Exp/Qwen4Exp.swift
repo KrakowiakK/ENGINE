@@ -3212,6 +3212,26 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     private var draftHeadTried = false
     /// int32 [1]: argmax token of the draft head for one mixed row (B=1, S=1)
     public func draftToken(_ mixed: MLXArray) -> MLXArray {
+        ensureDraftHead()
+        guard let d = draftHead else {
+            let logits = logitsFromMixed(mixed)
+            draftProbSink?(softmax(logits.asType(.float32), axis: -1).max(axis: -1))
+            return logits.argMax(axis: -1).asType(.int32)
+        }
+        let logits = quantizedMatmul(mixed, d.w, scales: d.s, biases: d.b, transpose: true, groupSize: d.gs, bits: d.bits)
+        draftProbSink?(softmax(logits.asType(.float32), axis: -1).max(axis: -1))
+        return d.ids[logits.argMax(axis: -1)]
+    }
+
+    /// 2026-10-09 (speculative sampling): the draft head's logits over its rows and each row's full-vocabulary id (nil when
+    /// the head is the whole lm_head). `draftToken` is the argmax of exactly these logits.
+    public func draftLogits(_ mixed: MLXArray) -> (logits: MLXArray, ids: MLXArray?) {
+        ensureDraftHead()
+        guard let d = draftHead else { return (logitsFromMixed(mixed), nil) }
+        return (quantizedMatmul(mixed, d.w, scales: d.s, biases: d.b, transpose: true, groupSize: d.gs, bits: d.bits), d.ids)
+    }
+
+    private func ensureDraftHead() {
         if !draftHeadTried {
             draftHeadTried = true
             let N = Self.draftVocab
@@ -3236,14 +3256,6 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
                 FileHandle.standardError.write("mtp draft head: \(rows.count) of \(V) rows (\(N) + \(rows.count - N) specials), \(draftHead!.bits)-bit\n".data(using: .utf8)!)
             }
         }
-        guard let d = draftHead else {
-            let logits = logitsFromMixed(mixed)
-            draftProbSink?(softmax(logits.asType(.float32), axis: -1).max(axis: -1))
-            return logits.argMax(axis: -1).asType(.int32)
-        }
-        let logits = quantizedMatmul(mixed, d.w, scales: d.s, biases: d.b, transpose: true, groupSize: d.gs, bits: d.bits)
-        draftProbSink?(softmax(logits.asType(.float32), axis: -1).max(axis: -1))
-        return d.ids[logits.argMax(axis: -1)]
     }
 
     /// P106 H53 (diagnostic, ENGINE_ROUND_TRACE_PROBS): receives each draft's head probability (max softmax over the
@@ -3253,6 +3265,14 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     /// trunk forward returning (logits, pre-mixer stream) -- the MTP input
     public func forwardHidden(_ inputs: MLXArray, cache: [KVCache]?) -> (MLXArray, MLXArray) {
         let logits = self(inputs, cache: cache)
+        return (logits, model.lastHidden!)
+    }
+
+    /// T-0053: the same for an mRoPE sequence (an image request): its embeddings override and (3, B, S) positions. Both
+    /// nil is the text call above, unchanged.
+    public func forwardHidden(_ inputs: MLXArray, cache: [KVCache]?, embedsOverride: MLXArray?, pos3: MLXArray?) -> (MLXArray, MLXArray) {
+        if embedsOverride == nil && pos3 == nil { return forwardHidden(inputs, cache: cache) }
+        let logits = self(inputs, cache: cache, embedsOverride: embedsOverride, pos3: pos3)
         return (logits, model.lastHidden!)
     }
 

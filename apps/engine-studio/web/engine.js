@@ -244,7 +244,9 @@ function reqCols(finished, rows) {
         }
         return r.mtp ? "on" : NA;
       } },
-    { h: "effort", f: (r) => esc(r.reasoning_effort ?? NA) },
+    // the engine records "off" for a thinking-off request (no effort applies then); builds before it showed the
+    // resolved effort there too ("low" for reasoning_effort none)
+    { h: "thinking", f: (r) => r.reasoning_effort == null ? NA : r.reasoning_effort === "off" ? "off" : esc(`on · ${r.reasoning_effort}`) },
     { h: "stream", f: (r) => (r.stream == null ? NA : r.stream ? "yes" : "no") },
     { h: "elapsed", num: true, f: (r) => fmtDur(r.elapsed_s) },
     { h: "started", num: true, f: (r) => fmtClock(r.started_at) },

@@ -45,18 +45,20 @@ Fence::Fence(Stream stream) {
   fence_ = std::shared_ptr<void>(new FenceImpl(stream), dtor);
 }
 
-void Fence::wait(Stream stream, const array& x) {
+void Fence::wait(Stream stream, const array& x, uint32_t value) {
   auto& f = *static_cast<FenceImpl*>(fence_.get());
 
   if (!f.use_fast) {
-    f.event->wait(stream);
+    auto& event = *f.event;
+    event.set_value(value);
+    event.wait(stream);
     return;
   }
 
   if (stream.device == Device::cpu) {
-    scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
+    scheduler::enqueue(stream, [fence_ = fence_, value]() mutable {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
-      while (f.cpu_value()[0] < count) {
+      while (f.cpu_value()[0] < value) {
       }
     });
     return;
@@ -75,21 +77,21 @@ void Fence::wait(Stream stream, const array& x) {
 
   auto buf = static_cast<MTL::Buffer*>(f.fence);
   compute_encoder.set_buffer(buf, 0);
-  compute_encoder.set_bytes(f.count, 1);
+  compute_encoder.set_bytes(value, 1);
   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
 
   compute_encoder.get_command_buffer()->addCompletedHandler(
       [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
 }
 
-void Fence::update(Stream stream, const array& x, bool cross_device) {
+uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
   auto& f = *static_cast<FenceImpl*>(fence_.get());
   f.count++;
 
   if (!f.use_fast) {
     f.event->set_value(f.count);
     f.event->signal(stream);
-    return;
+    return f.count;
   }
 
   if (stream.device == Device::cpu) {
@@ -97,7 +99,7 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
       f.cpu_value()[0] = count;
     });
-    return;
+    return f.count;
   }
 
   auto& d = metal::device(stream.device);
@@ -131,6 +133,7 @@ void Fence::update(Stream stream, const array& x, bool cross_device) {
 
   compute_encoder.get_command_buffer()->addCompletedHandler(
       [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+  return f.count;
 }
 
 } // namespace mlx::core

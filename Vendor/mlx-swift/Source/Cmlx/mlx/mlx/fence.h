@@ -29,8 +29,11 @@ class Fence {
   Fence() {};
   explicit Fence(Stream stream);
 
-  void update(Stream stream, const array& x, bool cross_device);
-  void wait(Stream stream, const array& x);
+  // Returns the fence value this update signals; wait on exactly that value
+  // (upstream #4552: waiting on the latest count deadlocks when a later update
+  // of the same fence is never reached by the waiting stream).
+  uint32_t update(Stream stream, const array& x, bool cross_device);
+  void wait(Stream stream, const array& x, uint32_t value);
 
  private:
   std::shared_ptr<void> fence_{nullptr};

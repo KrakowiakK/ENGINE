@@ -28,6 +28,8 @@ import MLXHuggingFace
 import Tokenizers
 import Jinja
 import Qwen4Exp
+import MLXVLM       // T-0053: Qwen3VLProcessor for image requests
+import CoreImage
 
 private let h8BoundaryProbe = ProcessInfo.processInfo.environment["ENGINE_H8_BOUNDARY_PROBE"] == "1"
 private let h8BoundarySplit = ProcessInfo.processInfo.environment["ENGINE_H8_BOUNDARY_SPLIT"] == "1"
@@ -466,6 +468,18 @@ func serve(_ o: Options) async throws {
     }
     serveRuntime["template_cache_mb"] = templateCacheMB
     serveRuntime["template_cache_verify"] = templateCacheVerify
+    if let qm = context.model as? Qwen4ExpModel, qm.hasVision {
+        let pcfg = try enginePreprocessorConfig(dir.path, maxPixelsCap: serveVisionMaxPixels)
+        serveVisionConfig = pcfg
+        serveVisionProcessor = Qwen3VLProcessor(pcfg, tokenizer: context.tokenizer)
+        FileHandle.standardError.write("engine serve: vision on (max \(pcfg.maxPixels) px per image, \(serveVisionMaxPatches) patches per request, fetch \(serveVisionFetch ? "on" : "off"))\n".data(using: .utf8)!)
+    }
+    if let pcfg = serveVisionConfig {
+        serveRuntime["vision"] = ["max_pixels": pcfg.maxPixels, "min_pixels": pcfg.minPixels, "max_patches": serveVisionMaxPatches,
+                                  "max_bytes": serveVisionMaxBytes, "fetch": serveVisionFetch] as [String: Any]
+    } else {
+        serveRuntime["vision"] = false
+    }
     modelThreadShared = ModelThread(minBatch: max(1, batchMinRows), gatherWindow: batchWindowMs / 1000,
                                     maxBatch: batchMaxRows, phaseScheduling: ProcessInfo.processInfo.environment["ENGINE_SCHEDULER"] != "fifo",
                                     maxConsecutiveDecodeDispatches: serveDecodeBurst,
@@ -671,6 +685,57 @@ nonisolated(unsafe) var serveQueueMax = 0
 nonisolated(unsafe) var serveQueueTimeout = 1800.0
 nonisolated(unsafe) var serveAdmission: AdmissionBudget!
 nonisolated(unsafe) var serveVocabularySize: Int? = nil     // P124: bounds logit_bias token ids
+/// T-0053: image input. The preprocessor is the CLI image path's (P037/P044) with the server's per-image pixel cap; both
+/// nil when the model has no vision tower, and an image request is then refused rather than answered blind.
+nonisolated(unsafe) var serveVisionConfig: Qwen3VLProcessorConfiguration? = nil
+nonisolated(unsafe) var serveVisionProcessor: Qwen3VLProcessor? = nil
+/// One image's pixel cap: a larger image is downscaled to it (smart_resize). 2048 x 2048 = 16384 patches, 4096 tokens.
+let serveVisionMaxPixels = Int(ProcessInfo.processInfo.environment["ENGINE_SERVE_VISION_MAX_PIXELS"] ?? "") ?? 4_194_304
+/// All images of one request, in patches (the tower runs them as one call).
+let serveVisionMaxPatches = Int(ProcessInfo.processInfo.environment["ENGINE_SERVE_VISION_MAX_PATCHES"] ?? "") ?? 65_536
+let serveVisionMaxBytes = Int(ProcessInfo.processInfo.environment["ENGINE_SERVE_VISION_MAX_BYTES"] ?? "") ?? 32 << 20
+/// The decoded size of one image, before any resize (100 MP: a 12000 x 8000 photo; PIL refuses past ~89 MP by default).
+let serveVisionMaxSourcePixels = Int(ProcessInfo.processInfo.environment["ENGINE_SERVE_VISION_MAX_SOURCE_PIXELS"] ?? "") ?? 100_000_000
+let serveVisionFetch = ProcessInfo.processInfo.environment["ENGINE_VISION_FETCH"] != "0"
+
+/// T-0053: what an image request carries from the handler into its choice. The MLX arrays are built and read only on the
+/// model thread (the ownership rule of P089 U10); the handler holds the box.
+final class ServeVisionPrepared: @unchecked Sendable {
+    var embeds: MLXArray? = nil
+    var pos3: MLXArray? = nil
+    var ropeDelta = 0
+    var towerSeconds = 0.0
+    var towerImages = 0          // images the tower ran for (the rest came from the feature cache)
+    var peakAboveBytes: Int? = nil
+}
+
+/// T-0053: the tower's output per image content (the first 8 bytes of the image bytes' SHA-256), least recently used out
+/// first within a byte budget (ENGINE_VISION_FEATURE_CACHE_MB, default 2048; 0 = off). Model-thread only.
+final class ServeVisionFeatureCache: @unchecked Sendable {
+    private var entries: [UInt64: (feats: MLXArray, bytes: Int, tick: Int)] = [:]
+    private var tick = 0
+    private(set) var bytes = 0
+    private(set) var hits = 0, misses = 0
+    let budget: Int
+    init(budget: Int) { self.budget = budget }
+    func get(_ key: UInt64) -> MLXArray? {
+        guard budget > 0, let e = entries[key] else { misses += 1; return nil }
+        tick += 1; entries[key] = (e.feats, e.bytes, tick); hits += 1
+        return e.feats
+    }
+    func put(_ key: UInt64, _ feats: MLXArray) {
+        guard budget > 0, feats.nbytes <= budget else { return }
+        if let old = entries[key] { bytes -= old.bytes }
+        tick += 1; entries[key] = (feats, feats.nbytes, tick); bytes += feats.nbytes
+        while bytes > budget, let lru = entries.min(by: { $0.value.tick < $1.value.tick }) {
+            bytes -= lru.value.bytes; entries.removeValue(forKey: lru.key)
+        }
+    }
+    var count: Int { entries.count }
+}
+nonisolated(unsafe) var serveVisionFeatureCache = ServeVisionFeatureCache(
+    budget: (Int(ProcessInfo.processInfo.environment["ENGINE_VISION_FEATURE_CACHE_MB"] ?? "") ?? 2048) << 20)
+let serveVisionPeakWitness = ProcessInfo.processInfo.environment["ENGINE_VISION_PEAK_WITNESS"] == "1"
 nonisolated(unsafe) var serveMemoryGuardEnabled = true
 nonisolated(unsafe) var serveLaunchAvailableBytes: Int64? = nil
 let serveMemoryGuardLaunchMarginBytes = 16e9
@@ -837,6 +902,10 @@ private struct ChatRequest {
     /// and `thinking_budget` keeps capping the reasoning, so the answer's room no longer depends on how long the
     /// reasoning ran.
     var maxAnswerTokens: Int? = nil
+    /// T-0053: the image sources of every image part, in document order (each part rendered as the template's placeholder),
+    /// and a malformed part's refusal.
+    var images: [String] = []
+    var visionError: String? = nil
     /// A request whose sampling needs the per-step processor: it runs serially without MTP (like logprobs), never in a
     /// batched round, whose shared argmax / top-k block and draft acceptance know nothing of per-row histories.
     var needsLogitProcessing: Bool { logitParams.adjustsLogits || (logitParams.minP > 0 && temperature > 0) }
@@ -845,13 +914,24 @@ private struct ChatRequest {
 private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defaultEffort: String = "medium", keepReasoning: Bool = true) -> ChatRequest? {
     guard let rawMessages = obj["messages"] as? [[String: Any]], !rawMessages.isEmpty else { return nil }
     var messages: [Message] = []
+    var images: [String] = []
+    var visionError: String? = nil
     for m in rawMessages {
         guard let role = m["role"] as? String else { continue }
         var msg: [String: any Sendable] = ["role": role]
         if let s = m["content"] as? String {
             msg["content"] = s
         } else if let parts = m["content"] as? [[String: Any]] {
-            msg["content"] = parts.compactMap { $0["text"] as? String }.joined()
+            // T-0053: an image part renders as the template's placeholder, in place (it used to be dropped without a
+            // word, C-0163); a text-only array is the same joined text as before
+            do {
+                let flat = try ServeVisionContent.flatten(parts, role: role)
+                msg["content"] = flat.text
+                images += flat.images
+            } catch {
+                visionError = visionError ?? "\(error)"
+                msg["content"] = parts.compactMap { $0["text"] as? String }.joined()
+            }
         } else {
             msg["content"] = ""
         }
@@ -962,6 +1042,8 @@ private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defau
         logitParams: logitParams, samplingError: samplingError)
     request.thinkingOff = thinkingOff
     request.maxAnswerTokens = maxAnswerTokens
+    request.images = images
+    request.visionError = visionError
     return request
 }
 
@@ -1143,6 +1225,25 @@ final class SeqState {
     var cache: [KVCache]
     var xs: MLXArray                       // the prompt; released the moment prefill is done
     let prefillIDs: [Int]
+    /// T-0053: an image request's prompt embeddings (merger rows spliced on) and (3, 1, T) mRoPE positions, released with
+    /// the prompt; `visionRopeDelta` stays for decode, and non-nil marks the sequence as an mRoPE one.
+    var visionEmbeds: MLXArray? = nil
+    var visionPos3: MLXArray? = nil
+    var visionRopeDelta: Int? = nil
+    /// After a prefix-store import of `m` rows: the indexer's slot 2 (the 3-axis position history the pooled block starts
+    /// are roped from) is not exported with the rows and the import clears it, so it is rebuilt here from this prompt's own
+    /// positions -- the same rows, since the store only matches the same tokens and the same images (`hotIds`).
+    func visionRestorePositions(upTo m: Int) {
+        guard let p = visionPos3, m > 0 else { return }
+        let rows = p[0..., 0..., 0 ..< m].asType(.int32)
+        for c in cache { if let l = c as? CacheList, let idx = l[1] as? ArraysCache { idx[2] = rows } }
+    }
+    /// The (3, 1, 1) position of the token about to be forwarded: its cache offset plus the delta, on all three axes.
+    func visionDecodePos3() -> MLXArray {
+        let offset = (cache.first { $0 is CacheList } as? CacheList).map { ($0[0] as! KVCacheSimple).offset } ?? 0
+        let p = Int32(offset + (visionRopeDelta ?? 0))
+        return MLXArray([p, p, p]).reshaped(3, 1, 1)
+    }
     var prefillForward: (MLXArray, MLXArray)? = nil // owner-only native batch result
     var prefillForwardBatchSize = 0
     var h26ForwardGroupID = 0, h26ForwardSlot = -1, h26ForwardDecoderCount = -1
@@ -2152,6 +2253,47 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         writeHTTPResponse(fd, status: 400, statusText: "Bad Request", contentType: "application/json", body: jsonErrorBody(e))
         return
     }
+    // T-0053: every image is decoded and sized here, before the template and admission -- its grid fixes how many tokens
+    // the prompt has. A part that cannot be read is refused, never dropped.
+    func refuseVision(_ message: String) {
+        writeHTTPResponse(fd, status: 400, statusText: "Bad Request", contentType: "application/json", body: jsonErrorBody(message))
+    }
+    if let e = chatReq.visionError { refuseVision(e); return }
+    var visionImages: [CIImage] = []
+    var visionGrids: [(t: Int, h: Int, w: Int)] = []     // post-merge
+    var visionHashes: [UInt64] = []                      // the prefix store's key of each image (its bytes' SHA-256)
+    var visionPatches = 0
+    if !chatReq.images.isEmpty {
+        guard let pcfg = serveVisionConfig else {
+            refuseVision("this server has no vision tower (ENGINE_NO_VISION is set, or the checkpoint declares none); the request carries \(chatReq.images.count) image(s)")
+            return
+        }
+        guard chatReq.n == 1 else { refuseVision("n must be 1 for a request with images"); return }
+        for (k, src) in chatReq.images.enumerated() {
+            let data: Data
+            do { data = try ServeVisionContent.load(src, limit: serveVisionMaxBytes, allowFetch: serveVisionFetch) }
+            catch { refuseVision("image \(k + 1): \(error)"); return }
+            guard let ci = CIImage(data: data, options: [.applyOrientationProperty: true]),
+                  ci.extent.width >= 1, ci.extent.height >= 1, ci.extent.width.isFinite, ci.extent.height.isFinite else {
+                refuseVision("image \(k + 1): \(data.count) bytes that CoreImage cannot decode as an image"); return
+            }
+            // the image is rendered at its full size (16 bytes a pixel) before it is resized, and a small file can be a huge
+            // image (a few-MB PNG of 50000 x 50000): its pixel count is bounded first, like PIL's MAX_IMAGE_PIXELS
+            guard Double(ci.extent.width) * Double(ci.extent.height) <= Double(serveVisionMaxSourcePixels) else {
+                refuseVision("image \(k + 1): \(Int(ci.extent.width))x\(Int(ci.extent.height)) pixels, over this server's \(serveVisionMaxSourcePixels) (ENGINE_SERVE_VISION_MAX_SOURCE_PIXELS)")
+                return
+            }
+            let g = engineImageGrid(width: Int(ci.extent.width), height: Int(ci.extent.height), cfg: pcfg)
+            visionHashes.append(ServeVisionContent.hash64(digest: SHA256.hash(data: data)))
+            visionImages.append(ci)
+            visionGrids.append((t: 1, h: g.h / pcfg.mergeSize, w: g.w / pcfg.mergeSize))
+            visionPatches += g.patches
+        }
+        guard visionPatches <= serveVisionMaxPatches else {
+            refuseVision("the \(visionImages.count) image(s) cost \(visionPatches) vision patches, over this server's \(serveVisionMaxPatches) per request (ENGINE_SERVE_VISION_MAX_PATCHES); send fewer or smaller images")
+            return
+        }
+    }
 
     let toolParamTypes = toolParamTypeMap(from: chatReq.rawTools)
     var toolsForTemplate: [Message]? = nil
@@ -2164,7 +2306,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         toolsForTemplate = chatReq.rawTools.map(toSendableDict)
     }
 
-    let ids: [Int]
+    let templateIds: [Int]
     do {
         var extra: [String: any Sendable] = ["reasoning_effort": chatReq.reasoningEffort]
         if chatReq.thinkingOff { extra["enable_thinking"] = false }
@@ -2172,15 +2314,15 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         if let cache = templateCacheShared, let renderer = templateRenderShared {
             let rendered = try renderer.render(messages: chatReq.messages, tools: toolsForTemplate, extra: extra)
             let (cachedIds, _) = cache.encode(rendered: rendered)
-            ids = cachedIds
+            templateIds = cachedIds
             if templateCacheVerify {
                 let reference = try context.tokenizer.applyChatTemplate(
                     messages: chatReq.messages, tools: toolsForTemplate, additionalContext: extra)
-                if reference != ids {
-                    var idx = min(reference.count, ids.count)
+                if reference != templateIds {
+                    var idx = min(reference.count, templateIds.count)
                     var cachedValue = -1, referenceValue = -1
-                    for i in 0..<min(reference.count, ids.count) where reference[i] != ids[i] {
-                        idx = i; cachedValue = ids[i]; referenceValue = reference[i]; break
+                    for i in 0..<min(reference.count, templateIds.count) where reference[i] != templateIds[i] {
+                        idx = i; cachedValue = templateIds[i]; referenceValue = reference[i]; break
                     }
                     let client = req.headers["x-engine-client"] ?? req.headers["user-agent"] ?? "unknown"
                     FileHandle.standardError.write(String(format: "engine: template-cache MISMATCH client=%@ index=%d cached=%d reference=%d\n",
@@ -2191,7 +2333,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 }
             }
         } else {
-            ids = try context.tokenizer.applyChatTemplate(
+            templateIds = try context.tokenizer.applyChatTemplate(
                 messages: chatReq.messages, tools: toolsForTemplate, additionalContext: extra)
         }
     } catch {
@@ -2199,6 +2341,24 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                            body: jsonErrorBody("chat template failed: \(error)"))
         return
     }
+    // T-0053: each image's placeholder becomes its own token count; the spans fix the mRoPE layout (HF get_rope_index)
+    let ids: [Int]
+    var visionSpans: [ServeVisionContent.Span] = []
+    if visionImages.isEmpty {
+        ids = templateIds
+    } else {
+        do {
+            let layout = try ServeVisionContent.expand(ids: templateIds, padId: engineImagePadId, grids: visionGrids)
+            ids = layout.ids
+            visionSpans = layout.spans
+        } catch {
+            refuseVision("\(error)")
+            return
+        }
+    }
+    // T-0053: what the prefix store keys this prompt by -- `ids` with each image's pad rows replaced by keys of the image's
+    // content, so a stored state is resumed only for the same image at the same place. The model input stays `ids`.
+    let hotIds = visionSpans.isEmpty ? ids : ServeVisionContent.keyed(ids: ids, spans: visionSpans, hashes: visionHashes)
 
     let lookahead = max(mtpDepth, batchMTPDepthShared) + 1
     let tokensDecision = MaxTokensPolicy.effective(requested: chatReq.requestedMaxTokens, defaultTokens: defaultMaxTokens,
@@ -2290,13 +2450,93 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         committedLength = serveAdmission.committedLength(reservation)
     }
     guard !cancelled() else { return }
-    let stateCache = stateCache?.indexed(for: ids)
+    // T-0053: an image request never touches the disk state cache (its keys are token ids, and every image's pads are the
+    // same id)
+    let stateCache = visionImages.isEmpty ? stateCache?.indexed(for: ids) : nil
+
+    // T-0053: the tower runs before any response byte, so a failure is still an HTTP error: pixels (one preprocess call per
+    // image -- `preprocess(images:)` stacks its list as a video's frames), features, the prompt's embeddings with each
+    // image's merger rows on its own span, and the mRoPE positions. One model-thread job; the arrays stay in the box.
+    let visionPrepared: ServeVisionPrepared? = visionImages.isEmpty ? nil : ServeVisionPrepared()
+    if let vp = visionPrepared {
+        let failure: String? = modelThreadShared.prefill {
+            guard !cancelled() else { return "cancelled" }
+            guard let qm = context.model as? Qwen4ExpModel, let proc = serveVisionProcessor, let pcfg = serveVisionConfig else {
+                return "no vision tower"
+            }
+            let t0 = Date()
+            // ENGINE_VISION_PEAK_WITNESS=1 (diagnostic, measuring only): the job's own memory peak above the active memory
+            // it started from -- it resets MLX's process peak, so the per-request peak_gpu_memory_bytes loses its history
+            let activeBefore = serveVisionPeakWitness ? Memory.activeMemory : 0
+            if serveVisionPeakWitness { GPU.resetPeakMemory() }
+            let merge = pcfg.mergeSize
+            // the tower runs only for images it has not seen (a conversation re-sends its screenshot every turn; the prefix
+            // store resumes the rows, this resumes the tower); each image is its own attention segment either way
+            var perImage: [MLXArray?] = visionHashes.map { serveVisionFeatureCache.get($0) }
+            let missing = perImage.indices.filter { perImage[$0] == nil }
+            if !missing.isEmpty {
+                var pixList: [MLXArray] = []
+                var thws: [THW] = []
+                for k in missing {
+                    guard let pre = try? proc.preprocess(images: [visionImages[k]], processing: nil) else { return "image \(k + 1): preprocessing failed" }
+                    let (px, th) = pre
+                    guard th.t == visionGrids[k].t, th.h == visionGrids[k].h * merge, th.w == visionGrids[k].w * merge else {
+                        return "image \(k + 1): the preprocessed grid \(th.t)x\(th.h)x\(th.w) differs from the sized one"
+                    }
+                    pixList.append(px); thws.append(th)
+                }
+                let pixels = pixList.count == 1 ? pixList[0] : concatenated(pixList, axis: 0)
+                guard let fresh = qm.visionFeatures(pixels: pixels, gridTHW: thws) else { return "no vision tower mounted" }
+                let freshNeed = missing.reduce(0) { $0 + visionSpans[$1].tokens }
+                guard fresh.dim(0) == freshNeed else { return "the tower returned \(fresh.dim(0)) visual tokens, the images need \(freshNeed)" }
+                eval(fresh)
+                var r0 = 0
+                for k in missing {
+                    let f = fresh[r0 ..< (r0 + visionSpans[k].tokens), 0...]
+                    perImage[k] = f
+                    serveVisionFeatureCache.put(visionHashes[k], f)
+                    r0 += visionSpans[k].tokens
+                }
+            }
+            vp.towerImages = missing.count
+            let feats = perImage.count == 1 ? perImage[0]! : concatenated(perImage.map { $0! }, axis: 0)
+            let need = visionSpans.reduce(0) { $0 + $1.tokens }
+            guard feats.dim(0) == need else { return "the tower returned \(feats.dim(0)) visual tokens, the spans need \(need)" }
+            let xs = MLXArray(ids.map { Int32($0) })[.newAxis]
+            var embeds = qm.embedTokenIds(xs)
+            let rows = feats.asType(embeds.dtype)[.newAxis]
+            var r = 0
+            for sp in visionSpans {
+                embeds[0..., sp.start ..< (sp.start + sp.tokens), 0...] = rows[0..., r ..< (r + sp.tokens), 0...]
+                r += sp.tokens
+            }
+            let pos3 = engineVisionPositions(total: ids.count, spans: visionSpans.map { (start: $0.start, t: $0.t, h: $0.h, w: $0.w) })
+            eval(embeds, pos3)
+            let next = Int(pos3[0, 0, ids.count - 1].item(Int32.self)) + 1
+            guard next - ids.count == ServeVisionContent.ropeDelta(spans: visionSpans) else {
+                return "mRoPE layout mismatch: next position \(next) for \(ids.count) tokens"
+            }
+            vp.embeds = embeds; vp.pos3 = pos3; vp.ropeDelta = next - ids.count
+            vp.towerSeconds = Date().timeIntervalSince(t0)
+            if serveVisionPeakWitness { vp.peakAboveBytes = Memory.peakMemory - activeBefore }
+            serveMemoryWitness.publish()
+            return nil
+        }
+        if let failure {
+            if failure != "cancelled" {
+                writeHTTPResponse(fd, status: 500, statusText: "Internal Server Error", contentType: "application/json",
+                                  body: jsonErrorBody("vision: \(failure)", type: "vision_error"))
+            }
+            return
+        }
+    }
 
     // This checkpoint's generation prompt opens <think> itself (see main.swift's engineThinkOpen
     // derivation) -- the token never appears in the GENERATED ids, only the prompt's.
     let sessionId = liveSessions.begin(client: req.headers["x-engine-client"] ?? req.headers["user-agent"] ?? "unknown",
                                        promptTokens: ids.count, maxTokens: chatReq.maxTokens, stream: chatReq.stream,
-                                       reasoningEffort: chatReq.reasoningEffort)
+                                       // a thinking-off request applies no effort (the template drops it): say "off"
+                                       reasoningEffort: chatReq.thinkingOff ? "off" : chatReq.reasoningEffort)
     endSession = { liveSessions.end(sessionId) }
 
     let thinkOpenInitially = ids.lastIndex(of: engineThinkOpenId).map { open in
@@ -2355,6 +2595,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let tReq0 = Date()
         let mt = modelThreadShared!
         let qm = model as? Qwen4ExpModel
+        // T-0053: an image request takes the shared machinery with every forward passing its mRoPE positions, the prefix
+        // store keyed by `hotIds` (image rows by content), and no batched round (a ragged step ropes at the cache offset,
+        // which an mRoPE sequence is not at). A text request is unchanged: its `hotIds` is `ids`.
+        let isVision = visionPrepared != nil
+        let useHot = hotStoreShared.enabled
         // P058: with a state cache configured, the RUNG SPACING doubles as the prefill chunk
         // width -- otherwise an ordinary chat-length prompt (well under 4096 tokens) is one
         // chunk with no interior boundary and nothing is ever cached. The existing invariant
@@ -2377,7 +2622,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         // at the exact prompt length never serves it (measured: every turn of a non-echoing client
         // fell back to the disk rung, up to 511 tokens back). One token: the split costs one
         // decode-sized forward (~20 ms); eight cost ~70 ms, the MoE touching up to 80 experts.
-        let hotReserve = hotStoreShared.enabled ? 1 : 0
+        let hotReserve = useHot ? 1 : 0
         // H50: the last interior 1024 boundary, where the canonical rung is certified (SeqState.canonicalTarget).
         let canonicalTarget = ((ids.count - 1) / h25CanonicalWidth) * h25CanonicalWidth
         // H57: the QSA indexer picks dense (no mask) or sparse (array mask) attention per CALL, from offset + S against its
@@ -2419,7 +2664,13 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             }
             let cache = model.newCache(parameters: nil)
             let xs = MLXArray(ids.map { Int32($0) })[.newAxis]
-            return seqRegistry.create { SeqState(sampler: sampler, cache: cache, xs: xs, ids: ids) }
+            let id = seqRegistry.create { SeqState(sampler: sampler, cache: cache, xs: xs, ids: hotIds) }
+            if let vp = visionPrepared {
+                let st = seqRegistry[id]
+                st.visionEmbeds = vp.embeds; st.visionPos3 = vp.pos3; st.visionRopeDelta = vp.ropeDelta
+                vp.embeds = nil; vp.pos3 = nil
+            }
+            return id
         }
         guard seqId >= 0 else { return }
         // Teardown is also MLX work: leaving the pool and dropping every array this request owns
@@ -2438,7 +2689,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     if let qm {
                         batchPoolShared.releaseIfMember(s.row, qm, ratio: qm.configuration.text.indexerCompressRatio)
                         s.cache = s.row.caches
-                        if let toks = hotTokens, hotStoreShared.enabled {
+                        if let toks = hotTokens, useHot {
                             // P099: a row that was batched keeps its LIVE head cache on the row (the retired one stops at the handover)
                             s.spec?.settle()         // H60: the stored head holds exactly the committed rows
                             let mtpc = s.spec?.mtpCache ?? s.row.spec?.mtpCache ?? s.retiredMTPCache
@@ -2490,16 +2741,16 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let wantMTP = mtpEligible && !hardThinkingGuard
         let mtpPolicyReason = mtpEligible ? (hardThinkingGuard ? "hard_guard" : "eligible") : "ineligible"
         var sharedAdmitted = false
-        if let qm, hotStoreShared.enabled {
+        if let qm, useHot {
             let (hot, admitted): (Int, Bool) = mt.prefill {
                 guard !cancelled() else { return (0, false) }
                 let st = seqRegistry[seqId]
                 // P119 (review F2): a request that starts cold is a sighting of its prompt's head; the head earns the split
                 // and the capture only once it has been seen before (or a shared entry of its ids exists). Knob off or
                 // ineligible: false, nothing recorded.
-                let coldMiss = { () -> (Int, Bool) in (0, sharedSplit && hotStoreShared.admitSharedPrefix(prompt: ids)) }
+                let coldMiss = { () -> (Int, Bool) in (0, sharedSplit && hotStoreShared.admitSharedPrefix(prompt: hotIds)) }
                 if h25Metadata { st.h25Witness["initial_entries"] = hotStoreShared.count; st.h25Count("initial_lookup_attempts") }
-                guard let h = st.h25Lookup(ids, mtp: wantMTP, kind: 0) else { return coldMiss() }
+                guard let h = st.h25Lookup(hotIds, mtp: wantMTP, kind: 0) else { return coldMiss() }
                 if h25Metadata {
                     st.h25Witness["initial_hit_length"] = h.length
                     st.h25Witness["initial_hit_has_mtp"] = h.hasMTP ? 1 : 0
@@ -2510,6 +2761,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 if wantMTP, h.hasMTP, let mtp = qm.mtp { mtpCache = mtp.newCache() }
                 st.h25Count("materialize_attempts")
                 guard hotStoreShared.materialize(h, into: st.cache, mtp: mtpCache, model: qm) else { return coldMiss() }
+                st.visionRestorePositions(upTo: h.length)          // T-0053 (no-op for text)
                 st.h25Count("materialize_successes")
                 if let mtpCache { st.primeMTPCache = mtpCache; eval(mtpCache.state) }
                 eval(st.cache.flatMap { $0.state })
@@ -2536,7 +2788,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 // D50: `lastDebug` is shared; another request's lookup may have replaced it since ours (the B40 H50d
                 // crash: a longer prompt's common prefix sliced past this prompt). Read it only if it is still ours.
                 let diag: [(Int, [Int], Int, Int, String, String)] = mt.prefill {
-                    guard hotStoreShared.lastDebugQuery == ids else { return [] }
+                    guard hotStoreShared.lastDebugQuery == hotIds else { return [] }
                     return hotStoreShared.lastDebug.map { d in
                         let lo = min(max(0, d.common - 6), ids.count, d.tokens.count)
                         let a = Array(d.tokens[lo ..< min(d.tokens.count, max(lo, d.common + 6))])
@@ -2619,11 +2871,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // Other tail/resume geometries keep their validated solo path.
             // P119 (`solo`): a chunk cut by the shared-prefix split did not exist before; it runs solo (B1, the geometry
             // the shared rung needs) rather than becoming a native-batch candidate that the uncut [0, 2048) never was.
-            guard prefillBatchEnabled, !solo, let qm, [512, 1024].contains(to - from) else { return mt.prefill(body) }
+            guard prefillBatchEnabled, !solo, !isVision, let qm, [512, 1024].contains(to - from) else { return mt.prefill(body) }
             return mt.prefill(key: seqId, position: from, group: "qwen:\(from):\(to):\(mtp)", tokens: to - from, prepare: {
                 guard !cancelled() else { return false }
                 if hotCoalesce, hotStoreShared.enabled,
-                   let hit = seqRegistry[seqId].h25Lookup(ids, minLength: from + 1, mtp: mtp, quiet: true, kind: 1),
+                   let hit = seqRegistry[seqId].h25Lookup(hotIds, minLength: from + 1, mtp: mtp, quiet: true, kind: 1),
                    !mtp || hit.hasMTP { return false }
                 return true
             }, batch: { keys in runNativePrefill(keys, from: from, to: to, model: qm) }, body)
@@ -2644,11 +2896,12 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     guard let mtp = qm.mtp, let mtpCache = st.primeMTPCache else { return (0, -1) }
                     // P100: another request (a sibling subagent) may have prefilled this prefix further since our lookup
                     if st.prefillForward == nil, hotCoalesce, hotStoreShared.enabled, c0 > 0 || hotStoreShared.coalescedStores > 0,
-                       let h = st.h25Lookup(ids, minLength: c0 + 1, mtp: true, quiet: true, kind: 2), h.hasMTP, h.length > c0,
+                       let h = st.h25Lookup(hotIds, minLength: c0 + 1, mtp: true, quiet: true, kind: 2), h.hasMTP, h.length > c0,
                        hotStoreShared.materialize(h, into: st.cache, mtp: mtpCache, model: qm) {
                         // P103: the imported rows are LAZY slices of the donor's buffers. The pre-existing hot-hit path
                         // evals them at the hit; this one did not, so a sibling's cache carried the donor's unevaluated
                         // prefill graph across model-thread jobs -- unbounded retention for no gain.
+                        st.visionRestorePositions(upTo: h.length)  // T-0053 (no-op for text)
                         eval(st.cache.flatMap { $0.state }); eval(mtpCache.state)
                         if c0 > 0 { hotStoreShared.coalescedIntoNonFresh += 1 }
                         st.h25Count("coalesced_imports"); st.h25Adopt(h)
@@ -2664,14 +2917,19 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     let nativeGroup = st.h26ForwardGroupID, nativeSlot = st.h26ForwardSlot
                     let nativeDecoders = st.h26ForwardDecoderCount
                     let bodyDecoders = h26PrefillMetadata ? mt.decoderCount : -1
-                    let (lg, h) = st.prefillForward ?? qm.forwardHidden(st.xs[0..., c0 ..< c1], cache: st.cache)
+                    let (lg, h) = st.prefillForward ?? qm.forwardHidden(st.xs[0..., c0 ..< c1], cache: st.cache,   // T-0053: image rows
+                                                                        embedsOverride: st.visionEmbeds?[0..., c0 ..< c1, 0...],
+                                                                        pos3: st.visionPos3?[0..., 0..., c0 ..< c1])
                     st.prefillForward = nil; st.prefillForwardBatchSize = 0
                     st.h26ForwardGroupID = 0; st.h26ForwardSlot = -1; st.h26ForwardDecoderCount = -1
                     var toks = Array(ids[(c0 + 1) ..< min(c1 + 1, ids.count)])
                     var nn = 0
                     if isLast {
                         st.lastLogits = lg
-                        nn = lg[0..., -1, 0...].argMax(axis: -1).item(Int.self)
+                        // 2026-10-09: a sampled request's first token is SAMPLED, as on the serial path (under MTP it was
+                        // always the argmax, so every sampled answer opened with the same token)
+                        nn = st.sampler.isGreedy ? lg[0..., -1, 0...].argMax(axis: -1).item(Int.self)
+                                                 : st.sampler.sample(lg[0..., -1, 0...]).item(Int.self)
                         toks.append(nn)
                     }
                     let (mixed, S) = mtp(hidden: h, tokens: MLXArray(toks.map { Int32($0) })[.newAxis], embed: embed, cache: mtpCache)
@@ -2701,7 +2959,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     if PrefillChunkPlan.capturesSharedRung(from: c0, to: c1, promptCount: ids.count, rung: sharedRung, margin: sharedPrefixRungMargin) {
                         if splitHere { sharedPrefixSplits += 1 }
                         if actualBatch == 1 {
-                            st.sharedPrefixCapture = hotStoreShared.captureSharedPrefix(prompt: ids, caches: st.cache, mtp: mtpCache, model: qm).rawValue
+                            st.sharedPrefixCapture = hotStoreShared.captureSharedPrefix(prompt: hotIds, caches: st.cache, mtp: mtpCache, model: qm).rawValue
                         } else { sharedPrefixNativeSkips += 1; st.sharedPrefixCapture = "native_batch" }
                     }
                     let origin = st.h25AfterPrefill(from: c0, to: c1, batch: actualBatch, mtp: true, model: qm)
@@ -2710,7 +2968,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                                         bodyDecoders: bodyDecoders, origin: origin)
                     st.h8RecordPrefill(h8Before, from: c0, to: c1, mtp: mtpCache, headTokens: toks)
                     if hotCoalesce, hotStoreShared.enabled, !isLast, !splitHere, c1 < ids.count - hotReserve {
-                        hotStoreShared.store(tokens: Array(ids[0 ..< c1]), caches: st.cache, mtp: mtpCache, rungs: [], model: qm, inFlight: true, owner: seqId, finalCanonical: origin)
+                        hotStoreShared.store(tokens: Array(hotIds[0 ..< c1]), caches: st.cache, mtp: mtpCache, rungs: [], model: qm, inFlight: true, owner: seqId, finalCanonical: origin)
                     }
                     return (nn, -1)
                 }
@@ -2730,6 +2988,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 eval(d1, Slast)
                 st.spec = ServeSpecState(model: qm, mtp: mtp, embed: qm.model.embedTokens, mtpCache: mtpCache,
                                          n0: n0, d1: d1, Slast: Slast, K: mtpDepth)
+                st.spec?.ropeDelta = st.visionRopeDelta              // T-0053: nil for text
                 st.primeMixed = MLXArray(0); st.primeS = MLXArray(0); st.primeMTPCache = nil
             }
         }
@@ -2743,9 +3002,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 defer { serveMemoryWitness.publish() }
                 guard !cancelled() else { return -2 }
                 let st = seqRegistry[seqId]
-                if st.prefillForward == nil, hotCoalesce, hotStoreShared.enabled, let qm, gc0 > 0 || hotStoreShared.coalescedStores > 0,
-                   let h = st.h25Lookup(ids, minLength: gc0 + 1, mtp: false, quiet: true, kind: 3), h.length > gc0,
+                if st.prefillForward == nil, hotCoalesce, useHot, let qm, gc0 > 0 || hotStoreShared.coalescedStores > 0,
+                   let h = st.h25Lookup(hotIds, minLength: gc0 + 1, mtp: false, quiet: true, kind: 3), h.length > gc0,
                    hotStoreShared.materialize(h, into: st.cache, mtp: nil, model: qm) {
+                    st.visionRestorePositions(upTo: h.length)                  // T-0053 (no-op for text)
                     eval(st.cache.flatMap { $0.state })                        // P103: as above
                     if gc0 > 0 { hotStoreShared.coalescedIntoNonFresh += 1 }
                     st.h25Count("coalesced_imports"); st.h25Adopt(h)
@@ -2760,7 +3020,12 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 let nativeGroup = st.h26ForwardGroupID, nativeSlot = st.h26ForwardSlot
                 let nativeDecoders = st.h26ForwardDecoderCount
                 let bodyDecoders = h26PrefillMetadata ? mt.decoderCount : -1
-                st.lastLogits = st.prefillForward?.0 ?? model(st.xs[0..., gc0 ..< gc1], cache: st.cache)
+                if let qm, let vEmb = st.visionEmbeds, let vPos = st.visionPos3 {      // T-0053: embeddings + mRoPE rows
+                    st.lastLogits = qm(st.xs[0..., gc0 ..< gc1], cache: st.cache, embedsOverride: vEmb[0..., gc0 ..< gc1, 0...],
+                                       pos3: vPos[0..., 0..., gc0 ..< gc1])
+                } else {
+                    st.lastLogits = st.prefillForward?.0 ?? model(st.xs[0..., gc0 ..< gc1], cache: st.cache)
+                }
                 st.prefillForward = nil; st.prefillForwardBatchSize = 0
                 st.h26ForwardGroupID = 0; st.h26ForwardSlot = -1; st.h26ForwardDecoderCount = -1
                 if hotReserve > 0, let qm, gc1 == ids.count - hotReserve { st.captureHotRung(length: gc1, model: qm) }
@@ -2776,7 +3041,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 if let qm, PrefillChunkPlan.capturesSharedRung(from: gc0, to: gc1, promptCount: ids.count, rung: sharedRung, margin: sharedPrefixRungMargin) {
                     if splitHere { sharedPrefixSplits += 1 }
                     if actualBatch == 1 {
-                        st.sharedPrefixCapture = hotStoreShared.captureSharedPrefix(prompt: ids, caches: st.cache, mtp: nil, model: qm).rawValue
+                        st.sharedPrefixCapture = hotStoreShared.captureSharedPrefix(prompt: hotIds, caches: st.cache, mtp: nil, model: qm).rawValue
                     } else { sharedPrefixNativeSkips += 1; st.sharedPrefixCapture = "native_batch" }
                 }
                 let origin = qm.flatMap { st.h25AfterPrefill(from: gc0, to: gc1, batch: actualBatch, mtp: false, model: $0) }
@@ -2784,8 +3049,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                                     nativeGroup: nativeGroup, nativeSlot: nativeSlot, nativeDecoders: nativeDecoders,
                                     bodyDecoders: bodyDecoders, origin: origin)
                 st.h8RecordPrefill(h8Before, from: gc0, to: gc1, mtp: nil)
-                if hotCoalesce, hotStoreShared.enabled, let qm, !splitHere, gc1 < ids.count - hotReserve {
-                    hotStoreShared.store(tokens: Array(ids[0 ..< gc1]), caches: st.cache, mtp: nil, rungs: [], model: qm, inFlight: true, owner: seqId, finalCanonical: origin)
+                if hotCoalesce, useHot, let qm, !splitHere, gc1 < ids.count - hotReserve {
+                    hotStoreShared.store(tokens: Array(hotIds[0 ..< gc1]), caches: st.cache, mtp: nil, rungs: [], model: qm, inFlight: true, owner: seqId, finalCanonical: origin)
                 }
                 return -1
             }
@@ -2800,7 +3065,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             let st = seqRegistry[seqId]
             // P093: the prefill-end rung -- the state at exactly the prompt, before any token is
             // forwarded. The next turn of a client that does not echo reasoning resumes here.
-            if let qm, hotStoreShared.enabled { st.captureHotRung(length: ids.count, model: qm) }
+            if let qm, useHot { st.captureHotRung(length: ids.count, model: qm) }
+            st.visionEmbeds = nil; st.visionPos3 = nil         // T-0053: the prompt's rows are in the caches now
             st.prevLogits = st.lastLogits[0..., -1, 0...]
             let y = st.spec.map { MLXArray([Int32($0.n0)]) } ?? st.sampler.sample(st.prevLogits)
             eval(y)
@@ -2965,7 +3231,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // count is exactly ids + out + queue). Skipped while the row is pooled: its state lives
             // in the pool then, and the final rung is captured after the pool releases it.
             let inCache = ids.count + out.count + specQueue.count
-            if hotStoreShared.enabled, let qm, inCache >= nextHotRung {
+            if useHot, let qm, inCache >= nextHotRung {
                 mt.decode(traceLabel: "hot_rung", traceKey: seqId) {
                     let st = seqRegistry[seqId]
                     guard !batchPoolShared.memberIds.contains(ObjectIdentifier(st.row)) else {
@@ -3017,6 +3283,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 && !toolCallInjected && !forcedPrefixIdsTemplate.isEmpty
             let rowBatchable = batchMinRows > 0 && forceQueue.isEmpty && !toolBoundary && !chatReq.logprobsRequested
                 && !chatReq.needsLogitProcessing      // P124: the per-row history lives in the serial sampler
+                && !isVision                          // T-0053: a batched round ropes at the cache offset
                 && (ids.count + out.count) > batchFloor && qm != nil
             setRegistered(rowBatchable)
             // The MTP -> batch handover, at the only safe point: with the round's verified tokens all
@@ -3118,7 +3385,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                         // T-0041: the copy index starts from the prompt, the emitted tokens and the pending token the round
                         // forwards first (sp.n0): it is NOT in `out` yet (out.append happens when it is emitted below), and
                         // without it every lookup would be shifted by one token
-                        if draftCopy.on, sp.copyIndex == nil, ids.count + out.count < draftCopy.maxContext {
+                        if draftCopy.on, !isVision, sp.copyIndex == nil, ids.count + out.count < draftCopy.maxContext {
                             sp.copyIndex = CopyIndex(Array((ids + out + [sp.n0]).suffix(draftCopy.window)))
                         }
                         let rr = serveSpecRound(&sp, cache: st.cache, sampler: &st.sampler, bias: softBias,
@@ -3147,7 +3414,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     st.spec = nil                       // forced prefix or ineligible: serial from here
                     st.row.spec = nil                   // no stale pre-boundary head may rearm later
                     forwardedNow = true
-                    var logits = model(st.pending[.newAxis], cache: st.cache)[0..., -1, 0...]
+                    // T-0053: an mRoPE sequence's token at cache offset L sits at position L + delta on all three axes
+                    var logits = (st.visionRopeDelta != nil && qm != nil
+                        ? qm!(st.pending[.newAxis], cache: st.cache, embedsOverride: nil, pos3: st.visionDecodePos3())
+                        : model(st.pending[.newAxis], cache: st.cache))[0..., -1, 0...]
                     // P077 soft stop: while the reasoning is open, add a ramped bias to `</think>` so
                     // the model closes at ITS OWN next sentence boundary instead of being truncated
                     // mid-derivation.
@@ -3285,8 +3555,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         // P099: a batched round that forwarded a pending stop also committed tokens after it (the queue; its last
         // element is the round's bonus, never forwarded) -- the claim counts the stop AND those.
         let queuedInCache: [Int] = specQueue.isEmpty ? [] : [pendingTok] + specQueue.dropLast()
-        if stopForwarded { hotTokens = ids + out + [stopTok] + queuedInCache }
-        else { hotTokens = ids + out + queuedInCache }
+        if stopForwarded { hotTokens = hotIds + out + [stopTok] + queuedInCache }
+        else { hotTokens = hotIds + out + queuedInCache }
         let decodeSeconds = max(Date().timeIntervalSince(tDecode0), 1e-6)
         lastRequestStats = [
             "ttft_ms": ttftSeconds * 1000,
@@ -3318,6 +3588,18 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 "sampled_tokens": mt.exclusive { seqRegistry[seqId].sampler.processor?.observed ?? 0 }] as [String: Any]
         }
         if ProcessInfo.processInfo.environment["ENGINE_EXPOSE_TOKEN_IDS"] == "1" { lastRequestStats["token_ids"] = out }
+        if let vp = visionPrepared {                               // T-0053 witness (absent on text requests)
+            lastRequestStats["vision"] = ["images": visionImages.count, "patches": visionPatches,
+                                          "visual_tokens": visionSpans.reduce(0) { $0 + $1.tokens },
+                                          "grids": visionSpans.map { [$0.t, $0.h, $0.w] }, "rope_delta": vp.ropeDelta,
+                                          "first_span_start": visionSpans.first?.start ?? -1,
+                                          "tower_ms": vp.towerSeconds * 1000, "tower_images": vp.towerImages,
+                                          "feature_cache": mt.exclusive { ["entries": serveVisionFeatureCache.count, "bytes": serveVisionFeatureCache.bytes,
+                                                                           "hits": serveVisionFeatureCache.hits, "misses": serveVisionFeatureCache.misses] }] as [String: Any]
+            if let p = vp.peakAboveBytes, var v = lastRequestStats["vision"] as? [String: Any] {
+                v["tower_peak_above_active_bytes"] = p; lastRequestStats["vision"] = v
+            }
+        }
         if sharedPrefixRung > 0 {   // P119 per-request witness (absent with the knob off)
             let (hitLength, capture): (Int, String) = mt.exclusive {
                 let st = seqRegistry[seqId]
@@ -3450,6 +3732,13 @@ struct ServeSpecState {
     var nextLookup: [Int]? = nil
     var lastWasLookup = false
     var lookupLen = 0
+    /// Speculative sampling: the head distribution d1 was sampled from (nil: d1 is the argmax, a one-hot draft), and the
+    /// queued drafts' distributions next to `pre`.
+    var q1: SpecDraftDist? = nil
+    var preQ: [SpecDraftDist?]? = nil
+    /// T-0053: an mRoPE sequence's position offset (an image request): the verify block of a round at committed length T
+    /// sits at positions T + ropeDelta ..< T + ropeDelta + K + 1 on all three axes; nil for text.
+    var ropeDelta: Int? = nil
     /// H60 review: a queued chain that is never consumed (the request's last round) must not have grown a head buffer,
     /// or the stored head's capacity (charged by the hot store) would differ from B44's. Queue only when the K-1 rows fit.
     func chainFitsWithoutGrowth() -> Bool {
@@ -3465,6 +3754,7 @@ struct ServeSpecState {
         guard let pre else { return }
         self.pre = nil
         self.preP = nil
+        self.preQ = nil
         let kv = (mtpCache as! CacheList)[0] as! KVCacheSimple
         _ = kv.trim(pre.count)
         let idxc = (mtpCache as! CacheList)[1] as! ArraysCache
@@ -3576,6 +3866,13 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     var draftArrs: [MLXArray] = [sp.d1]
     let lookupRound = sp.nextLookup
     sp.nextLookup = nil
+    // speculative sampling: a sampled request (top-k on, no logit processor) drafts by sampling the head under its own
+    // temperature / top-k / top-p and accepts by min(1, p/q); copy-mode lookups and the confidence policy keep one-hot drafts
+    // (top-k at most 1024: the residual compares every target candidate with every head candidate, and a top-k at or past the
+    // vocabulary is the sampler's full path, which has no k-wide distribution to compare)
+    let sampling = specSamplingOn && !sampler.isGreedy && sampler.topK > 0 && sampler.topK <= 1024 && !tracing && !draftPolicy.conf
+    let lookupThisRound = lookupRound.map { !$0.isEmpty } ?? false
+    var draftDists: [SpecDraftDist?] = [sampling && !lookupThisRound ? sp.q1 : nil]
     if let lk = lookupRound, !lk.isEmpty {
         // T-0041 copy mode: verify the looked-up tokens; the head's d1 is not used this round
         sp.settle()
@@ -3603,6 +3900,7 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
         if tracing { probArrs = probs }
     } else if let pre = sp.pre, pre.count == K - 1 {
         draftArrs += pre                                    // H60: queued by the previous round
+        draftDists += sampling ? (sp.preQ ?? Array(repeating: nil, count: K - 1)) : Array(repeating: nil, count: K - 1)
         if tracing { probArrs += (sp.preP?.count == K - 1 ? sp.preP! : Array(repeating: noProb, count: K - 1)) }
     } else {
         sp.settle()
@@ -3611,7 +3909,12 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
         if tracing { model.draftProbSink = { roundProbs.append($0.reshaped(-1)) } }
         for _ in 1 ..< K {
             let (m, s2) = mtp(hidden: Slast, tokens: draftArrs.last![.newAxis], embed: embed, cache: sp.mtpCache)
-            draftArrs.append(model.draftToken(m[0..., -1, 0...]))
+            if sampling {
+                let (x, q) = specSampleDraft(model, m[0..., -1, 0...], sampler: &sampler)
+                draftArrs.append(x); draftDists.append(q)
+            } else {
+                draftArrs.append(model.draftToken(m[0..., -1, 0...])); draftDists.append(nil)
+            }
             Slast = s2
         }
         if tracing { model.draftProbSink = nil; probArrs += roundProbs }
@@ -3619,9 +3922,15 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     }
     sp.pre = nil
     sp.preP = nil
+    sp.preQ = nil
     let T = (cache.first { $0 is CacheList } as! CacheList)[0].offset      // committed length before the round
     let block = concatenated([MLXArray([Int32(sp.n0)])] + draftArrs, axis: 0)[.newAxis]
-    let (vl, vh) = model.forwardHidden(block, cache: cache)
+    let vPos3: MLXArray? = sp.ropeDelta.map { d in
+        let p = (0 ... K).map { Int32(T + d + $0) }
+        return MLXArray(p + p + p).reshaped(3, 1, K + 1)
+    }
+    let (vl, vh) = vPos3 == nil ? model.forwardHidden(block, cache: cache)
+                                : model.forwardHidden(block, cache: cache, embedsOverride: nil, pos3: vPos3)
     // P078: the soft stop must ride the SPECULATIVE path too -- row j of the verify block continues a
     // prefix of `generated + j` tokens, so it gets the bias serial decoding would apply there. Without
     // this the server's ramp was inert whenever MTP was on, which is every agentic deployment.
@@ -3642,12 +3951,22 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
             vlb[0..., engineThinkCloseId ..< (engineThinkCloseId + 1)] = col + add.reshaped([rows, 1]).asType(vlb.dtype)
         }
     }
-    let predsArr = (sampler.isGreedy ? vlb.argMax(axis: -1) : sampler.sample(vlb.reshaped(-1, vlb.dim(-1)))).asType(.int32)
-    let both = concatenated([predsArr, concatenated(draftArrs, axis: 0)], axis: 0)
-    let bothHost = both.asArray(Int32.self).map { Int($0) }
-    let preds = Array(bothHost.prefix(K + 1)), drafts = Array(bothHost.suffix(K))
+    let preds: [Int], drafts: [Int]
     var a = 0
-    while a < K && preds[a] == drafts[a] { a += 1 }
+    if sampling && !lookupThisRound && draftDists.count == K {
+        let r = specVerify(vlb, drafts: draftArrs, dists: draftDists, sampler: &sampler)
+        preds = r.0; drafts = r.1; a = r.2
+        specSamplingRounds += 1
+    } else {
+        let predsArr = (sampler.isGreedy ? vlb.argMax(axis: -1) : sampler.sample(vlb.reshaped(-1, vlb.dim(-1)))).asType(.int32)
+        let both = concatenated([predsArr, concatenated(draftArrs, axis: 0)], axis: 0)
+        let bothHost = both.asArray(Int32.self).map { Int($0) }
+        preds = Array(bothHost.prefix(K + 1)); drafts = Array(bothHost.suffix(K))
+        while a < K && preds[a] == drafts[a] { a += 1 }
+    }
+    // the accepted count before the cuts below: a cut lands on an ACCEPTED draft, which is then the round's last token
+    // (with one-hot drafts preds[a] is that same draft; a sampled round's preds[a] is the residual draw, so it must not be used)
+    let acceptedBeforeCuts = a
     // a committed `</think>` ends the round: the rows after it were biased as if still thinking --
     // P094: only when a bias actually reached those rows; at a zero ramp the cut is one wasted round
     if thinkOpen, bias.active,
@@ -3657,7 +3976,7 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     // them back here (they become the bonus, never forwarded) is what makes the final cache state
     // exactly the emitted sequence, which the hot prefix store depends on.
     if let si = (0 ..< a).first(where: { stopIds.contains(drafts[$0]) }) { a = si }
-    let bonus = preds[a]
+    let bonus = a < acceptedBeforeCuts ? drafts[a] : preds[a]
     let newTokens = Array(drafts.prefix(a)) + [bonus]
     if tracing {
         let c = concatenated(probArrs.map { $0.reshaped(-1).asType(.float32) }, axis: 0).asArray(Float.self)
@@ -3678,7 +3997,12 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     var nextP1: MLXArray? = nil
     let wantP1 = tracing || draftPolicy.conf
     if wantP1 { model.draftProbSink = { nextP1 = $0.reshaped(-1) } }
-    sp.d1 = model.draftToken(m2[0..., -1, 0...])
+    if sampling {
+        let (x, q) = specSampleDraft(model, m2[0..., -1, 0...], sampler: &sampler)
+        sp.d1 = x; sp.q1 = q
+    } else {
+        sp.d1 = model.draftToken(m2[0..., -1, 0...]); sp.q1 = nil
+    }
     if wantP1 { model.draftProbSink = nil; sp.p1 = nextP1 }
     asyncEval(sp.d1)
     if serialReprimeFirst, a < K { model.rollback(cache, blockRows: K + 1, keep: a + 1) }
@@ -3697,18 +4021,100 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
         var Sl = sp.Slast
         var queuedProbs: [MLXArray] = []
         if tracing { model.draftProbSink = { queuedProbs.append($0.reshaped(-1)) } }
+        var nextQ: [SpecDraftDist?] = []
         for _ in 1 ..< K {
             let (m, s2) = mtp(hidden: Sl, tokens: next.last![.newAxis], embed: embed, cache: sp.mtpCache)
-            next.append(model.draftToken(m[0..., -1, 0...]))
+            if sampling {
+                let (x, q) = specSampleDraft(model, m[0..., -1, 0...], sampler: &sampler)
+                next.append(x); nextQ.append(q)
+            } else {
+                next.append(model.draftToken(m[0..., -1, 0...])); nextQ.append(nil)
+            }
             Sl = s2
         }
         if tracing { model.draftProbSink = nil; sp.preP = queuedProbs }
         asyncEval(next.last!)
         sp.pre = Array(next.dropFirst())
+        sp.preQ = nextQ
     }
     return (newTokens, K, a)
 }
 let serialReprimeFirst: Bool = ProcessInfo.processInfo.environment["ENGINE_SERIAL_REPRIME_FIRST"] != "0"
+
+// MARK: - speculative sampling (2026-10-09)
+//
+// A sampled request used to draft the head's ARGMAX and accept a draft when the target's own sample equalled it: exact
+// (that is speculative sampling with a one-hot draft), but a draft is then accepted with probability p(d) only -- at
+// temperature 1.0 a decisive head still loses every round in which the target spreads its mass. Sampling the draft from
+// the head's own distribution q (under the request's temperature / top-k / top-p) and accepting it with probability
+// min(1, p(x)/q(x)), resampling a rejected position from norm(max(0, p - q)), emits tokens distributed exactly as the
+// target's (Leviathan et al. 2023, Chen et al. 2023); a draft is accepted with probability sum_x min(p(x), q(x)), which
+// beats p(d) when the head's distribution is close to the target's (measured, not assumed: see the commit).
+// ENGINE_SPEC_SAMPLING=0 restores the one-hot drafts.
+let specSamplingOn: Bool = ProcessInfo.processInfo.environment["ENGINE_SPEC_SAMPLING"] != "0"
+nonisolated(unsafe) var specSamplingRounds = 0
+
+/// A draft's head distribution: the k candidate full-vocabulary ids (int32) and their probabilities (float32).
+struct SpecDraftDist { let ids: MLXArray; let probs: MLXArray }
+
+/// The sampler's own semantics -- temperature, then top-k (argPartition + a k-wide sort), then a nucleus that keeps the
+/// token crossing `topP` -- as a distribution over the k candidates: ids (..., k) int32 and probabilities (..., k).
+func specTopK(_ logits: MLXArray, temp: Float, topK: Int, topP: Float) -> (ids: MLXArray, probs: MLXArray) {
+    let l = logits.asType(.float32) / temp
+    let part = argPartition(-l, kth: topK - 1, axis: -1)[.ellipsis, 0 ..< topK]
+    var vals = takeAlong(l, part, axis: -1)
+    let ord = argSort(-vals, axis: -1)
+    vals = takeAlong(vals, ord, axis: -1)
+    let ids = takeAlong(part, ord, axis: -1)
+    if topP > 0 && topP < 1 {
+        let p = softmax(vals, axis: -1)
+        vals = MLX.which((p.cumsum(axis: -1) - p) .< MLXArray(topP), vals, MLXArray(-Float.infinity))
+    }
+    return (ids.asType(.int32), softmax(vals, axis: -1))
+}
+
+/// One sampled draft from the head stream `mixed` (1, hidden): the token (1,) int32 and the distribution it came from.
+func specSampleDraft(_ model: Qwen4ExpModel, _ mixed: MLXArray, sampler: inout EngineSampler) -> (MLXArray, SpecDraftDist) {
+    let (logits, rowIds) = model.draftLogits(mixed)
+    let (idx, q) = specTopK(logits.reshaped(-1), temp: sampler.temp, topK: sampler.topK, topP: sampler.topP)
+    let ids = rowIds.map { $0[idx].asType(.int32) } ?? idx
+    let pick = MLXRandom.categorical(log(q), axis: -1, key: sampler.drawKey())
+    return (ids[pick].reshaped(1), SpecDraftDist(ids: ids, probs: q))
+}
+
+/// The verify of a sampled round: target rows `vlb` (K + 1, V), drafts x_j (1,) each with the distribution it was drawn
+/// from (nil: a one-hot draft). Returns (preds, drafts, accepted): preds[j] is what row j emits when the round stops there
+/// -- the residual draw for j < K, the target's own draw at K -- and `accepted` the leading run of accepted drafts.
+/// One host read for the round, as the one-hot verify.
+func specVerify(_ vlb: MLXArray, drafts draftArrs: [MLXArray], dists: [SpecDraftDist?],
+                sampler: inout EngineSampler) -> ([Int], [Int], Int) {
+    let K = draftArrs.count, k = sampler.topK
+    let X = concatenated(draftArrs, axis: 0).asType(.int32)                                   // (K,)
+    let (pIds, pP) = specTopK(vlb, temp: sampler.temp, topK: k, topP: sampler.topP)          // (K+1, k)
+    var oneHot = [Float](repeating: 0, count: k); oneHot[0] = 1
+    let oneHotRow = MLXArray(oneHot)
+    let QI = stacked((0 ..< K).map { j in dists[j]?.ids ?? broadcast(draftArrs[j].asType(.int32).reshaped(1), to: [k]) }, axis: 0)
+    let Q = stacked((0 ..< K).map { j in dists[j]?.probs ?? oneHotRow }, axis: 0)            // (K, k)
+    let pRows = pP[0 ..< K], iRows = pIds[0 ..< K]
+    let pX = (pRows * (iRows .== X[0..., .newAxis]).asType(.float32)).sum(axis: -1)        // p_j(x_j)
+    let qX = (Q * (QI .== X[0..., .newAxis]).asType(.float32)).sum(axis: -1)               // q_j(x_j) > 0: x_j ~ q_j
+    let u = MLXRandom.uniform(Float(0) ..< Float(1), [K], key: sampler.drawKey())
+    let accept = u .< minimum(pX / maximum(qX, MLXArray(Float(1e-30))), MLXArray(Float(1)))
+    // residual over the target's candidates: max(0, p - q), q read at each candidate id (0 outside the head's candidates)
+    let qAtP = (Q[0..., .newAxis, 0...] * (QI[0..., .newAxis, 0...] .== iRows[0..., 0..., .newAxis]).asType(.float32)).sum(axis: -1)
+    var res = maximum(pRows - qAtP, MLXArray(Float(0)))
+    let rs = res.sum(axis: -1, keepDims: true)
+    res = MLX.which(rs .> MLXArray(Float(0)), res / maximum(rs, MLXArray(Float(1e-30))), pRows)   // p <= q everywhere: never rejected
+    let rPick = MLXRandom.categorical(log(res), axis: -1, key: sampler.drawKey())             // (K,)
+    let rTok = takeAlong(iRows, rPick.reshaped(K, 1), axis: -1).reshaped(K)
+    let bPick = MLXRandom.categorical(log(pP[K ..< (K + 1)]), axis: -1, key: sampler.drawKey())
+    let bTok = takeAlong(pIds[K ..< (K + 1)], bPick.reshaped(1, 1), axis: -1).reshaped(1)
+    let host = concatenated([accept.asType(.int32), rTok.asType(.int32), bTok.asType(.int32), X], axis: 0)
+        .asArray(Int32.self).map { Int($0) }
+    var a = 0
+    while a < K && host[a] == 1 { a += 1 }
+    return (Array(host[K ..< (2 * K + 1)]), Array(host[(2 * K + 1)...]), a)
+}
 
 /// P067: throwaway prefill + serial steps (+ prime and two rounds with MTP) so the first client never
 /// pays a kernel compile. Constant token ids, nothing kept.

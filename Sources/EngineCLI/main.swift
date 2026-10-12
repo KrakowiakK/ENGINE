@@ -750,7 +750,9 @@ func nllDump(_ o: Options) async throws {
 /// / `max_pixels`. Decoding it raw would silently fall back to the library defaults (3136 / 12845056)
 /// instead of the checkpoint's 65536 / 16777216, which changes the resize target, the patch grid and
 /// therefore the NUMBER OF IMAGE TOKENS. Map it explicitly.
-func enginePreprocessorConfig(_ modelDir: String) throws -> Qwen3VLProcessorConfiguration {
+/// T-0053: `maxPixelsCap` lowers `max_pixels` (never raises it) -- the server's own bound on one image's tower cost; a
+/// larger image is downscaled to it by the same smart_resize, so its patch grid and token count follow from the cap.
+func enginePreprocessorConfig(_ modelDir: String, maxPixelsCap: Int? = nil) throws -> Qwen3VLProcessorConfiguration {
     let url = URL(fileURLWithPath: modelDir).appendingPathComponent("preprocessor_config.json")
     guard let raw = try? Data(contentsOf: url),
           var obj = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
@@ -760,6 +762,7 @@ func enginePreprocessorConfig(_ modelDir: String) throws -> Qwen3VLProcessorConf
         if let s = size["shortest_edge"] as? Int { obj["min_pixels"] = s }
         if let l = size["longest_edge"] as? Int { obj["max_pixels"] = l }
     }
+    if let cap = maxPixelsCap, let mp = obj["max_pixels"] as? Int, cap < mp { obj["max_pixels"] = cap }
     let fixed = try JSONSerialization.data(withJSONObject: obj)
     return try JSONDecoder().decode(Qwen3VLProcessorConfiguration.self, from: fixed)
 }
@@ -1076,6 +1079,48 @@ func generateWithImage(_ o: Options, imagePath: String) async throws {
     print(context.tokenizer.decode(tokenIds: out))
     FileHandle.standardError.write(String(format: "\nengine vision: ttft %.2f s, decode %.2f tok/s over %d tokens, peak %.1f GB\n",
         ttft, Double(out.count) / dec, out.count, Double(GPU.peakMemory) / 1e9).data(using: .utf8)!)
+}
+
+/// T-0058 (2026-10-09) -- `engine vision-dump --model DIR --pixels IN.safetensors --out OUT.safetensors [--image PATH]`:
+/// the vision tower on the reference preprocessor's pixels (`pixel_values`, `grid_thw` from tools/profile/vision_parity.py)
+/// and, with `--image`, this engine's own preprocessing of the image and the tower on it, saved in float32 for a numeric
+/// comparison with the Python reference tower. Diagnostic only; loads the whole model.
+func visionDump(_ o: Options) async throws {
+    guard let modelPath = o.values["--model"], let pixPath = o.values["--pixels"], let outPath = o.values["--out"] else {
+        throw EngineError.invalid("vision-dump needs --model DIR --pixels IN.safetensors --out OUT.safetensors [--image PATH]")
+    }
+    let dir = URL(fileURLWithPath: modelPath).resolvingSymlinksInPath()
+    await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
+        Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
+    }
+    applyWiredLimit()
+    let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
+    guard let m = context.model as? Qwen4ExpModel, m.hasVision else { throw EngineError.invalid("vision-dump: no vision tower") }
+    let inArrays = try loadArrays(url: URL(fileURLWithPath: pixPath))
+    guard let px = inArrays["pixel_values"], let g = inArrays["grid_thw"] else {
+        throw EngineError.invalid("vision-dump: \(pixPath) needs pixel_values and grid_thw")
+    }
+    let gv = g.asType(.int32).asArray(Int32.self)
+    var out: [String: MLXArray] = [:]
+    // every intermediate of the tower on the reference pixels, for the stage-by-stage comparison
+    Qwen3VLVision.VisionModel.debugSink = { name, a in out["dbg_" + name] = a.asType(.float32) }
+    guard let f1 = m.visionFeatures(pixels: px, gridTHW: [THW(Int(gv[0]), Int(gv[1]), Int(gv[2]))]) else {
+        throw EngineError.invalid("vision-dump: no vision tower mounted")
+    }
+    Qwen3VLVision.VisionModel.debugSink = nil
+    out["feats_on_ref_pixels"] = f1.asType(.float32)
+    if let img = o.values["--image"] {
+        // --max-pixels: the server's per-image cap, to compare a downscaled image with the reference processor's
+        let pcfg = try enginePreprocessorConfig(dir.path, maxPixelsCap: o.values["--max-pixels"].flatMap { Int($0) })
+        guard let ci = CIImage(contentsOf: URL(fileURLWithPath: img)) else { throw EngineError.invalid("vision-dump: cannot read \(img)") }
+        let (px2, th2) = try Qwen3VLProcessor(pcfg, tokenizer: context.tokenizer).preprocess(images: [ci], processing: nil)
+        out["pixels_swift"] = px2.asType(.float32)
+        out["grid_swift"] = MLXArray([Int32(th2.t), Int32(th2.h), Int32(th2.w)])
+        if let f2 = m.visionFeatures(pixels: px2, gridTHW: [th2]) { out["feats_on_swift_pixels"] = f2.asType(.float32) }
+    }
+    eval(Array(out.values))
+    try save(arrays: out, url: URL(fileURLWithPath: outPath))
+    FileHandle.standardError.write("engine vision-dump: \(out.map { "\($0.key) \($0.value.shape)" }.sorted().joined(separator: ", ")) -> \(outPath)\n".data(using: .utf8)!)
 }
 
 /// P051 -- `--chat-file PATH`'s JSON shape: an array of turns. `content` is either plain text or the
@@ -2952,6 +2997,12 @@ do {
         let sem = DispatchSemaphore(value: 0)
         let box = FailureBox()
         Task.detached { do { try await batchProbe(o) } catch { box.error = error }; sem.signal() }
+        sem.wait()
+        if let e = box.error { throw e }
+    case "vision-dump":
+        let sem = DispatchSemaphore(value: 0)
+        let box = FailureBox()
+        Task.detached { do { try await visionDump(o) } catch { box.error = error }; sem.signal() }
         sem.wait()
         if let e = box.error { throw e }
     case "tokbench":

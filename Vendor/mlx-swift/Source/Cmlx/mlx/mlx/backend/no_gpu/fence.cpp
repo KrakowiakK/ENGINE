@@ -20,10 +20,10 @@ Fence::Fence(Stream) {
   fence_ = std::shared_ptr<void>(new FenceImpl{}, dtor);
 }
 
-void Fence::wait(Stream stream, const array&) {
+void Fence::wait(Stream stream, const array&, uint32_t value) {
   auto& f = *static_cast<FenceImpl*>(fence_.get());
   if (stream.device == Device::cpu) {
-    scheduler::enqueue(stream, [count = f.count, fence_ = fence_]() mutable {
+    scheduler::enqueue(stream, [count = value, fence_ = fence_]() mutable {
       auto& f = *static_cast<FenceImpl*>(fence_.get());
       std::unique_lock<std::mutex> lk(f.mtx);
       if (f.value >= count) {
@@ -36,7 +36,7 @@ void Fence::wait(Stream stream, const array&) {
   }
 }
 
-void Fence::update(Stream stream, const array&, bool) {
+uint32_t Fence::update(Stream stream, const array&, bool) {
   auto& f = *static_cast<FenceImpl*>(fence_.get());
   f.count++;
   if (stream.device == Device::cpu) {
@@ -49,6 +49,7 @@ void Fence::update(Stream stream, const array&, bool) {
   } else {
     throw std::runtime_error("[Fence::update] Invalid stream.");
   }
+  return f.count;
 }
 
 } // namespace mlx::core

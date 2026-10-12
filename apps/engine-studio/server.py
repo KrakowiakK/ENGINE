@@ -659,6 +659,7 @@ _SERVE_DEFAULTS = {"--tokens": 2048, "--max-concurrent": 8, "--mtp": 0, "--think
                    "--loop-guard": 0, "--host": "127.0.0.1", "--port": 8080, "--preserve-thinking": "template"}
 
 _HASH_CACHE = {}                 # (path, size, mtime_ns) -> sha256 hex
+_START_SLACK_S = 2.0             # a file written this soon after the estimated process start is not "newer"
 _HASH_LOCK = threading.Lock()
 _PROC_CACHE = {}                 # (pid, args) -> facts that cannot change while that process lives
 _MODEL_CACHE = {}                # (dir, config mtime, dir mtime) -> checkpoint facts
@@ -706,8 +707,10 @@ def _file_facts(path, started_at=None):
         return {"path": str(path), "exists": False}
     out = {"path": str(path), "exists": True, "bytes": st.st_size, "mtime": st.st_mtime, "sha256": _file_sha256(path)}
     if started_at:
-        # the file on disk was rebuilt after this process started: its hash is NOT what the process is running
-        out["newer_than_process"] = st.st_mtime > started_at
+        # the file on disk was rebuilt after this process started: its hash is NOT what the process is running.
+        # started_at comes from `ps etime`, which macOS rounds to the nearest second, and predeploy copies the files
+        # and starts the engine within the same second: allow the rounding before calling a file newer
+        out["newer_than_process"] = st.st_mtime > started_at + _START_SLACK_S
     return out
 
 
@@ -1540,18 +1543,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          headers={"Content-Type": "application/json", "X-Engine-Client": f"studio /v1 proxy ({ua})"})
             r = conn.getresponse()
             retry_after = r.getheader("Retry-After")        # P116: an engine 503 keeps its Retry-After for the client
-            if stream and r.status == 200:
+            if r.status == 200:
+                # Bytes go through as they arrive, streamed or not (2026-10-03). The engine answers with its headers
+                # before the prefill and then a newline every 0.25 s until the reply: relayed at once, they keep a
+                # tunnel alive through a long prefill or a long non-streamed answer (Cloudflare drops a request after
+                # ~100 s without a byte), and streamed tokens arrive one by one. read(4096) waited for 4 KiB.
                 self.send_response(r.status)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
+                if stream:
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                else:
+                    self.send_header("Content-Type", r.getheader("Content-Type", "application/json"))
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 while True:
-                    chunk = r.read(4096)
+                    chunk = r.read1(65536)
                     if not chunk:
                         break
                     self.wfile.write(("%x\r\n" % len(chunk)).encode() + chunk + b"\r\n")
+                    self.wfile.flush()
                 self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
             else:
                 body = r.read()                               # a JSON answer, or any error even on a stream request
                 self.send_response(r.status)

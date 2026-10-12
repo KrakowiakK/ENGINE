@@ -25,10 +25,70 @@ public struct Qwen3VLProcessor: UserInputProcessor {
     }
 
     private func preprocess(image: CIImage, resizedSize: CGSize) -> CIImage {
-        image
-            .toSRGB()
-            .resampled(to: resizedSize, method: .bicubic)
+        Self.resampleKeysBicubic(image.toSRGB(), to: resizedSize)
             .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
+    }
+
+    /// ENGINE T-0058: bicubic with the Keys kernel a = -0.5 (Mitchell-Netravali B = 0, C = 0.5), the reference processors'
+    /// PIL / torchvision BICUBIC. Core Image's bicubic scale transform defaults to C = 0.75, a sharper kernel.
+    /// ENGINE_VISION_BICUBIC_C overrides C (0.75 restores Core Image's default) for the parity tool.
+    static let keysC: Float = Float(ProcessInfo.processInfo.environment["ENGINE_VISION_BICUBIC_C"] ?? "") ?? 0.5
+    static func resampleKeysBicubic(_ image: CIImage, to size: CGSize) -> CIImage {
+        let filter = CIFilter.bicubicScaleTransform()
+        filter.inputImage = image
+        filter.scale = Float(size.height / image.extent.height)
+        filter.aspectRatio = Float((size.width / image.extent.width) / (size.height / image.extent.height))
+        filter.parameterB = 0
+        filter.parameterC = keysC
+        return filter.outputImage!.cropped(to: CGRect(x: 0, y: 0, width: size.width, height: size.height))
+    }
+
+    /// ENGINE T-0058: PIL's BICUBIC resize, the reference processors' (Hugging Face Qwen2VLImageProcessor: PIL on uint8):
+    /// separable Keys a = -0.5 with the kernel widened by the scale factor when downscaling (antialias), each pass rounded
+    /// to 8 bits. Two dense matmuls on the device. ENGINE_VISION_RESAMPLE=coreimage keeps the Core Image bicubic.
+    static let pilResample: Bool = ProcessInfo.processInfo.environment["ENGINE_VISION_RESAMPLE"] != "coreimage"
+
+    static func pilCubic(_ v: Double) -> Double {
+        let a = -0.5, x = abs(v)
+        if x < 1 { return ((a + 2) * x - (a + 3)) * x * x + 1 }
+        if x < 2 { return (((x - 5) * x + 8) * x - 4) * a }
+        return 0
+    }
+
+    /// (outSize, inSize) resampling weights, PIL's precompute_coeffs for the bicubic filter (support 2).
+    static func pilWeights(inSize: Int, outSize: Int) -> MLXArray {
+        let scale = Double(inSize) / Double(outSize)
+        let filterScale = max(scale, 1.0)
+        let support = 2.0 * filterScale
+        var w = [Float](repeating: 0, count: outSize * inSize)
+        for xx in 0 ..< outSize {
+            let center = (Double(xx) + 0.5) * scale
+            let lo = max(Int(center - support + 0.5), 0)
+            let hi = min(Int(center + support + 0.5), inSize)
+            guard hi > lo else { continue }
+            var ks = [Double](repeating: 0, count: hi - lo)
+            var total = 0.0
+            for x in lo ..< hi {
+                ks[x - lo] = pilCubic((Double(x) - center + 0.5) / filterScale)
+                total += ks[x - lo]
+            }
+            if total != 0 { for x in lo ..< hi { w[xx * inSize + x] = Float(ks[x - lo] / total) } }
+        }
+        return MLXArray(w, [outSize, inSize])
+    }
+
+    /// One image -> normalized (1, C, H, W) pixels at `size`, PIL-resized from its sRGB-encoded 8-bit values.
+    private func pilBicubic(_ image: CIImage, to size: CGSize) -> MLXArray {
+        let src = MediaProcessing.asMLXArray(image.toSRGB())                      // (1, 3, H, W), 0...1
+        let h = src.dim(2), w = src.dim(3)
+        let oh = Int(size.height), ow = Int(size.width)
+        func q8(_ x: MLXArray) -> MLXArray { clip(MLX.round(x * 255), min: 0, max: 255) / 255 }
+        var x = q8(src[0])                                                        // (3, H, W): the file's 8-bit values
+        if ow != w { x = q8(matmul(x, Self.pilWeights(inSize: w, outSize: ow).transposed())) }   // (3, H, ow)
+        if oh != h { x = q8(matmul(Self.pilWeights(inSize: h, outSize: oh), x)) }                // (3, oh, ow)
+        let mean = MLXArray(config.imageMean.map { Float($0) }).reshaped(3, 1, 1)
+        let std = MLXArray(config.imageStd.map { Float($0) }).reshaped(3, 1, 1)
+        return expandedDimensions((x - mean) / std, axis: 0)
     }
 
     public func preprocess(images: [CIImage], processing: UserInput.Processing?) throws -> (
@@ -50,17 +110,19 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
 
-        let resampled = processed.map { MediaProcessing.resampleBicubic($0, to: targetSize) }
-
-        let normalized =
-            resampled
-            .map {
-                MediaProcessing.normalize(
-                    $0,
-                    mean: config.imageMeanTuple,
-                    std: config.imageStdTuple)
-            }
-            .map { MediaProcessing.asMLXArray($0) }
+        // ENGINE T-0058: through the sRGB tone curve before resampling, as `preprocess(image:resizedSize:)` above and the
+        // video path do (and as the reference processors see the file's values). Without it the pixels reached the tower
+        // in LINEAR light: against the Hugging Face processor's pixels, relative error 0.39, but 0.0385 against
+        // srgb_to_linear of them -- mid-tones far darker than the model was trained on.
+        let normalized: [MLXArray]
+        if Self.pilResample {
+            normalized = processed.map { pilBicubic($0, to: targetSize) }
+        } else {
+            normalized =
+                processed
+                .map { preprocess(image: $0, resizedSize: targetSize) }
+                .map { MediaProcessing.asMLXArray($0) }
+        }
 
         return try QwenVL.patchify(
             images: normalized,
@@ -637,7 +699,11 @@ public enum Qwen3VLVision {
         init(dim: Int, hiddenDim: Int) {
             _linear1.wrappedValue = Linear(dim, hiddenDim, bias: true)
             _linear2.wrappedValue = Linear(hiddenDim, dim, bias: true)
-            _activation.wrappedValue = GELU(approximation: .fast)
+            // ENGINE T-0058: the checkpoints' `hidden_act` is gelu_pytorch_tanh -- the tanh form (`.precise`), as in the
+            // references (mlx-vlm `nn.GELU(approx="tanh")`, HF ACT2FN). `.fast` is x * sigmoid(1.702 x), a different
+            // function: against the reference tower on identical pixels it put block 0 at cosine 0.979 and the merged
+            // features at 0.93.
+            _activation.wrappedValue = GELU(approximation: .precise)
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -921,19 +987,29 @@ public enum Qwen3VLVision {
                 value: MLXArray(0, dtype: cumSum.dtype))
         }
 
+        /// ENGINE T-0058 (diagnostic): receives the tower's intermediates (patch embedding, position embedding, rotary
+        /// table, every block, merger) for a stage-by-stage comparison with the reference. nil (always, outside
+        /// `engine vision-dump`) changes nothing.
+        nonisolated(unsafe) public static var debugSink: ((String, MLXArray) -> Void)? = nil
+
         public func callAsFunction(_ pixelValues: MLXArray, gridTHW: [THW]) -> (MLXArray, [MLXArray]) {
+            let sink = Self.debugSink
             var hiddenStates = patchEmbed(pixelValues)
+            sink?("patch", hiddenStates)
 
             let posEmbeds = positionalEmbeddings(gridTHW)
+            sink?("pos", posEmbeds)
             hiddenStates = hiddenStates + posEmbeds
 
             let rotaryEmbeds = rotaryPositionEmbedding(gridTHW)
+            sink?("rot", rotaryEmbeds)
             let cuSeqlens = cumulativeSequenceLengths(gridTHW)
 
             var deepstackOutputs: [MLXArray] = []
 
             for (index, block) in blocks.enumerated() {
                 hiddenStates = block(hiddenStates, cuSeqlens: cuSeqlens, rotaryPosEmb: rotaryEmbeds)
+                sink?(String(format: "block%02d", index), hiddenStates)
                 if let dsIndex = deepstackVisualIndexes.firstIndex(of: index) {
                     let feature = deepstackMergers[dsIndex](hiddenStates)
                     deepstackOutputs.append(feature)
@@ -941,6 +1017,7 @@ public enum Qwen3VLVision {
             }
 
             hiddenStates = merger(hiddenStates)
+            sink?("merger", hiddenStates)
             return (hiddenStates, deepstackOutputs)
         }
 
