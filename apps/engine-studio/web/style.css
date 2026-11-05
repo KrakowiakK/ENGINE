@@ -245,3 +245,23 @@ pre.argv { margin: 0 0 6px; padding: 8px; background: var(--panel-2); border: 1p
   .kv { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .kv dd { margin-bottom: 5px; }
 }
+
+/* /engine "Over time": four live line charts (engine.js renderCharts) */
+.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr)); gap: 14px 18px; }
+.chart-box { min-width: 0; position: relative; }
+.chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.chart-head h3 { margin: 0 0 4px; }
+.chart-now { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.chart-now b { color: var(--text); font-weight: 600; }
+.chart { display: block; width: 100%; height: 170px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; cursor: crosshair; }
+.chart-win { float: right; display: inline-flex; gap: 4px; text-transform: none; letter-spacing: normal; }
+.chart-win button { background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim); border-radius: 6px; padding: 1px 8px; font-size: 11px; }
+.chart-win button.on { background: var(--accent-dim); color: var(--text); border-color: var(--accent); }
+
+/* /engine Totals: "Best so far" records */
+.rec-head { margin: 14px 0 6px !important; display: flex; align-items: baseline; gap: 8px; }
+.rec-reset { margin-left: auto; background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim); border-radius: 6px; padding: 1px 8px; font-size: 11px; }
+.rec { display: flex; flex-direction: column; }
+.rec-when { font-size: 10.5px; color: var(--text-dim); text-align: center; margin-top: 2px; font-variant-numeric: tabular-nums; }
+#d-records { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+.rec-med { font-size: 0.62em; font-weight: 500; color: var(--text-dim); }

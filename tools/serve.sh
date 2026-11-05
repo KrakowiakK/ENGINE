@@ -16,9 +16,9 @@ for ARG in "$@"; do
       exit 2 ;;
   esac
 done
-if [[ "${ENGINE_SCHEDULER:-phase}" != phase || "${ENGINE_BATCH_PREFILL:-1}" != 1 || "${ENGINE_PREFILL_ROW_PROJECTIONS:-all}" != all || "${ENGINE_SHARED_RAM_BUDGET:-1}" != 1 || "${ENGINE_MTP:-1}" != 1 || "${ENGINE_BATCH_MTP_POLICY:-auto}" != auto || "${ENGINE_H25_CANONICAL_PREFIX:-0}" != 0 || "${ENGINE_RELEASE_POOLED_PRIVATE_HISTORY:-1}" != 1 \
-      || "${ENGINE_PREFILL_WIDTH_CANONICAL:-1024}" != 1024 || "${ENGINE_PREFILL_CHUNK_ALONE:-4096}" != 4096 || "${ENGINE_PREFILL_BUDGET_CUT:-1}" != 1 \
-      || "${ENGINE_SHARED_PREFIX_RUNG:-1024}" != 1024 || "${ENGINE_SHARED_PREFIX_RUNG_MAX:-4}" != 4 \
+if [[ "${ENGINE_SCHEDULER:-phase}" != phase || "${ENGINE_BATCH_PREFILL:-1}" != 1 || "${ENGINE_PREFILL_ROW_PROJECTIONS:-all}" != all || "${ENGINE_SHARED_RAM_BUDGET:-1}" != 1 || "${ENGINE_MTP:-1}" != 1 || ( "${ENGINE_BATCH_MTP_POLICY:-auto}" != auto && "${ENGINE_BATCH_MTP_POLICY:-}" != cycle:2 ) || "${ENGINE_H25_CANONICAL_PREFIX:-0}" != 0 || "${ENGINE_RELEASE_POOLED_PRIVATE_HISTORY:-1}" != 1 \
+      || "${ENGINE_PREFILL_WIDTH_CANONICAL:-1024}" != 1024 || ( "${ENGINE_PREFILL_CHUNK_ALONE:-4096}" != 4096 && ! ( "${ENGINE_PREFILL_CHUNK_ALONE:-}" == 8192 && "${ENGINE_QSA_GATHER_MAX_S:-}" == 8192 ) ) || "${ENGINE_PREFILL_BUDGET_CUT:-1}" != 1 \
+      || ( "${ENGINE_SHARED_PREFIX_RUNG:-1024}" != 1024 && ! ( "${ENGINE_SHARED_PREFIX_RUNG:-}" == 191 && "${ENGINE_SHARED_PREFIX_RUNG_SHORT:-}" == 1 ) ) || "${ENGINE_SHARED_PREFIX_RUNG_MAX:-4}" != 4 \
       || "${ENGINE_ADMISSION_GROWTH_WINDOW:-32768}" != 32768 ]]; then
   echo 'The tested OMP profile requires phase scheduling, native prefill with all row projections, shared RAM budgeting, MTP auto, decode-origin prefix reuse, pooled release, the B40 prefill widths and the P119 shared-prefix rung at 1024 (at most 4 heads) and the P120 admission growth window 32768. Use a separate diagnostic invocation for overrides.' >&2
   exit 2
@@ -27,7 +27,12 @@ fi
 # first chunk at 1024; that state is kept once per distinct head (at most 4, 1/8 of the hot budget) and resumed by later
 # cold prompts with the head (aider's 1321-token system prompt). Pinned, not a default: a shell value other than these
 # is refused above (an unparsable one would make the binary refuse to start).
+RUNG_REQUESTED="${ENGINE_SHARED_PREFIX_RUNG:-1024}"
 export ENGINE_SHARED_PREFIX_RUNG=1024 ENGINE_SHARED_PREFIX_RUNG_MAX=4
+# T-0156 (2026-10-31): a profile may set ENGINE_SHARED_PREFIX_RUNG=191 together with ENGINE_SHARED_PREFIX_RUNG_SHORT=1 (a
+# short rung on an indexed model: the E9 client's ~192-255-token common head; not bit-identical, checked on answers); the
+# E9 docs profile does. The check above refuses every other rung.
+[[ "$RUNG_REQUESTED" == 191 ]] && export ENGINE_SHARED_PREFIX_RUNG=191
 # P120 (B54): the hot store's share of the RAM budget follows each row's committed length (prompt + 32768, grown ahead of
 # the row) instead of prompt + max_tokens; admission decisions are unchanged (they still price prompt + max_tokens).
 export ENGINE_ADMISSION_GROWTH_WINDOW=32768
@@ -42,7 +47,12 @@ export ENGINE_BATCH_FLOOR="${ENGINE_BATCH_FLOOR:-64}"
 # --batch-min 2 (2026-10-02, was 4): with short rows batchable, two or three concurrent chats already pay: real suite
 # 2 concurrent 128 tok/s vs 97-101 interleaved, 3 concurrent 130 vs 93; a lone row never waits (rows register).
 export ENGINE_SCHEDULER=phase ENGINE_BATCH_PREFILL=1 ENGINE_PREFILL_ROW_PROJECTIONS=all
-export ENGINE_SHARED_RAM_BUDGET=1 ENGINE_MTP=1 ENGINE_BATCH_MTP_POLICY=auto
+# T-0208: the batched draft depth may also be fixed at K=2 (cycle:2, the E9 docs launcher default; C-0675, C-0677)
+export ENGINE_SHARED_RAM_BUDGET=1 ENGINE_MTP=1 ENGINE_BATCH_MTP_POLICY="${ENGINE_BATCH_MTP_POLICY:-auto}"
+# T-0295 (2026-11-05, C-0818): routed-expert gathers take MLX's expert-grouped GEMM from 26 rows (0.5 x 512 experts / top-10)
+# instead of 205 (stock 4): batched MTP rounds -4..-15% at 12-32 rows (C-0817), 32 sessions +10.0% client-like / +7.2%
+# extract throughput, QC-6 OK. Single-stream rounds (4 rows) do not switch. Rollback: MLX_GATHER_RHS_MIN_RATIO=4.
+export MLX_GATHER_RHS_MIN_RATIO="${MLX_GATHER_RHS_MIN_RATIO:-0.5}"
 # P106 B40 (operator 2026-09-23): prefix reuse from the LIVE decode state too (canonical-only B27 reuse OFF: a hot
 # continuation need not be bit-identical to a cold prefill); pooled private-history release kept.
 # Prefill: 4096-token chunks while alone (B43; the first chunk ends at the QSA budget 2048), 1024 while shared;
@@ -50,7 +60,12 @@ export ENGINE_SHARED_RAM_BUDGET=1 ENGINE_MTP=1 ENGINE_BATCH_MTP_POLICY=auto
 # 16384/131072). Hot store ceiling 192 GB (raised from 128 on 2026-09-30: at 128 GB the LRU evicted still-reused prompts of a 7-prompt agent loop, 108 evictions in 45 min); the shared RAM budget only lends it what live requests do not reserve
 # (H50a: 20 GB evicted live conversations, 219k tokens re-prefilled).
 export ENGINE_H25_CANONICAL_PREFIX=0 ENGINE_RELEASE_POOLED_PRIVATE_HISTORY=1
+ALONE_REQUESTED="${ENGINE_PREFILL_CHUNK_ALONE:-4096}"
 export ENGINE_PREFILL_WIDTH_CANONICAL=1024 ENGINE_PREFILL_CHUNK_ALONE=4096 ENGINE_PREFILL_BUDGET_CUT=1
+# T-0155 (2026-10-31): a profile may set ENGINE_PREFILL_CHUNK_ALONE=8192 together with ENGINE_QSA_GATHER_MAX_S=8192 (the
+# sparse QSA gather kept for 8192 rows; without it attention falls back to dense SDPA and 8192 is slower, C-0468); the
+# E9 docs profile does (C-0480). The check above refuses every other alone width and 8192 without the gather limit.
+[[ "$ALONE_REQUESTED" == 8192 ]] && export ENGINE_PREFILL_CHUNK_ALONE=8192
 # H54 (B44): store-time anchor rungs -- per 8192 band of an entry's last 32k tokens, the highest inherited rung (mostly
 # earlier turns' ends), charged to the hot store. They never enlarge the live ladder, so the per-row reserve is unchanged
 # (H58/D52: live anchors starved the hot store at eight 258k rows).
@@ -65,7 +80,8 @@ unset ENGINE_OWNER_ORDER_TRACE ENGINE_RESTACK_EVAL ENGINE_INDEXER_ROUTE_WITNESS 
   ENGINE_DUMP_CALLS ENGINE_DUMP_HC0 ENGINE_DUMP_LAYERS \
   ENGINE_DUMP_ROUTER ENGINE_DUMP_ROUTER_N ENGINE_DUMP_TOP \
   ENGINE_MTP_ROUND_TRACE ENGINE_MTP_MARGIN_DUMP ENGINE_SERVE_NO_WARM \
-  ENGINE_TEMPLATE_CACHE_VERIFY ENGINE_ROUND_TRACE ENGINE_ROUND_TRACE_PROBS ENGINE_ROUND_D1_DEVICE
+  ENGINE_TEMPLATE_CACHE_VERIFY ENGINE_ROUND_TRACE ENGINE_ROUND_TRACE_PROBS ENGINE_ROUND_D1_DEVICE \
+  ENGINE_ROW_ACCEPT_TRACE ENGINE_VERIFY_PROJ_CHECK ENGINE_HC_VERIFY_CHECK
 # P106 B32 (H42): ENGINE_TEMPLATE_CACHE_MB defaults to 256 inside the binary; VERIFY is a
 # diagnostic double-check (HTTP 500 on mismatch) and must never run in production.
 export ENGINE_CACHE_LIMIT_GB="${ENGINE_CACHE_LIMIT_GB:-32}"
@@ -117,10 +133,18 @@ export ENGINE_DRAFT_COPY="${ENGINE_DRAFT_COPY:-1}" ENGINE_DRAFT_COPY_MIN="${ENGI
 # three requests waiting 1500 s (then 503) with 180 GB free; at 2x all 16 fit (~10.5 GB priced per row).
 export ENGINE_DECODE_AFFINITY_MS="${ENGINE_DECODE_AFFINITY_MS:-5}" ENGINE_DECODE_SHARE="${ENGINE_DECODE_SHARE:-0.5}"
 export ENGINE_ADMISSION_HISTORY_FACTOR="${ENGINE_ADMISSION_HISTORY_FACTOR:-2}"
+# T-0109 (2026-10-29): decode seats. ENGINE_SEATS sets --max-concurrent and --batch-max-rows together (default 16, the
+# 2026-10-02 profile); a batched round reads each distinct routed expert once, so more rows share the expert reads.
+# T-0118 (2026-10-29): batched MTP depth cap (--batch-mtp). Default 3, the tested profile; above 3 the auto policy drafts
+# deeper only while the implied per-position acceptance stays >= 0.84 (BatchDraftPolicy deepUp/deepDown).
+BATCH_MTP_K="${ENGINE_BATCH_MTP_K:-3}"
+[[ "$BATCH_MTP_K" =~ ^[0-9]+$ ]] && (( BATCH_MTP_K >= 1 && BATCH_MTP_K <= 8 )) || { echo "ENGINE_BATCH_MTP_K must be 1..8" >&2; exit 2; }
+SEATS="${ENGINE_SEATS:-16}"
+[[ "$SEATS" =~ ^[0-9]+$ ]] && (( SEATS >= 1 && SEATS <= 64 )) || { echo "ENGINE_SEATS must be 1..64" >&2; exit 2; }
 exec "$BIN" serve --model "${ENGINE_MODEL:-$PWD/weights/e9}" --max-context "${ENGINE_MAX_CONTEXT:-1048576}" \
   --host "${ENGINE_HOST:-127.0.0.1}" --port "${ENGINE_PORT:-8099}" \
-  --tokens 0 --max-tokens-clamp 1 --mtp 3 --batch-mtp 3 --think-bias-max 16 --think-bias-start 1000 \
-  --think-bias-full 4000 --think-bias-deadline 8000 --think-bias-gate line --max-concurrent 16 \
+  --tokens 0 --max-tokens-clamp 1 --mtp 3 --batch-mtp "$BATCH_MTP_K" --think-bias-max 16 --think-bias-start 1000 \
+  --think-bias-full 4000 --think-bias-deadline 8000 --think-bias-gate line --max-concurrent "$SEATS" \
   --reasoning-effort xhigh --hot-cache-gb 192 --hot-keep-rungs 2 \
-  --batch-min 2 --batch-max-rows 16 --batch-window-ms 25 --prefill-chunk 0 --state-cache-step 512 \
-  --queue-max 32 --queue-timeout-s 1500 ${DISK_ARGS[@]+"${DISK_ARGS[@]}"} "$@"
+  --batch-min 2 --batch-max-rows "$SEATS" --batch-window-ms 25 --prefill-chunk 0 --state-cache-step 512 \
+  --queue-max "$(( SEATS > 32 ? SEATS : 32 ))" --queue-timeout-s 1500 ${DISK_ARGS[@]+"${DISK_ARGS[@]}"} "$@"

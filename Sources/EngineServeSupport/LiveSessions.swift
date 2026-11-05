@@ -24,6 +24,7 @@ public final class LiveSessions: @unchecked Sendable {
         public var mtpAccepted = 0
         public var finishReason = ""
         public var endedAt: Date? = nil
+        public var images = 0                   // T-0141: image inputs of the request (0 for text)
     }
 
     private let lock = NSLock()
@@ -119,7 +120,7 @@ public final class LiveSessions: @unchecked Sendable {
             "elapsed_s": end.timeIntervalSince(e.startedAt), "prompt_tokens": e.promptTokens,
             "cached_tokens": e.cachedTokens, "cache_source": e.cacheSource, "prefilled_to": e.prefilledTo,
             "max_tokens": e.maxTokens, "generated": e.generated, "stream": e.stream, "mtp": e.mtp,
-            "reasoning_effort": e.reasoningEffort, "finish_reason": e.finishReason,
+            "reasoning_effort": e.reasoningEffort, "finish_reason": e.finishReason, "images": e.images,
         ]
         if let f = e.firstTokenAt {
             r["ttft_ms"] = f.timeIntervalSince(e.startedAt) * 1000

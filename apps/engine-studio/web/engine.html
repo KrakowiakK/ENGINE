@@ -39,6 +39,24 @@
   <section class="card">
     <h2>Totals</h2>
     <div id="d-totals" class="tbl-wrap"></div>
+    <h3 class="rec-head">Best so far <span id="d-rec-since" class="h2-sub"></span>
+      <button id="d-rec-reset" type="button" class="rec-reset" title="Start the records again from now (the history stays)">reset records</button></h3>
+    <div id="d-records" class="tiles"></div>
+  </section>
+
+  <section class="card">
+    <h2>Over time <span class="h2-sub">sampled every 1.5 s by the Studio server, last 3 hours</span>
+      <span id="d-chart-win" class="chart-win"></span></h2>
+    <div class="chart-grid">
+      <div class="chart-box"><div class="chart-head"><h3>Decode tok/s</h3><span id="d-cv-dec" class="chart-now"></span></div>
+        <canvas id="d-ch-dec" class="chart"></canvas></div>
+      <div class="chart-box"><div class="chart-head"><h3>Prefill tok/s <span class="h2-sub">computed, cache hits excluded, 6 s window</span></h3><span id="d-cv-pre" class="chart-now"></span></div>
+        <canvas id="d-ch-pre" class="chart"></canvas></div>
+      <div class="chart-box"><div class="chart-head"><h3>Concurrency <span class="h2-sub">active · decoding · prefilling</span></h3><span id="d-cv-act" class="chart-now"></span></div>
+        <canvas id="d-ch-act" class="chart"></canvas></div>
+      <div class="chart-box"><div class="chart-head"><h3>Context tokens <span class="h2-sub">all active requests · largest one</span></h3><span id="d-cv-ctx" class="chart-now"></span></div>
+        <canvas id="d-ch-ctx" class="chart"></canvas></div>
+    </div>
   </section>
 
   <section class="card">

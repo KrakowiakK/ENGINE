@@ -145,6 +145,7 @@ function renderHeader(d) {
 
 function renderLive(d) {
   const s = d.sessions || {}, a = s.aggregate || {}, sys = d.system || {};
+  const raw = d.raw || {}, aw = raw.admission_wait || s.admission_wait || {}, rbq = raw.ram_budget || s.ram_budget || {};
   $("d-now").innerHTML =
     tile(`${a.active ?? NA}/${s.max_concurrent ?? NA}`, "active / max") +
     tile(a.prefilling ?? NA, "prefilling") +
@@ -153,7 +154,15 @@ function renderLive(d) {
     tile(numCell(a.prompt_tokens_in_flight), "prompt tokens in flight") +
     tile(s.reserved_sequences ?? NA, "reserved sequences") +
     tile(isNum(s.batch_steps) ? fmtNum(s.batch_steps) : NA, "batch steps") +
-    tile(s.mtp_depth ?? NA, "MTP depth");
+    tile(s.mtp_depth ?? NA, "MTP depth") +
+    // T-0092: requests waiting for a memory reservation are in no table above; show them and what the next one costs
+    tile(aw.waiting ?? NA, "waiting for admission",
+         "requests the admission budget has not taken yet (they are in neither table)") +
+    tile(isNum(aw.refused_after_wait) ? aw.refused_after_wait : NA, "refused after wait",
+         "requests that waited the whole queue timeout and got an error") +
+    tile(isNum(aw.max_wait_s) ? aw.max_wait_s.toFixed(0) + " s" : NA, "longest admission wait") +
+    tile(fmtBytes(rbq.prospective_reservation_growth_bytes), "next request's price",
+         "what admitting one more request costs in the admission budget (ram_budget.prospective_reservation_growth_bytes)");
 
   const mem = s.memory || {};
   $("d-mem").innerHTML =
@@ -180,7 +189,7 @@ function renderLive(d) {
         `${fmtBytes(rb.active_reservation_bytes)} / ${fmtBytes(rb.capacity_bytes)}`) +
       `<div class="tiles">${tile(fmtBytes(rb.capacity_bytes), "capacity")}${tile(rb.active_reservations ?? NA, "reservations")}` +
       `${tile(fmtBytes(rb.hot_target_bytes), "hot target")}${tile(fmtBytes(rb.hot_ceiling_bytes), "hot ceiling")}` +
-      `${tile(fmtBytes(rb.live_limit_bytes), "live limit")}${tile(fmtBytes(rb.prospective_reservation_growth_bytes), "prospective growth")}</div>`
+      `${tile(fmtBytes(rb.live_limit_bytes), "live limit")}${tile(fmtBytes(rbq.prospective_reservation_growth_bytes), "prospective growth")}</div>`
     : `<div class="es-empty">this engine build reports no ram_budget</div>`;
 }
 
@@ -262,7 +271,9 @@ function reqCols(finished, rows) {
 function renderRequests(d) {
   const s = d.sessions || {};
   const active = (s.active || []).slice().sort((x, y) => (x.id || 0) - (y.id || 0));
-  $("d-active-n").textContent = `(${active.length}${isNum(s.max_concurrent) ? " of " + s.max_concurrent : ""})`;
+  const waiting = ((d.raw || {}).admission_wait || s.admission_wait || {}).waiting;
+  $("d-active-n").textContent = `(${active.length}${isNum(s.max_concurrent) ? " of " + s.max_concurrent : ""}` +
+    `${isNum(waiting) && waiting > 0 ? ", " + waiting + " waiting for admission" : ""})`;
   $("d-active").innerHTML = table(reqCols(false, active), active, d.available ? "no request in flight" : (d.reason || "engine unavailable"));
   const recent = (ui.includeOld ? (d.raw || {}).recent : s.recent) || [];
   $("d-recent-n").textContent = `(${recent.length}${!ui.includeOld && s.since ? " since reset" : ""})`;
@@ -389,6 +400,228 @@ function renderRaw(d) {
     `<div class="es-empty">${esc(d.reason || "no payload")}</div>`;
 }
 
+// ------------------------------------------------------------------------------------------ over time (charts)
+//
+// The Studio server samples the engine every 1.5 s and keeps 3 h (GET /api/engine/history, chartHistory below); a Studio
+// without that endpoint falls back to one sample per page refresh kept in localStorage. A gap longer than GAP_S breaks
+// the line.
+//   decode tok/s   the engine's aggregate.decode_tokens_per_second
+//   prefill tok/s  prompt tokens actually computed per second, from the progress of each request's prefilled_to between
+//                  two samples (a new request counts from its cached tokens; a request that finished in between counts
+//                  up to its prompt length), so cache hits are excluded
+//   concurrency    aggregate.active / decoding / prefilling
+//   context        sum over active requests of prompt + generated tokens, and the largest single request
+
+const HIST_KEY = "engine-dash-history-v1", HIST_MAX_S = 3 * 3600, GAP_S = 8;
+const WINDOWS = [["5m", 300], ["15m", 900], ["1h", 3600], ["3h", 10800]];
+// hover / pin: a moment in time (t), not a pixel of one canvas, so every chart marks the same moment
+const charts = { samples: [], win: 900, pf: null, hover: null, pin: null, lastSave: 0, server: null };
+try {
+  const h = JSON.parse(localStorage.getItem(HIST_KEY) || "null");
+  if (h && Array.isArray(h.samples)) charts.samples = h.samples;
+  if (h && isNum(h.win)) charts.win = h.win;
+} catch { /* no storage: history lives in this page only */ }
+
+function chartSample(d) {
+  const t = d.at;
+  if (!isNum(t)) return;
+  if (!d.available) { charts.samples.push({ t, gap: true }); charts.pf = null; return; }
+  const s = d.sessions || {}, a = s.aggregate || {};
+  const active = s.active || [], recent = s.recent || [];
+  let pre = null;
+  const pf = charts.pf;
+  if (pf && t > pf.t && t - pf.t <= GAP_S) {
+    let work = 0;
+    for (const r of active) {
+      const base = pf.prev.has(r.id) ? pf.prev.get(r.id) : (r.cached_tokens || 0);
+      work += Math.max(0, (r.prefilled_to || 0) - base);
+    }
+    for (const r of recent) {
+      if (pf.seen.has(r.id)) continue;
+      const base = pf.prev.has(r.id) ? pf.prev.get(r.id) : (r.cached_tokens || 0);
+      work += Math.max(0, (r.prompt_tokens || 0) - base);
+    }
+    pre = work / (t - pf.t);
+  }
+  const seen = pf ? pf.seen : new Set();
+  for (const r of recent) seen.add(r.id);
+  charts.pf = { t, prev: new Map(active.map((r) => [r.id, r.prefilled_to || r.cached_tokens || 0])), seen };
+  let ctx = 0, ctxMax = 0;
+  for (const r of active) { const c = (r.prompt_tokens || 0) + (r.generated || 0); ctx += c; ctxMax = Math.max(ctxMax, c); }
+  charts.samples.push({ t, dec: isNum(a.decode_tokens_per_second) ? a.decode_tokens_per_second : null, pre,
+                        act: a.active ?? null, decn: a.decoding ?? null, pren: a.prefilling ?? null, ctx, ctxMax });
+  while (charts.samples.length && charts.samples[0].t < t - HIST_MAX_S) charts.samples.shift();
+  if (t - charts.lastSave > 10) {
+    charts.lastSave = t;
+    try { localStorage.setItem(HIST_KEY, JSON.stringify({ win: charts.win, samples: charts.samples })); } catch { /* full */ }
+  }
+}
+
+// The Studio server samples the engine continuously (GET /api/engine/history, same fields as chartSample); this page
+// only fetches what is new since its last sample. A Studio without that endpoint falls back to sampling in the page.
+async function chartHistory(d) {
+  if (charts.server !== false) {
+    const last = charts.server ? (charts.samples.length ? charts.samples[charts.samples.length - 1].t : 0) : 0;
+    try {
+      const r = await fetch(`/api/engine/history?since=${last}`, { cache: "no-store" });
+      if (r.status === 404) throw new Error("no history endpoint");
+      if (!r.ok) return;
+      const h = await r.json();
+      if (!charts.server) { charts.server = true; charts.samples = []; charts.pf = null; }   // the server's history replaces the page's
+      for (const x of h.samples || []) charts.samples.push(x);
+      if (h.records) { charts.records = h.records; renderRecords(); }
+      const cut = (charts.samples.length ? charts.samples[charts.samples.length - 1].t : 0) - HIST_MAX_S;
+      while (charts.samples.length && charts.samples[0].t < cut) charts.samples.shift();
+      try { localStorage.setItem(HIST_KEY, JSON.stringify({ win: charts.win, samples: [] })); } catch { /* */ }
+      return;
+    } catch (e) {
+      if (String(e.message).includes("no history endpoint")) charts.server = false; else return;
+    }
+  }
+  chartSample(d);
+}
+
+// the Studio server's best value of each charted quantity since its records started (or were reset), with when, and
+// next to it the median over the busy samples (value > 0) since median_since
+function renderRecords() {
+  const r = charts.records, box = $("d-records");
+  if (!box) return;
+  if (!r) { box.innerHTML = `<div class="es-empty">records need the Studio server's history</div>`; return; }
+  const b = r.best || {}, med = r.median || {};
+  const medSince = isNum(r.median_since) ? fmtDateTime(r.median_since) : NA;
+  const cell = (k, label, fmt) => {
+    const m = med[k] && isNum(med[k].v) ? med[k] : null;
+    const title = (b[k] ? `best reached ${fmtDateTime(b[k].t)}` : "not reached yet") +
+      (m ? `\nmedian of ${m.n.toLocaleString()} busy samples (value > 0) since ${medSince}, within 0.5%` : "\nno busy sample yet");
+    return `<div class="es-tile" title="${esc(title)}"><div class="v">${b[k] ? fmt(b[k].v) : NA}` +
+      `<span class="rec-med"> · med ${m ? fmt(m.v) : NA}</span></div><div class="l">${esc(label)}</div></div>`;
+  };
+  const when = (k) => (b[k] ? `<div class="rec-when">${fmtDateTime(b[k].t)}</div>` : "");
+  const items = [["dec", "decode tok/s", (v) => v.toFixed(1)], ["pre", "prefill tok/s", (v) => v.toFixed(0)],
+                 ["act", "concurrent requests", (v) => String(Math.round(v))], ["ctx", "context tokens (all active)", fmtNum],
+                 ["ctxMax", "context tokens (one request)", fmtNum]];
+  box.innerHTML = items.map(([k, l, f]) => `<div class="rec">${cell(k, l, f)}${when(k)}</div>`).join("");
+  $("d-rec-since").textContent = (isNum(r.since) ? `best since ${fmtDateTime(r.since)}` : "") +
+    (isNum(r.median_since) ? ` · median (busy samples) since ${medSince}` : "");
+}
+
+function niceMax(v) {
+  if (!(v > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v))), m = v / p;
+  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * p;
+}
+
+// series: [{key, color, width}]; the first series is the headline value
+function drawChart(canvasId, nowId, series, fmt, integer) {
+  const cv = $(canvasId);
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.documentElement);
+  const dim = css.getPropertyValue("--text-dim").trim() || "#9a9ca3", border = css.getPropertyValue("--border").trim() || "#34363c";
+  const last = charts.samples.length ? charts.samples[charts.samples.length - 1].t : Date.now() / 1000;
+  const t1 = last, t0 = t1 - charts.win;
+  const pts = charts.samples.filter((p) => p.t >= t0 - GAP_S);
+  let vmax = 0;
+  for (const p of pts) for (const s of series) if (isNum(p[s.key])) vmax = Math.max(vmax, p[s.key]);
+  vmax = niceMax(integer ? Math.max(vmax, 4) : vmax * 1.05);
+  if (integer) vmax = Math.ceil(vmax / 4) * 4;     // whole-number gridlines (e.g. 0 / 10 / 20 / 30 / 40, not 12.5 steps)
+  const L = CH_L, R = CH_R, T = 8, B = 20, pw = W - L - R, ph = H - T - B;
+  const X = (t) => L + ((t - t0) / (t1 - t0)) * pw, Y = (v) => T + ph - (v / vmax) * ph;
+  g.font = "10px -apple-system, sans-serif"; g.fillStyle = dim; g.strokeStyle = border; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = (vmax * i) / 4, y = Math.round(Y(v)) + 0.5;
+    g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
+    g.textAlign = "right"; g.textBaseline = "middle"; g.fillText(fmtNum(integer ? Math.round(v) : v), L - 5, y);
+  }
+  g.textAlign = "center"; g.textBaseline = "top";
+  for (let i = 0; i <= 4; i++) {
+    const t = t0 + (charts.win * i) / 4, ago = t1 - t;
+    g.fillText(ago < 1 ? "now" : "-" + (ago >= 3600 ? (ago / 3600).toFixed(ago % 3600 ? 1 : 0) + "h" : Math.round(ago / 60) + "m"), X(t), H - B + 5);
+  }
+  g.save(); g.beginPath(); g.rect(L, T, pw, ph); g.clip();
+  for (const s of series.slice().reverse()) {
+    g.strokeStyle = s.color; g.lineWidth = s.width || 1.5; g.beginPath();
+    let pen = false, prevT = null;
+    for (const p of pts) {
+      const v = p[s.key];
+      if (p.gap || !isNum(v) || (prevT !== null && p.t - prevT > GAP_S)) { pen = false; prevT = p.gap ? null : p.t; if (!isNum(v)) continue; }
+      const x = X(p.t), y = Y(v);
+      if (pen) g.lineTo(x, y); else g.moveTo(x, y);
+      pen = true; prevT = p.t;
+    }
+    g.stroke();
+  }
+  g.restore();
+  // the marked moment (hover, else a pinned click), the same t on every chart: the sample nearest it
+  let shown = pts.length ? pts[pts.length - 1] : null, hoverX = null;
+  const mark = charts.hover ?? charts.pin;
+  if (isNum(mark) && mark >= t0 && mark <= t1 && pts.length) {
+    shown = pts.reduce((b, p) => (Math.abs(p.t - mark) < Math.abs(b.t - mark) ? p : b), pts[0]);
+    hoverX = X(shown.t);
+    g.strokeStyle = charts.hover == null ? warmColor : dim;
+    g.setLineDash(charts.hover == null ? [] : [3, 3]);
+    g.beginPath(); g.moveTo(hoverX + 0.5, T); g.lineTo(hoverX + 0.5, T + ph); g.stroke(); g.setLineDash([]);
+    g.fillStyle = dim;
+    for (const s of series) {      // a dot where the line passes the marked moment
+      if (!isNum(shown[s.key])) continue;
+      g.fillStyle = s.color; g.beginPath(); g.arc(hoverX, Y(shown[s.key]), 3, 0, 2 * Math.PI); g.fill();
+    }
+  }
+  // median of the visible window over its busy samples (value > 0), like the records' median
+  const busy = series[0] ? pts.filter((p) => p.t >= t0 && !p.gap && isNum(p[series[0].key]) && p[series[0].key] > 0)
+    .map((p) => p[series[0].key]).sort((a, b) => a - b) : [];
+  const med = busy.length ? busy[(busy.length - 1) >> 1] : null;
+  const vals = series.map((s) => `<span style="color:${s.color}">●</span> <b>${shown && isNum(shown[s.key]) ? fmt(shown[s.key]) : NA}</b>`).join(" · ");
+  $(nowId).innerHTML = (hoverX !== null && shown ? `${fmtClock(shown.t)}${charts.hover == null ? " (pinned)" : ""} · ` : "") + vals +
+    ` <span class="muted" title="median of the ${busy.length} busy samples (value > 0) in this window">· med ${isNum(med) ? fmt(med) : NA}</span>`;
+}
+const CH_L = 46, CH_R = 8, warmColor = "#e0a93a";
+// the time under the cursor, from any chart (they share the window and the margins)
+function chartTimeAt(cv, x) {
+  const last = charts.samples.length ? charts.samples[charts.samples.length - 1].t : Date.now() / 1000;
+  const pw = cv.clientWidth - CH_L - CH_R;
+  return last - charts.win + (Math.min(Math.max(x - CH_L, 0), pw) / pw) * charts.win;
+}
+
+function renderCharts() {
+  const box = $("d-chart-win");
+  if (box && !box.childElementCount) {
+    box.innerHTML = WINDOWS.map(([l, s]) => `<button type="button" data-w="${s}">${l}</button>`).join("");
+    box.addEventListener("click", (e) => {
+      const w = Number(e.target.dataset && e.target.dataset.w);
+      if (w) {
+        charts.win = w; renderCharts();
+        if (charts.server) try { localStorage.setItem(HIST_KEY, JSON.stringify({ win: w, samples: [] })); } catch { /* */ }
+      }
+    });
+    for (const id of ["d-ch-dec", "d-ch-pre", "d-ch-act", "d-ch-ctx"]) {
+      const cv = $(id);
+      cv.addEventListener("mousemove", (e) => { charts.hover = chartTimeAt(cv, e.offsetX); renderCharts(); });
+      cv.addEventListener("mouseleave", () => { charts.hover = null; renderCharts(); });
+      // a click pins the moment on all charts (a second click near it, or Esc, unpins)
+      cv.addEventListener("click", (e) => {
+        const t = chartTimeAt(cv, e.offsetX);
+        charts.pin = isNum(charts.pin) && Math.abs(charts.pin - t) < charts.win / 100 ? null : t;
+        renderCharts();
+      });
+    }
+    window.addEventListener("resize", () => renderCharts());
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && charts.pin != null) { charts.pin = null; renderCharts(); } });
+  }
+  if (box) for (const b of box.children) b.classList.toggle("on", Number(b.dataset.w) === charts.win);
+  const acc = "#5b8cff", ok = "#35c76a", warm = "#e0a93a", violet = "#b07cff";
+  const f0 = (v) => v.toFixed(0), f1 = (v) => (v < 100 ? v.toFixed(1) : v.toFixed(0));
+  drawChart("d-ch-dec", "d-cv-dec", [{ key: "dec", color: acc, width: 2 }], f1, false);
+  drawChart("d-ch-pre", "d-cv-pre", [{ key: "pre", color: warm, width: 2 }], f0, false);
+  drawChart("d-ch-act", "d-cv-act", [{ key: "act", color: ok, width: 2 }, { key: "decn", color: acc, width: 1 }, { key: "pren", color: warm, width: 1 }], f0, true);
+  drawChart("d-ch-ctx", "d-cv-ctx", [{ key: "ctx", color: violet, width: 2 }, { key: "ctxMax", color: dimColor(), width: 1 }], (v) => fmtNum(v), true);
+}
+function dimColor() { return getComputedStyle(document.documentElement).getPropertyValue("--text-dim").trim() || "#9a9ca3"; }
+
 function render(d) {
   const banner = $("d-banner");
   if (!d.available) {
@@ -397,7 +630,7 @@ function render(d) {
   } else {
     banner.classList.add("hidden");
   }
-  const parts = [renderHeader, renderLive, renderTotals, renderLimits, renderRequests, renderScheduler, renderConfig, renderRaw];
+  const parts = [renderHeader, renderLive, renderTotals, renderCharts, renderLimits, renderRequests, renderScheduler, renderConfig, renderRaw];
   for (const f of parts) {
     try { f(d); } catch (e) { console.error(f.name, e); }   // one malformed field never blanks the whole page
   }
@@ -413,6 +646,7 @@ async function refresh() {
     const r = await fetch("/api/engine/overview", { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     ui.data = await r.json();
+    try { await chartHistory(ui.data); } catch (e) { console.error("chartHistory", e); }
     render(ui.data);
     $("d-updated").textContent = `updated ${fmtClock(ui.data.at)} · ${Math.round(performance.now() - t0)} ms`;
   } catch (e) {
@@ -445,6 +679,21 @@ $("d-include-old").addEventListener("change", (e) => {
   ui.includeOld = e.target.checked;
   if (ui.data) renderRequests(ui.data);
 });
+$("d-rec-reset").addEventListener("click", async () => {
+  if (!confirmRecordsReset()) return;
+  try {
+    const r = await fetch("/api/engine/records/reset", { method: "POST" });
+    if (r.ok) { charts.records = await r.json(); renderRecords(); }
+  } catch { /* the next refresh shows the server as unreachable */ }
+});
+// two clicks within 4 s: no browser dialog (the dashboard is often on a wall screen)
+function confirmRecordsReset() {
+  const b = $("d-rec-reset"), now = Date.now();
+  if (b.dataset.armed && now - Number(b.dataset.armed) < 4000) { delete b.dataset.armed; b.textContent = "reset records"; return true; }
+  b.dataset.armed = String(now); b.textContent = "click again to reset";
+  setTimeout(() => { if (b.dataset.armed && Date.now() - Number(b.dataset.armed) >= 4000) { delete b.dataset.armed; b.textContent = "reset records"; } }, 4100);
+  return false;
+}
 $("d-reset").addEventListener("click", async () => {
   try {
     const r = await fetch("/api/stats/reset", { method: "POST" });

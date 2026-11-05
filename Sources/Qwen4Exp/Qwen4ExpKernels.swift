@@ -12,6 +12,7 @@ import Foundation
 import MLX
 import MLXFast
 import MLXNN
+import MLXLMCommon
 
 enum Q4Fused {
     static let enabled: Bool = ProcessInfo.processInfo.environment["ENGINE_NO_FUSED"] == nil
@@ -41,7 +42,9 @@ enum Q4Fused {
     static var gdnGate: Bool { enabled && mask & 2048 != 0 }     // GDN g/beta gate math in one kernel
     static var moeDownLane: Bool { enabled && mask & 4096 != 0 } // lane-per-row expert down kernel + combine (needs 256)
     static var hcChainNorm: Bool { enabled && mask & 8192 != 0 } // combine kernel also emits the next hyper-connection's grouped norm (needs 512)
-    static var splitKM: Bool { enabled && mask & 16384 != 0 }    // 8-bit g64 projections at 2..8 rows through q8_qmv_splitk (MLX's qmm is 2-3x off bandwidth there)      // hyper-connection: norm kernel -> qmv -> up+silu+sigmoid+mix+inject kernel -> combine(partials)
+    static var splitKM: Bool { enabled && (mask & 16384 != 0 || splitKMForced) }
+    /// T-0076: ENGINE_QMV_SPLITK=1 turns the 2..8-row split-K projections on without touching the mask (Qwen3.5-397B launcher)
+    static let splitKMForced: Bool = ProcessInfo.processInfo.environment["ENGINE_QMV_SPLITK"] == "1"    // 8-bit g64 projections at 2..8 rows through q8_qmv_splitk (MLX's qmm is 2-3x off bandwidth there)      // hyper-connection: norm kernel -> qmv -> up+silu+sigmoid+mix+inject kernel -> combine(partials)
     static var hcSplitK: Bool { enabled && mask & 32768 != 0 }
     /// unit 36: the DENSE (bf16) hyper-connection fused chain. Separate bit so it can be ablated
     /// against its own MLX fallback on the SAME checkpoint -- the only test that can show it is
@@ -175,18 +178,35 @@ func q4HCMix(normed: MLXArray, u: MLXArray, hc H: Int, d D: Int) -> MLXArray {
         outputShapes: [lead + [D]], outputDTypes: [normed.dtype])[0]
 }
 
+/// T-0198: ENGINE_RUNTIME_ROWS=1 -- prefill kernels whose template carried the chunk's row count (or S/K) take it from a
+/// small int32 input instead, so a new prompt length no longer compiles a new variant on the model thread (W97: ~5 kernels
+/// x 15-50 ms per new length). The bodies are unchanged; the value is the same, only no longer a compile-time constant.
+let q4RuntimeRows: Bool = (ProcessInfo.processInfo.environment["ENGINE_RUNTIME_ROWS"] ?? "0") == "1"
+func q4RuntimeInts(_ v: [Int]) -> MLXArray { MLXArray(v.map { Int32($0) }) }
 // MARK: hyper-connection mix + inject in one pass (body in Kernels/lab/hc_mix_inject.metal)
 private let q4HCMixInjectKernel = MLXFast.metalKernel(
     name: "q4_hc_mix_inject", inputNames: ["normed", "u", "winj"], outputNames: ["mixed", "inj"], source: Q4LabKernelSource.hc_mix_inject)
+private let q4HCMixInjectRTKernel = MLXFast.metalKernel(
+    name: "q4_hc_mix_inject_rt", inputNames: ["normed", "u", "winj", "rtv"], outputNames: ["mixed", "inj"],
+    source: "const int NROWS = rtv[0];\n" + Q4LabKernelSource.hc_mix_inject)
 /// ENGINE_HC_MIX_INJECT=0 restores the separate mix kernel and the inject qmv
 let q4HCMixInjectOn: Bool = (ProcessInfo.processInfo.environment["ENGINE_HC_MIX_INJECT"] ?? "1") != "0"
 let q4HCMixInjectRows: Int = Int(ProcessInfo.processInfo.environment["ENGINE_HC_MIX_INJECT_ROWS"] ?? "1") ?? 1
 /// -> (mixed (lead..., D), raw inject logits (lead..., H)); the combine applies 2*sigmoid(./H)
-func q4HCMixInject(normed: MLXArray, u: MLXArray, winj: MLXArray, hc H: Int, d D: Int, rows R: Int) -> (MLXArray, MLXArray) {
+func q4HCMixInject(normed: MLXArray, u: MLXArray, winj: MLXArray, hc H: Int, d D: Int, rows R: Int, runtime: Bool = q4RuntimeRows) -> (MLXArray, MLXArray) {
     let rows = normed.size / (H * D)
     let lead = Array(normed.shape.dropLast())
     let TG = 256
     precondition(D % TG == 0 && winj.dim(0) == H)
+    if runtime {
+        EngineWitness.hit("runtime_rows")
+        let r = q4HCMixInjectRTKernel(
+            [normed, u, winj, q4RuntimeInts([rows])],
+            template: [("T", normed.dtype), ("H", H), ("D", D), ("TG", TG), ("ROWS", R)],
+            grid: (((rows + R - 1) / R) * TG, 1, 1), threadGroup: (TG, 1, 1),
+            outputShapes: [lead + [D], lead + [H]], outputDTypes: [normed.dtype, normed.dtype])
+        return (r[0], r[1])
+    }
     let r = q4HCMixInjectKernel(
         [normed, u, winj],
         template: [("T", normed.dtype), ("H", H), ("D", D), ("TG", TG), ("ROWS", R), ("NROWS", rows)],
@@ -368,9 +388,35 @@ private let q4RopeKernel = MLXFast.metalKernel(
             y[t] = T(v * cc + x1 * ss);
         }
         """)
+private let q4RopeRTKernel = MLXFast.metalKernel(
+    name: "q4_rope_partial_rt", inputNames: ["x", "c", "s", "rtv"], outputNames: ["y"],
+    source: """
+        const int S = rtv[0];
+        uint t = thread_position_in_grid.x;         // (b*H + h)*S*HD + pos*HD + i
+        uint i = t % HD;
+        uint pos = (t / HD) % S;
+        float v = float(x[t]);
+        if (i >= ROT) { y[t] = T(v); return; }
+        uint hf = ROT / 2;                          // `half` is a Metal type name
+        ulong tab = (ulong)pos * ROT + i;
+        float cc = c[tab], ss = s[tab];
+        if (i < hf) {
+            float x2 = float(x[t + hf]);
+            y[t] = T(v * cc - x2 * ss);
+        } else {
+            float x1 = float(x[t - hf]);
+            y[t] = T(v * cc + x1 * ss);
+        }
+        """)
 
-func q4RopePartial(_ x: MLXArray, cos c: MLXArray, sin s: MLXArray, rotDim ROT: Int) -> MLXArray {
+func q4RopePartial(_ x: MLXArray, cos c: MLXArray, sin s: MLXArray, rotDim ROT: Int, runtime: Bool = q4RuntimeRows) -> MLXArray {
     let S = x.dim(2), HD = x.dim(3)
+    if runtime {
+        EngineWitness.hit("runtime_rows")
+        return q4RopeRTKernel([x, c, s, q4RuntimeInts([S])], template: [("T", x.dtype), ("HD", HD), ("ROT", ROT)],
+                              grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
+                              outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+    }
     return q4RopeKernel([x, c, s], template: [("T", x.dtype), ("S", S), ("HD", HD), ("ROT", ROT)],
                         grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
                         outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
@@ -481,14 +527,14 @@ private let q8MoEGateUpKernel = MLXFast.metalKernel(
         uint t = tg / K, k = tg % K;
         int e = idx[tg];
         uint row0 = tile * (NSG * ROWS) + sg * ROWS;
-        const uint DW = D / 4, DG = D / 64;
+        const uint DW = D / 4, DG = D / GS;
         float accg[ROWS], accu[ROWS];
         for (uint r = 0; r < ROWS; ++r) { accg[r] = 0.0f; accu[r] = 0.0f; }
         for (uint kb = 0; kb < D; kb += BLOCK) {
             uint off = kb + lane * VPT;
             float xv[VPT]; float xs = 0.0f;
             for (uint i = 0; i < VPT; ++i) { xv[i] = float(x[t * D + off + i]); xs += xv[i]; }
-            uint g = off / 64;
+            uint g = off / GS;
             for (uint r = 0; r < ROWS; ++r) {
                 ulong rowbase = ((ulong)e * I + row0 + r);
                 const device uint32_t* gp = gw + rowbase * DW + off / 4;
@@ -571,7 +617,7 @@ private let q8MoEGateUpMRKernel = MLXFast.metalKernel(
         int slot[MR];
         for (uint r2 = 0; r2 < uint(MR); ++r2) slot[r2] = tgSlot[r2];
         uint row0 = tile * (NSG * ROWS) + sg * ROWS;
-        const uint DW = D / 4, DG = D / 64;
+        const uint DW = D / 4, DG = D / GS;
         float accg[ROWS][MR], accu[ROWS][MR];
         for (uint r = 0; r < ROWS; ++r) for (uint r2 = 0; r2 < uint(MR); ++r2) { accg[r][r2] = 0.0f; accu[r][r2] = 0.0f; }
         // LOOP ORDER: the WEIGHT words are hoisted into registers and the ACTIVATION is re-read from
@@ -581,7 +627,7 @@ private let q8MoEGateUpMRKernel = MLXFast.metalKernel(
         // are the thing that must not be read twice.
         for (uint kb = 0; kb < D; kb += BLOCK) {
             uint off = kb + lane * VPT;
-            uint g = off / 64;
+            uint g = off / GS;
             for (uint r = 0; r < ROWS; ++r) {
                 ulong rowbase = ((ulong)e * I + row0 + r);
                 const device uint32_t* gp = gw + rowbase * DW + off / 4;
@@ -620,6 +666,262 @@ private let q8MoEGateUpMRKernel = MLXFast.metalKernel(
             }
         }
         """)
+
+// MARK: T-0173 -- the shared expert folded into the fused routed-expert path (ENGINE_MOE_SHARED_FOLD=1, default off)
+// At 2..8 rows the shared expert ran as three launches per layer (gate|up qmm, silu_mul_split, down qmm), latency-bound
+// at ~4x its read time (C-0549). Its weights have one routed expert's exact layout (8-bit g64, I=640), so it rides the
+// fused kernels as slot K of every row with the pseudo expert id EX = numExperts, reading its own weight pointers; the
+// combine reads it from yk[:, K] and gates it with the router's shared gate as before. Rounding-level, not bit-identical.
+/// ENGINE_MOE_SHARED_FOLD: 1 = the fold; ablations (T-0173, C-0556): 2 = the folded kernels with K slots (no shared slot)
+/// + the shipped shared expert and combine; 3 = the shipped routed kernels + the shared expert alone through the folded
+/// kernels (independent of the router) + the shipped combine
+/// 4 = TIMING ONLY: the shared expert skipped (zeros), its in-model cost (C-0560)
+let q8MoESharedFoldMode: Int = Int(ProcessInfo.processInfo.environment["ENGINE_MOE_SHARED_FOLD"] ?? "0") ?? 0
+let q8MoESharedFold: Bool = q8MoESharedFoldMode != 0
+/// read once: a ProcessInfo.environment lookup builds the whole dictionary (21-31 us here); per MoE call it cost ~1-1.5 ms of
+/// host time per 4-row forward and was the measured cause of the first build's round-time loss (C-0555)
+let q8MoESharedFoldCheck: Bool = ProcessInfo.processInfo.environment["ENGINE_MOE_SHARED_FOLD_CHECK"] != nil
+private let q8MoEGateUpMRSharedKernel = MLXFast.metalKernel(
+    name: "q8_moe_gateup_mr_shared", inputNames: ["x", "idx", "gw", "gs", "gb", "uw", "us", "ub", "sgw", "sgs", "sgb", "suw", "sus", "sub"],
+    outputNames: ["h"], source: """
+        constexpr uint NSG = 2, VPT = 16, BLOCK = 512;   // ROWS, MR from template
+        uint p = threadgroup_position_in_grid.x;         // the (row, slot) pair
+        uint tile = threadgroup_position_in_grid.y;
+        uint sg = simdgroup_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        int e = idx[p];
+        // THE OWNERSHIP DECISION IS PER THREADGROUP, SO ONE THREAD MAKES IT. The first version had
+        // every thread of every threadgroup scan the index buffer, and grid.y is the tile count:
+        // 30 pairs x 160 tiles x 64 threads x ~60 loads = 18 M index loads per layer of pure
+        // overhead, against 35 MB of useful weight reads. That is why the first multi-row build
+        // measured SLOWER while reading 32% fewer weight bytes.
+        uint tid = thread_index_in_threadgroup;
+        threadgroup int tgFirst;
+        threadgroup int tgSlot[MR];
+        if (tid == 0) {
+            int f = 1;
+            for (uint q = 0; q < p; ++q) { if (idx[q] == e) { f = 0; break; } }
+            tgFirst = f;
+            for (uint r2 = 0; r2 < uint(MR); ++r2) {
+                tgSlot[r2] = -1;
+                for (uint k2 = 0; k2 < uint(K); ++k2) { if (idx[r2 * K + k2] == e) { tgSlot[r2] = int(k2); break; } }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tgFirst == 0) return;                                   // uniform across the threadgroup
+        int slot[MR];
+        for (uint r2 = 0; r2 < uint(MR); ++r2) slot[r2] = tgSlot[r2];
+        uint row0 = tile * (NSG * ROWS) + sg * ROWS;
+        const uint DW = D / 4, DG = D / GS;
+        float accg[ROWS][MR], accu[ROWS][MR];
+        for (uint r = 0; r < ROWS; ++r) for (uint r2 = 0; r2 < uint(MR); ++r2) { accg[r][r2] = 0.0f; accu[r][r2] = 0.0f; }
+        // LOOP ORDER: the WEIGHT words are hoisted into registers and the ACTIVATION is re-read from
+        // L1 per row, not the other way round. The first build hoisted x into xv[MR][VPT] -- 48
+        // registers at MR=3 against the per-pair body's 16 -- and lost more to occupancy than it
+        // saved in device traffic. x is 2560 floats per row and stays in cache; the expert weights
+        // are the thing that must not be read twice.
+        for (uint kb = 0; kb < D; kb += BLOCK) {
+            uint off = kb + lane * VPT;
+            uint g = off / GS;
+            for (uint r = 0; r < ROWS; ++r) {
+                bool shx = (e == EX);
+                ulong rowbase = shx ? (ulong)(row0 + r) : ((ulong)e * I + row0 + r);
+                const device uint32_t* gp = (shx ? sgw : gw) + rowbase * DW + off / 4;
+                const device uint32_t* upp = (shx ? suw : uw) + rowbase * DW + off / 4;
+                uint32_t wgv[4], wuv[4];
+                for (uint pw = 0; pw < 4; ++pw) { wgv[pw] = gp[pw]; wuv[pw] = upp[pw]; }
+                float gsc = float((shx ? sgs : gs)[rowbase * DG + g]), gbi = float((shx ? sgb : gb)[rowbase * DG + g]);
+                float usc = float((shx ? sus : us)[rowbase * DG + g]), ubi = float((shx ? sub : ub)[rowbase * DG + g]);
+                for (uint r2 = 0; r2 < uint(MR); ++r2) {
+                    if (slot[r2] < 0) continue;                 // uniform across the threadgroup
+                    const device T* xr = x + r2 * D + off;
+                    float dg = 0.0f, du = 0.0f, xs = 0.0f;
+                    for (uint pw = 0; pw < 4; ++pw) {
+                        uint32_t wg = wgv[pw], wu = wuv[pw];
+                        for (uint j = 0; j < 4; ++j) {
+                            float xj = float(xr[pw * 4 + j]);
+                            xs += xj;
+                            dg += float((wg >> (8 * j)) & 0xFF) * xj;
+                            du += float((wu >> (8 * j)) & 0xFF) * xj;
+                        }
+                    }
+                    accg[r][r2] += gsc * dg + gbi * xs;
+                    accu[r][r2] += usc * du + ubi * xs;
+                }
+            }
+        }
+        for (uint r = 0; r < ROWS; ++r) {
+            for (uint r2 = 0; r2 < uint(MR); ++r2) {
+                if (slot[r2] < 0) continue;
+                float gsum = simd_sum(accg[r][r2]);
+                float usum = simd_sum(accu[r][r2]);
+                if (lane == 0) {
+                    float sil = gsum / (1.0f + exp(-gsum));
+                    h[((ulong)(r2 * K + uint(slot[r2]))) * I + row0 + r] = T(sil * usum);
+                }
+            }
+        }
+        """)
+private let q8MoEDownLaneSharedKernel = MLXFast.metalKernel(
+    name: "q8_moe_down_lane_shared", inputNames: ["h", "idx", "dw", "ds", "db", "sdw", "sds", "sdb"], outputNames: ["yk"],
+    source: { () -> String in
+        let src = Q4LabKernelSource.moe_down_lane_q8
+        let old = """
+ulong rowbase = (ulong)e * D + row;
+const device uint4* wp = (const device uint4*)(dw + rowbase * (I / 4));
+const device T* sp = ds + rowbase * (I / GS);
+const device T* bp = db + rowbase * (I / GS);
+"""
+        precondition(src.components(separatedBy: old).count == 2, "moe_down_lane_q8 source changed shape")
+        return src.replacingOccurrences(of: old, with: """
+bool shx = (e == EX);
+ulong rowbase = shx ? (ulong)row : (ulong)e * D + row;
+const device uint4* wp = (const device uint4*)((shx ? sdw : dw) + rowbase * (I / 4));
+const device T* sp = (shx ? sds : ds) + rowbase * (I / GS);
+const device T* bp = (shx ? sdb : db) + rowbase * (I / GS);
+""")
+    }())
+private let q4MoECombineSharedKernel = MLXFast.metalKernel(
+    name: "q4_moe_combine_shared", inputNames: ["y", "w", "g"], outputNames: ["out"],
+    source: """
+        uint t = thread_position_in_grid.x;         // row * D + j; y is [rows, K + 1, D] with the shared expert in slot K
+        uint row = t / D, j = t % D;
+        float acc = 0.0f;
+        for (uint k = 0; k < K; ++k) {
+            acc += float(w[(ulong)row * K + k]) * float(y[((ulong)row * (K + 1) + k) * D + j]);
+        }
+        float gg = float(g[row]);
+        float sg = 1.0f / (1.0f + exp(-gg));
+        out[t] = T(acc + sg * float(y[((ulong)row * (K + 1) + K) * D + j]));
+        """)
+
+/// instrument: the shared expert alone through the folded kernels (K = 1, every row's only slot = EX)
+func q8MoESharedOnly(x: MLXArray, shared sh: (gw: MLXArray, gs: MLXArray, gb: MLXArray, uw: MLXArray, us: MLXArray, ub: MLXArray,
+                                              dw: MLXArray, ds: MLXArray, db: MLXArray), experts E: Int, D: Int, I: Int) -> MLXArray {
+    let T = x.dim(0), NSG = 2, ROWS = q8MoEMRRows
+    let idx1 = MLXArray.full([T, 1], values: MLXArray(UInt32(E)))
+    let h = q8MoEGateUpMRSharedKernel(
+        [x, idx1, sh.gw, sh.gs, sh.gb, sh.uw, sh.us, sh.ub, sh.gw, sh.gs, sh.gb, sh.uw, sh.us, sh.ub],
+        template: [("T", x.dtype), ("K", 1), ("D", D), ("I", I), ("ROWS", ROWS), ("MR", T), ("GS", 64), ("EX", E)],
+        grid: (T * NSG * 32, I / (NSG * ROWS), 1), threadGroup: (NSG * 32, 1, 1),
+        outputShapes: [[T, 1, I]], outputDTypes: [x.dtype])[0]
+    let TGS = q4MoEDownLaneThreads
+    return q8MoEDownLaneSharedKernel(
+        [h, idx1, sh.dw, sh.ds, sh.db, sh.dw, sh.ds, sh.db],
+        template: [("T", x.dtype), ("K", 1), ("D", D), ("I", I), ("TGS", TGS), ("GS", 64), ("EX", E)],
+        grid: (T * TGS, (D + TGS - 1) / TGS, 1), threadGroup: (TGS, 1, 1),
+        outputShapes: [[T, 1, D]], outputDTypes: [x.dtype])[0].reshaped(T, D)
+}
+
+/// ablation 2: the routed experts through the folded kernels with K slots (no shared slot): yk [T, K, D]
+func q8MoEExpertsFoldKernelsK(x: MLXArray, idx: MLXArray, gate: Q4ExpertBank, up: Q4ExpertBank, down: Q4ExpertBank,
+                              shared sh: (gw: MLXArray, gs: MLXArray, gb: MLXArray, uw: MLXArray, us: MLXArray, ub: MLXArray,
+                                          dw: MLXArray, ds: MLXArray, db: MLXArray), experts E: Int, K: Int, D: Int, I: Int) -> MLXArray {
+    let T = x.dim(0), NSG = 2, ROWS = q8MoEMRRows, TGS = q4MoEDownLaneThreads
+    let ix = idx.asType(.uint32)
+    let h = q8MoEGateUpMRSharedKernel(
+        [x, ix, gate.w, gate.s, gate.b, up.w, up.s, up.b, sh.gw, sh.gs, sh.gb, sh.uw, sh.us, sh.ub],
+        template: [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", ROWS), ("MR", T), ("GS", gate.group), ("EX", E)],
+        grid: (T * K * NSG * 32, I / (NSG * ROWS), 1), threadGroup: (NSG * 32, 1, 1),
+        outputShapes: [[T, K, I]], outputDTypes: [x.dtype])[0]
+    return q8MoEDownLaneSharedKernel(
+        [h, ix, down.w, down.s, down.b, sh.dw, sh.ds, sh.db],
+        template: [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS), ("GS", down.group), ("EX", E)],
+        grid: (T * K * TGS, (D + TGS - 1) / TGS, 1), threadGroup: (TGS, 1, 1),
+        outputShapes: [[T, K, D]], outputDTypes: [x.dtype])[0]
+}
+
+/// x [T, D] (2 <= T <= 8), idx [T, K] -> the combined MoE output [T, D] with the shared expert folded in (see above)
+func q8MoEExpertsSharedFold(x: MLXArray, idx: MLXArray, w: MLXArray, sharedGate g: MLXArray,
+                            gate: Q4ExpertBank, up: Q4ExpertBank, down: Q4ExpertBank,
+                            shared sh: (gw: MLXArray, gs: MLXArray, gb: MLXArray, uw: MLXArray, us: MLXArray, ub: MLXArray,
+                                        dw: MLXArray, ds: MLXArray, db: MLXArray),
+                            experts E: Int, K: Int, D: Int, I: Int, outShape: [Int]) -> MLXArray {
+    let T = x.dim(0), K1 = K + 1, NSG = 2, ROWS = q8MoEMRRows
+    let idx1 = concatenated([idx.asType(.uint32), MLXArray.full([T, 1], values: MLXArray(UInt32(E)))], axis: 1)
+    let h = q8MoEGateUpMRSharedKernel(
+        [x, idx1, gate.w, gate.s, gate.b, up.w, up.s, up.b, sh.gw, sh.gs, sh.gb, sh.uw, sh.us, sh.ub],
+        template: [("T", x.dtype), ("K", K1), ("D", D), ("I", I), ("ROWS", ROWS), ("MR", T), ("GS", gate.group), ("EX", E)],
+        grid: (T * K1 * NSG * 32, I / (NSG * ROWS), 1), threadGroup: (NSG * 32, 1, 1),
+        outputShapes: [[T, K1, I]], outputDTypes: [x.dtype])[0]
+    let TGS = q4MoEDownLaneThreads
+    let yk = q8MoEDownLaneSharedKernel(
+        [h, idx1, down.w, down.s, down.b, sh.dw, sh.ds, sh.db],
+        template: [("T", x.dtype), ("K", K1), ("D", D), ("I", I), ("TGS", TGS), ("GS", down.group), ("EX", E)],
+        grid: (T * K1 * TGS, (D + TGS - 1) / TGS, 1), threadGroup: (TGS, 1, 1),
+        outputShapes: [[T, K1, D]], outputDTypes: [x.dtype])[0]
+    return q4MoECombineSharedKernel([yk, w, g], template: [("T", x.dtype), ("K", K), ("D", D)],
+                                    grid: (T * D, 1, 1), threadGroup: (256, 1, 1),
+                                    outputShapes: [outShape], outputDTypes: [x.dtype])[0]
+}
+
+
+/// T-0173 instrument for `engine kernelbench shared-fold`: one stage of the shipped 2..8-row MoE path or of the folded one,
+/// on raw banks (gate/up/down of the routed experts; the shared expert as one gate/up/down triple). Stages:
+/// p_gu (routed gate/up, shipped), p_rt (routed gate/up + down), p_sh (shared expert as the model runs it: gate|up qmm,
+/// silu_mul_split, down qmm), p_all (routed + shared + combine), f_gu / f_rt / f_all (the folded twins, K+1 slots),
+/// f_gu_k / f_rt_k (the folded kernels with K slots, no shared slot: the cost of the pointer select alone), f_sh (the shared
+/// expert alone through the folded kernels).
+public struct Q4SharedFoldBench {
+    public typealias Bank = (MLXArray, MLXArray, MLXArray)
+    static func T0(_ x: MLXArray) -> Int { x.dim(0) }
+    public static func stage(_ name: String, x: MLXArray, idx: MLXArray, w: MLXArray, g: MLXArray,
+                             gate: Bank, up: Bank, down: Bank, sgu: Bank, sdown: Bank, sg: Bank, su: Bank,
+                             E: Int, K: Int, D: Int, I: Int, router: MLXArray? = nil) -> MLXArray {
+        // *_r stages: the router (bf16 gemv, [E+1, D]) and the shipped top-k kernel run first and the routed experts wait for
+        // them (the real routing is kept: idx + 0 * top-k id); the shipped shared expert depends on x only, as in the model
+        if name.hasSuffix("_r"), let rw = router {
+            let (tk, tw, tg) = q4MoETopK(logits: matmul(x, rw.transposed()), experts: E, topK: K, sharedGate: true)
+            let idxDep = idx + (tk.reshaped(T0(x), K)[0 ..< 1, 0 ..< 1].asType(idx.dtype) * 0)
+            let base = String(name.dropLast(2))
+            if base == "r" { return tk }
+            return stage(base, x: x, idx: idxDep, w: tw.reshaped(T0(x), K), g: tg.reshaped(T0(x)), gate: gate, up: up, down: down,
+                         sgu: sgu, sdown: sdown, sg: sg, su: su, E: E, K: K, D: D, I: I)
+        }
+        let gb = Q4ExpertBank(w: gate.0, s: gate.1, b: gate.2, bits: 8, group: 64)
+        let ub = Q4ExpertBank(w: up.0, s: up.1, b: up.2, bits: 8, group: 64)
+        let db = Q4ExpertBank(w: down.0, s: down.1, b: down.2, bits: 8, group: 64)
+        let sh = (gw: sg.0, gs: sg.1, gb: sg.2, uw: su.0, us: su.1, ub: su.2, dw: sdown.0, ds: sdown.1, db: sdown.2)
+        let T = x.dim(0), NSG = 2, ROWS = q8MoEMRRows, TGS = q4MoEDownLaneThreads
+        func shared() -> MLXArray {
+            let gu = quantizedMatmul(x, sgu.0, scales: sgu.1, biases: sgu.2, transpose: true, groupSize: 64, bits: 8)
+            return quantizedMatmul(q4SiluMulSplit(gu, hidden: I), sdown.0, scales: sdown.1, biases: sdown.2, transpose: true, groupSize: 64, bits: 8)
+        }
+        func foldGU(_ ix: MLXArray, _ KK: Int) -> MLXArray {
+            q8MoEGateUpMRSharedKernel(
+                [x, ix, gate.0, gate.1, gate.2, up.0, up.1, up.2, sh.gw, sh.gs, sh.gb, sh.uw, sh.us, sh.ub],
+                template: [("T", x.dtype), ("K", KK), ("D", D), ("I", I), ("ROWS", ROWS), ("MR", T), ("GS", 64), ("EX", E)],
+                grid: (T * KK * NSG * 32, I / (NSG * ROWS), 1), threadGroup: (NSG * 32, 1, 1),
+                outputShapes: [[T, KK, I]], outputDTypes: [x.dtype])[0]
+        }
+        func foldDN(_ h: MLXArray, _ ix: MLXArray, _ KK: Int) -> MLXArray {
+            q8MoEDownLaneSharedKernel(
+                [h, ix, down.0, down.1, down.2, sh.dw, sh.ds, sh.db],
+                template: [("T", x.dtype), ("K", KK), ("D", D), ("I", I), ("TGS", TGS), ("GS", 64), ("EX", E)],
+                grid: (T * KK * TGS, (D + TGS - 1) / TGS, 1), threadGroup: (TGS, 1, 1),
+                outputShapes: [[T, KK, D]], outputDTypes: [x.dtype])[0]
+        }
+        let ixK = idx.asType(.uint32)
+        let ix1 = concatenated([ixK, MLXArray.full([T, 1], values: MLXArray(UInt32(E)))], axis: 1)
+        switch name {
+        case "p_gu": return q4MoEGateUpShipped(x: x, idx: idx, gate: gb, up: ub, K: K, D: D, I: I)
+        case "p_rt": return q4MoEExpertsK(x: x, idx: idx, gate: gb, up: ub, down: db, K: K, D: D, I: I)
+        case "p_sh": return shared()
+        case "p_all":
+            let yk = q4MoEExpertsK(x: x, idx: idx, gate: gb, up: ub, down: db, K: K, D: D, I: I)
+            return q4MoECombine(y: yk, w: w, shared: shared(), gate: g, topK: K, d: D)
+        case "f_gu": return foldGU(ix1, K + 1)
+        case "f_rt": return foldDN(foldGU(ix1, K + 1), ix1, K + 1)
+        case "f_gu_k": return foldGU(ixK, K)
+        case "f_rt_k": return foldDN(foldGU(ixK, K), ixK, K)
+        case "f_sh": return q8MoESharedOnly(x: x, shared: sh, experts: E, D: D, I: I)
+        case "f_all":
+            return q8MoEExpertsSharedFold(x: x, idx: idx, w: w, sharedGate: g, gate: gb, up: ub, down: db, shared: sh,
+                                          experts: E, K: K, D: D, I: I, outShape: [T, D])
+        default: preconditionFailure("unknown shared-fold stage \(name)")
+        }
+    }
+}
 
 private let q8MoEDownLaneMRKernel = MLXFast.metalKernel(
     name: "q8_moe_down_lane_mr", inputNames: ["h", "idx", "dw", "ds", "db"], outputNames: ["yk"], source: Q4LabKernelSource.moe_down_lane_q8mr)
@@ -685,8 +987,8 @@ func q4MoEGateUpShipped(x: MLXArray, idx: MLXArray, gate: Q4ExpertBank, up: Q4Ex
         let h = (parts & 1 != 0 ? q8MoEGateUpMRKernel : q8MoEGateUpKernel)(
             [x, idx, gate.w, gate.s, gate.b, up.w, up.s, up.b],
             template: (parts & 1 != 0
-                       ? [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", ROWS), ("MR", T)]
-                       : [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", 4)]),
+                       ? [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", ROWS), ("MR", T), ("GS", gate.group)]
+                       : [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", 4), ("GS", gate.group)]),
             grid: (T * K * NSG * 32, I / (NSG * (parts & 1 != 0 ? ROWS : 4)), 1), threadGroup: (NSG * 32, 1, 1),
             outputShapes: [[T, K, I]], outputDTypes: [x.dtype])[0]
         return h
@@ -694,7 +996,7 @@ func q4MoEGateUpShipped(x: MLXArray, idx: MLXArray, gate: Q4ExpertBank, up: Q4Ex
     let ROWS = q8MoEGateUpRows
     return (eight ? q8MoEGateUpKernel : q4MoEGateUpKernel)(
         [x, idx, gate.w, gate.s, gate.b, up.w, up.s, up.b],
-        template: [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", ROWS)],
+        template: [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", ROWS), ("GS", gate.group)],
         grid: (T * K * NSG * 32, I / (NSG * ROWS), 1), threadGroup: (NSG * 32, 1, 1),
         outputShapes: [[T, K, I]], outputDTypes: [x.dtype])[0]
 }
@@ -711,22 +1013,22 @@ func q4MoEDownShipped(h: MLXArray, idx: MLXArray, down: Q4ExpertBank, K: Int, D:
             let per = TGS * DR                       // rows covered by one threadgroup
             return q8MoEDownLaneMR2Kernel(
                 [h, idx, down.w, down.s, down.b],
-                template: [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS), ("MR", T), ("ROWS", DR)],
+                template: [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS), ("MR", T), ("ROWS", DR), ("GS", down.group)],
                 grid: (T * K * TGS, (D + per - 1) / per, 1), threadGroup: (TGS, 1, 1),
                 outputShapes: [[T, K, D]], outputDTypes: [dtype])[0]
         }
         return (parts & 2 != 0 ? q8MoEDownLaneMRKernel : q8MoEDownLaneKernel)(
             [h, idx, down.w, down.s, down.b],
             template: (parts & 2 != 0
-                       ? [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS), ("MR", T)]
-                       : [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS)]),
+                       ? [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS), ("MR", T), ("GS", down.group)]
+                       : [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS), ("GS", down.group)]),
             grid: (T * K * TGS, (D + TGS - 1) / TGS, 1), threadGroup: (TGS, 1, 1),
             outputShapes: [[T, K, D]], outputDTypes: [dtype])[0]
     }
     let TGS = q4MoEDownLaneThreads
     return (eight ? q8MoEDownLaneKernel : q4MoEDownLaneKernel)(
         [h, idx, down.w, down.s, down.b],
-        template: [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS)],
+        template: [("T", dtype), ("K", K), ("D", D), ("I", I), ("TGS", TGS), ("GS", down.group)],
         grid: (T * K * TGS, (D + TGS - 1) / TGS, 1), threadGroup: (TGS, 1, 1),
         outputShapes: [[T, K, D]], outputDTypes: [dtype])[0]
 }
@@ -818,9 +1120,10 @@ public struct Q4MoEDecodeBench {
     public static func run(x: MLXArray, idx: MLXArray,
                            gate: (MLXArray, MLXArray, MLXArray), up: (MLXArray, MLXArray, MLXArray),
                            down: (MLXArray, MLXArray, MLXArray), bits: Int, K: Int, D: Int, I: Int) -> (h: MLXArray, yk: MLXArray) {
-        let g = Q4ExpertBank(w: gate.0, s: gate.1, b: gate.2, bits: bits, group: bits == 8 ? 64 : 32)
-        let u = Q4ExpertBank(w: up.0, s: up.1, b: up.2, bits: bits, group: bits == 8 ? 64 : 32)
-        let d = Q4ExpertBank(w: down.0, s: down.1, b: down.2, bits: bits, group: bits == 8 ? 64 : 32)
+        func group(_ w: MLXArray, _ sc: MLXArray) -> Int { w.dim(-1) * (32 / bits) / sc.dim(-1) }
+        let g = Q4ExpertBank(w: gate.0, s: gate.1, b: gate.2, bits: bits, group: group(gate.0, gate.1))
+        let u = Q4ExpertBank(w: up.0, s: up.1, b: up.2, bits: bits, group: group(up.0, up.1))
+        let d = Q4ExpertBank(w: down.0, s: down.1, b: down.2, bits: bits, group: group(down.0, down.1))
         let h = q4MoEGateUpShipped(x: x, idx: idx, gate: g, up: u, K: K, D: D, I: I)
         let yk = q4MoEDownShipped(h: h, idx: idx, down: d, K: K, D: D, I: I, dtype: x.dtype)
         return (h, yk)
@@ -846,7 +1149,7 @@ func q4MoEExperts(x: MLXArray, idx: MLXArray, wts: MLXArray, gate: Q4ExpertBank,
     let NSG = 2, ROWS = 4
     let h = q4MoEGateUpKernel(
         [x, idx, gate.w, gate.s, gate.b, up.w, up.s, up.b],
-        template: [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", ROWS)],
+        template: [("T", x.dtype), ("K", K), ("D", D), ("I", I), ("ROWS", ROWS), ("GS", gate.group)],
         grid: (T * K * NSG * 32, I / (NSG * ROWS), 1), threadGroup: (NSG * 32, 1, 1),
         outputShapes: [[T, K, I]], outputDTypes: [x.dtype])[0]
     return q4MoEDownKernel(
@@ -986,20 +1289,38 @@ func q4HCInjectNorm(hyper: MLXArray, x: MLXArray, injp: MLXArray, nextOnePlusW: 
 private let q8SplitKKernel = MLXFast.metalKernel(
     name: "q8_qmv_splitk", inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"], source: Q4LabKernelSource.qmv_splitk, atomicOutputs: true)
 
+/// T-0165: the split-K 8-bit projection on raw (weight, scales, biases), for the DFlash2 drafter's 2..8-row matmuls
+/// (ENGINE_DFLASH_SPLITK=1); nil when it does not apply. Float32 atomics: the drafts may differ run to run in the last
+/// bits, which only moves a proposal (the verify decides what is committed).
+public func q8SplitKMatmul(_ x: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int) -> MLXArray? {
+    let K = x.dim(-1), rows = x.size / K
+    guard rows >= 1, rows <= 8, K % 512 == 0, w.dim(1) * 4 == K, groupSize == 64 || groupSize == 32 else { return nil }
+    let N = w.dim(0), SPLIT = K / 512
+    let y = q8SplitKKernel([x.reshaped(rows, K), w, scales, biases], template: [("T", x.dtype), ("M", rows), ("N", N), ("K", K), ("GS", groupSize), ("SPLIT", SPLIT)],
+                           grid: (N * SPLIT * 32, 1, 1), threadGroup: (256, 1, 1),
+                           outputShapes: [[rows, N]], outputDTypes: [.float32], initValue: 0)[0]
+    return y.asType(x.dtype).reshaped(Array(x.shape.dropLast()) + [N])
+}
+
 /// `lin(x)` through the split-K kernel when it applies (8-bit g64, 2...8 rows, K % 512 == 0), else the module itself
 private let q8SplitKPartKernel = MLXFast.metalKernel(
     name: "q8_qmv_splitk_part", inputNames: ["x", "w", "scales", "biases"], outputNames: ["y"], source: Q4LabKernelSource.qmv_splitk_part)
 
 /// split-K 8-bit g64 projection WITHOUT atomics: returns float32 partials [rows, SPLIT, N] for a consumer that sums them
 /// (deterministic; no zero-fill dispatch). nil when the projection does not qualify.
-func q8ProjSplitKPartials(_ lin: Linear, _ x: MLXArray, split SPLIT: Int) -> MLXArray? {
+/// T-0191: ENGINE_HC_SPLITK_MAX_ROWS (default 8): the most rows the HC mixDown's split-K partials take. The fused HC chain runs
+/// up to 16 rows (fusedChainActive), so rows 9..16 (B=3/4 verify blocks at K=3, plain steps of 9..16 rows) fell to MLX's qmv
+/// on the dependent path; the kernel is generic in M (float acc[M]).
+let q8SplitKMaxRows: Int = max(1, min(16, Int(ProcessInfo.processInfo.environment["ENGINE_HC_SPLITK_MAX_ROWS"] ?? "") ?? 8))
+
+func q8ProjSplitKPartials(_ lin: Linear, _ x: MLXArray, split SPLIT: Int, maxRows: Int = 8) -> MLXArray? {
     let K = x.dim(-1)
     let rows = x.size / K
-    guard rows >= 1, rows <= 8, K % (SPLIT * 32 * 16) == 0, let q = lin as? QuantizedLinear, q.bits == 8, q.groupSize == 64, let b = q.biases,
+    guard rows >= 1, rows <= maxRows, K % (SPLIT * 32 * 16) == 0, let q = lin as? QuantizedLinear, q.bits == 8, q.groupSize == 64 || q.groupSize == 32, let b = q.biases,
           q.weight.dim(1) * 4 == K else { return nil }
     let N = q.weight.dim(0)
     let xf = x.reshaped(rows, K)
-    return q8SplitKPartKernel([xf, q.weight, q.scales, b], template: [("T", x.dtype), ("M", rows), ("N", N), ("K", K), ("GS", 64), ("SPLIT", SPLIT)],
+    return q8SplitKPartKernel([xf, q.weight, q.scales, b], template: [("T", x.dtype), ("M", rows), ("N", N), ("K", K), ("GS", q.groupSize), ("SPLIT", SPLIT)],
                               grid: (N * SPLIT * 32, 1, 1), threadGroup: (256, 1, 1),
                               outputShapes: [[rows, SPLIT, N]], outputDTypes: [.float32])[0]
 }
@@ -1049,12 +1370,20 @@ func q8Proj(_ lin: Linear, _ x: MLXArray, minRows: Int = 2, force: Bool = false)
     let K = x.dim(-1)
     let rows = x.size / K
     if q8DenseQmmMin >= 2, rows >= q8DenseQmmMin, rows < 12, !Q4Fused.splitKM { return q8ProjPadded(lin, x, minRows: q8DenseQmmMin) }
-    guard force || Q4Fused.splitKM, rows >= (q8SplitK1Row ? 1 : minRows), rows <= 8, K % 512 == 0, let q = lin as? QuantizedLinear, q.bits == 8, q.groupSize == 64, let b = q.biases,
+    if rows > 16, let y = q4VerifyProj(lin, x) {   // T-0119: verify widths without MLX qmm's 32-row tile padding
+        if !q4VerifyProjCheck { return y }
+        let r = lin(x)
+        let d = abs(y.asType(.float32) - r.asType(.float32)).max().item(Float.self), a = abs(r.asType(.float32)).max().item(Float.self)
+        FileHandle.standardError.write(String(format: "vproj-check rows=%d N=%d K=%d max|d| %.3e max|ref| %.3e\n", rows, y.dim(-1), K, d, a).data(using: .utf8)!)
+        return r
+    }
+    guard force || Q4Fused.splitKM, rows >= (q8SplitK1Row ? 1 : minRows), rows <= 8, K % 512 == 0, let q = lin as? QuantizedLinear, q.bits == 8, q.groupSize == 64 || q.groupSize == 32, let b = q.biases,
           q.weight.dim(1) * 4 == K else { return lin(x) }
     let N = q.weight.dim(0)
     let SPLIT = K / 512
     let xf = x.reshaped(rows, K)
-    let y = q8SplitKKernel([xf, q.weight, q.scales, b], template: [("T", x.dtype), ("M", rows), ("N", N), ("K", K), ("GS", 64), ("SPLIT", SPLIT)],
+    // T-0076: the body indexes scales by kb / GS for 16-element blocks, so g32 (GGUF Q8_0 carried exactly) runs as is
+    let y = q8SplitKKernel([xf, q.weight, q.scales, b], template: [("T", x.dtype), ("M", rows), ("N", N), ("K", K), ("GS", q.groupSize), ("SPLIT", SPLIT)],
                            grid: (N * SPLIT * 32, 1, 1), threadGroup: (256, 1, 1),
                            outputShapes: [[rows, N]], outputDTypes: [.float32], initValue: 0)[0]
     return y.asType(x.dtype).reshaped(Array(x.shape.dropLast()) + [N])
@@ -1148,6 +1477,8 @@ let q4QSARaggedParts: Int = Int(ProcessInfo.processInfo.environment["ENGINE_QSA_
 /// block's arithmetic. ENGINE_QSA_RAGGED_VERIFY_PARTS=0 sends S > 1 through the single ragged kernel instead.
 private let q4QSAGatherRaggedGQAPartKernel = MLXFast.metalKernel(
     name: "q4_qsa_gather_ragged_gqa_part", inputNames: ["q", "k", "v", "top", "params", "scale"], outputNames: ["po", "pm", "pl"], source: Q4LabKernelSource.qsa_sdpa_gather_ragged_gqa_part)
+private let q4QSAGatherTiledStackedKernel = MLXFast.metalKernel(
+    name: "q4_qsa_verify_tiled_stacked", inputNames: ["q", "k", "v", "top", "params", "scale"], outputNames: ["po", "pm", "pl"], source: q4QSAVerifyTiledSourceSelected)
 let q4QSARaggedVerifyParts: Int = Int(ProcessInfo.processInfo.environment["ENGINE_QSA_RAGGED_VERIFY_PARTS"] ?? "\(q4QSAParts)") ?? q4QSAParts
 let q4QSARaggedHpg: Int = Int(ProcessInfo.processInfo.environment["ENGINE_QSA_RAGGED_HPG"] ?? "2") ?? 2
 let q4QSARaggedMinRows: Int = Int(ProcessInfo.processInfo.environment["ENGINE_QSA_RAGGED_MIN_ROWS"] ?? "2") ?? 2
@@ -1159,10 +1490,21 @@ func q4QSAGatherRagged(q: MLXArray, keys k: MLXArray, values v: MLXArray, top: M
     let B = q.dim(0), H = q.dim(1), S = q.dim(2), D = q.dim(3), KVH = k.dim(1), kcap = k.dim(2), K = top.dim(2)
     precondition(D % 32 == 0 && H % KVH == 0 && top.dtype == .int32 && top.dim(1) == S)   // P099: S rows per row (the single kernel is S-generic)
     precondition(rowOffsets.count == B && rowNBlocks.count == B)
-    var p: [Int32] = [Int32(B), 0, Int32(kcap), 0]
+    var p: [Int32] = [Int32(B), 0, Int32(kcap), Int32(K)]       // p[3]: K for the tiled verify gather (T-0164); unread by the other ragged kernels
     p += rowOffsets.map { Int32($0) }
     p += rowNBlocks.map { Int32($0) }
     let G = H / KVH
+    if S > 1, q4QSARaggedVerifyParts > 0, q4QSAVerifyTiledOn, D == 256, G <= 16, S <= 8 {
+        EngineWitness.hit("qsa_verify_tiled_ragged")
+        // T-0127: the tiled verify gather on the stacked pool (the same source; one threadgroup of 4 simdgroups per part)
+        let PV = q4QSARaggedVerifyParts
+        let pr = q4QSAGatherTiledStackedKernel([q, k, v, top, MLXArray(p), q4Const(scale)],
+                                               template: [("T", q.dtype), ("D", D), ("H", H), ("KVH", KVH), ("S", S), ("R", R)] + (q4QSATiledRuntimeK ? [] : [("K", K)]) + [("PARTS", PV)],
+                                               grid: (B * KVH * S * PV * 128, 1, 1), threadGroup: (128, 1, 1),
+                                               outputShapes: [[B, H, S, PV, D], [B, H, S, PV], [B, H, S, PV]], outputDTypes: [.float32, .float32, .float32])
+        return q4QSAMergeKernel([pr[0], pr[1], pr[2]], template: [("T", q.dtype), ("D", D), ("PARTS", PV)],
+                                grid: (B * H * S * D, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[B, H, S, D]], outputDTypes: [q.dtype])[0]
+    }
     if S > 1, q4QSARaggedVerifyParts > 0 {
         let PV = q4QSARaggedVerifyParts
         let pr = q4QSAGatherRaggedGQAPartKernel([q, k, v, top, MLXArray(p), q4Const(scale)],
@@ -1212,6 +1554,10 @@ func q4QSAGatherRaggedRows(q: MLXArray, keys: [MLXArray], values: [MLXArray], to
         return q4QSAGatherRaggedMulti(q: q, keys: keys, values: values, top: top, rowOffsets: rowOffsets,
                                       rowNBlocks: rowNBlocks, ratio: R, scale: scale)
     }
+    if q.dim(2) > 1, q4QSARaggedVerifyParts > 0, q4QSAVerifyRowsMulti, B >= 2 {
+        return q4QSAVerifyRowsGather(q: q, keys: keys, values: values, top: top, rowOffsets: rowOffsets,
+                                     rowNBlocks: rowNBlocks, ratio: R, scale: scale)
+    }
     let outs = (0 ..< B).map { b in
         q4QSAGatherRagged(q: q[b ..< (b + 1)], keys: keys[b], values: values[b], top: top[b ..< (b + 1)],
                           rowOffsets: [rowOffsets[b]], rowNBlocks: [rowNBlocks[b]], ratio: R, scale: scale, parts: P)
@@ -1241,6 +1587,106 @@ private func q4QSAGatherRaggedMultiSource(_ B: Int) -> String {
         .replacingOccurrences(of: oldParams, with: "int Bn = params[0], kcap = params[4 + 2 * Bn + int(b)];")
         .replacingOccurrences(of: oldK, with: select + "const device T* kb = kbase + (ulong)kvh * (ulong)kcap * D + lane * QK;")
         .replacingOccurrences(of: oldV, with: "const device T* vb = vbase + (ulong)kvh * (ulong)kcap * D + lane * QK;")
+}
+/// T-0110: the VERIFY (S > 1) gather over row-resident K/V in one dispatch per group of up to 8 rows instead of one per
+/// row: `qsa_sdpa_gather_ragged_gqa_part` with the same three address lines swapped as the S = 1 multi kernel above. Every
+/// (row, head, query row, part) is still computed by the same body from that row's offset, block count and top row, so the
+/// partials -- and the merge over them -- are the per-row calls' bit for bit. ENGINE_RR_VERIFY_MULTI=0 keeps per-row calls.
+let q4QSAVerifyRowsMulti: Bool = (ProcessInfo.processInfo.environment["ENGINE_RR_VERIFY_MULTI"] ?? "1") != "0"
+private func q4QSAVerifyMultiSource(_ B: Int) -> String {
+    let src = Q4LabKernelSource.qsa_sdpa_gather_ragged_gqa_part
+    let oldParams = "int Bn = params[0], kcap = params[2];"
+    let oldK = "const device T* kb = k + (ulong)(b * KVH + kvh) * (ulong)kcap * D + lane * QK;"
+    let oldV = "const device T* vb = v + (ulong)(b * KVH + kvh) * (ulong)kcap * D + lane * QK;"
+    precondition(src.components(separatedBy: oldParams).count == 2 && src.components(separatedBy: oldK).count == 2
+                 && src.components(separatedBy: oldV).count == 2, "qsa_sdpa_gather_ragged_gqa_part changed shape")
+    var select = "const device T* kbase = k0;\nconst device T* vbase = v0;\n"
+    for b in 1 ..< max(1, B) { select += "if (b == \(b)) { kbase = k\(b); vbase = v\(b); }\n" }
+    return src
+        .replacingOccurrences(of: oldParams, with: "int Bn = params[0], kcap = params[4 + 2 * Bn + int(b)];")
+        .replacingOccurrences(of: oldK, with: select + "const device T* kb = kbase + (ulong)kvh * (ulong)kcap * D + lane * QK;")
+        .replacingOccurrences(of: oldV, with: "const device T* vb = vbase + (ulong)kvh * (ulong)kcap * D + lane * QK;")
+}
+nonisolated(unsafe) private var q4QSAVerifyMultiKernels: [Int: MLXFast.MLXFastKernel] = [:]
+nonisolated(unsafe) private var q4QSAVerifyTiledKernels: [Int: MLXFast.MLXFastKernel] = [:]
+/// T-0127: the tiled verify gather with the K/V base pointer and capacity of row b's OWN buffer (row-resident pool)
+private func q4QSAVerifyTiledMultiSource(_ B: Int) -> String {
+    let src = q4QSAVerifyTiledSourceSelected
+    let oldParams = "int Bn = params[0], kcap = params[2];"
+    let oldK = "const device T* kb = k + (ulong)(b * KVH + kvh) * (ulong)kcap * D;"
+    let oldV = "const device T* vb = v + (ulong)(b * KVH + kvh) * (ulong)kcap * D;"
+    precondition(src.components(separatedBy: oldParams).count == 2 && src.components(separatedBy: oldK).count == 2
+                 && src.components(separatedBy: oldV).count == 2, "tiled verify gather source changed shape")
+    var select = "const device T* kbase = k0;\nconst device T* vbase = v0;\n"
+    for b in 1 ..< max(1, B) { select += "if (b == \(b)) { kbase = k\(b); vbase = v\(b); }\n" }
+    return src
+        .replacingOccurrences(of: oldParams, with: "int Bn = params[0], kcap = params[4 + 2 * Bn + int(b)];")
+        .replacingOccurrences(of: oldK, with: select + "const device T* kb = kbase + (ulong)kvh * (ulong)kcap * D;")
+        .replacingOccurrences(of: oldV, with: "const device T* vb = vbase + (ulong)kvh * (ulong)kcap * D;")
+}
+/// partials (po, pm, pl) of `rows` (<= 8) row-resident rows' verify gather
+private func q4QSAVerifyMultiPartials(q: MLXArray, keys: [MLXArray], values: [MLXArray], top: MLXArray,
+                                      rowOffsets: [Int], rowNBlocks: [Int], ratio R: Int, scale: Float, parts PV: Int) -> [MLXArray] {
+    let B = q.dim(0), H = q.dim(1), S = q.dim(2), D = q.dim(3), KVH = keys[0].dim(1), K = top.dim(2), G = H / KVH
+    precondition(B >= 1 && B <= 8 && keys.count == B && values.count == B && keys.allSatisfy { $0.dim(0) == 1 && $0.dim(1) == KVH })
+    let kernel: MLXFast.MLXFastKernel
+    if let kk = q4QSAVerifyMultiKernels[B] { kernel = kk } else {
+        kernel = MLXFast.metalKernel(name: "q4_qsa_verify_rows\(B)",
+                                     inputNames: ["q"] + (0 ..< B).map { "k\($0)" } + (0 ..< B).map { "v\($0)" } + ["top", "params", "scale"],
+                                     outputNames: ["po", "pm", "pl"], source: q4QSAVerifyMultiSource(B))
+        q4QSAVerifyMultiKernels[B] = kernel
+    }
+    var p: [Int32] = [Int32(B), 0, 0, Int32(K)]                  // p[3]: K for the tiled verify gather (T-0164)
+    p += rowOffsets.map { Int32($0) }
+    p += rowNBlocks.map { Int32($0) }
+    p += keys.map { Int32($0.dim(2)) }
+    if q4QSAVerifyTiledOn || q4QSAVerifyTiledCheck, D == 256, H / KVH <= 16, S <= 8 {
+        EngineWitness.hit("qsa_verify_tiled")
+        let tk: MLXFast.MLXFastKernel
+        if let kk = q4QSAVerifyTiledKernels[B] { tk = kk } else {
+            tk = MLXFast.metalKernel(name: "q4_qsa_verify_tiled\(B)",
+                                     inputNames: ["q"] + (0 ..< B).map { "k\($0)" } + (0 ..< B).map { "v\($0)" } + ["top", "params", "scale"],
+                                     outputNames: ["po", "pm", "pl"], source: q4QSAVerifyTiledMultiSource(B))
+            q4QSAVerifyTiledKernels[B] = tk
+        }
+        let tr = tk([q] + keys + values + [top, MLXArray(p), q4Const(scale)],
+                    template: [("T", q.dtype), ("D", D), ("H", H), ("KVH", KVH), ("S", S), ("R", R)] + (q4QSATiledRuntimeK ? [] : [("K", K)]) + [("PARTS", PV)],
+                    grid: (B * KVH * S * PV * 128, 1, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[B, H, S, PV, D], [B, H, S, PV], [B, H, S, PV]], outputDTypes: [.float32, .float32, .float32])
+        if !q4QSAVerifyTiledCheck { return tr }
+        let ref = kernel([q] + keys + values + [top, MLXArray(p), q4Const(scale)],
+                         template: [("T", q.dtype), ("D", D), ("H", H), ("KVH", KVH), ("S", S), ("R", R), ("K", K), ("PARTS", PV)],
+                         grid: (B * KVH * S * PV * 32, G, 1), threadGroup: (32, G, 1),
+                         outputShapes: [[B, H, S, PV, D], [B, H, S, PV], [B, H, S, PV]], outputDTypes: [.float32, .float32, .float32])
+        let mt = q4QSAMergeKernel([tr[0], tr[1], tr[2]], template: [("T", q.dtype), ("D", D), ("PARTS", PV)], grid: (B * H * S * D, 1, 1),
+                                  threadGroup: (256, 1, 1), outputShapes: [[B, H, S, D]], outputDTypes: [q.dtype])[0]
+        let mr = q4QSAMergeKernel([ref[0], ref[1], ref[2]], template: [("T", q.dtype), ("D", D), ("PARTS", PV)], grid: (B * H * S * D, 1, 1),
+                                  threadGroup: (256, 1, 1), outputShapes: [[B, H, S, D]], outputDTypes: [q.dtype])[0]
+        let d = abs(mt.asType(.float32) - mr.asType(.float32)).max().item(Float.self), am = abs(mr.asType(.float32)).max().item(Float.self)
+        FileHandle.standardError.write(String(format: "qsa-tiled-check rows=%d max|d| %.3e max|ref| %.3e\n", B, d, am).data(using: .utf8)!)
+        return ref
+    }
+    return kernel([q] + keys + values + [top, MLXArray(p), q4Const(scale)],
+                  template: [("T", q.dtype), ("D", D), ("H", H), ("KVH", KVH), ("S", S), ("R", R), ("K", K), ("PARTS", PV)],
+                  grid: (B * KVH * S * PV * 32, G, 1), threadGroup: (32, G, 1),
+                  outputShapes: [[B, H, S, PV, D], [B, H, S, PV], [B, H, S, PV]], outputDTypes: [.float32, .float32, .float32])
+}
+func q4QSAVerifyRowsGather(q: MLXArray, keys: [MLXArray], values: [MLXArray], top: MLXArray,
+                           rowOffsets: [Int], rowNBlocks: [Int], ratio R: Int, scale: Float) -> MLXArray {
+    let B = q.dim(0), H = q.dim(1), S = q.dim(2), D = q.dim(3), PV = q4QSARaggedVerifyParts
+    var po: [MLXArray] = [], pm: [MLXArray] = [], pl: [MLXArray] = []
+    var b0 = 0
+    while b0 < B {
+        let b1 = min(B, b0 + 8)
+        let r = q4QSAVerifyMultiPartials(q: q[b0 ..< b1], keys: Array(keys[b0 ..< b1]), values: Array(values[b0 ..< b1]),
+                                         top: top[b0 ..< b1], rowOffsets: Array(rowOffsets[b0 ..< b1]),
+                                         rowNBlocks: Array(rowNBlocks[b0 ..< b1]), ratio: R, scale: scale, parts: PV)
+        po.append(r[0]); pm.append(r[1]); pl.append(r[2])
+        b0 = b1
+    }
+    let cat = { (a: [MLXArray]) in a.count == 1 ? a[0] : concatenated(a, axis: 0) }
+    return q4QSAMergeKernel([cat(po), cat(pm), cat(pl)], template: [("T", q.dtype), ("D", D), ("PARTS", PV)],
+                            grid: (B * H * S * D, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[B, H, S, D]], outputDTypes: [q.dtype])[0]
 }
 nonisolated(unsafe) private var q4QSAGatherRaggedMultiKernels: [Int: MLXFast.MLXFastKernel] = [:]
 func q4QSAGatherRaggedMulti(q: MLXArray, keys: [MLXArray], values: [MLXArray], top: MLXArray,
@@ -1308,6 +1754,9 @@ private let q4QSAGatherPartBlkKernel = MLXFast.metalKernel(
 let q4QSABlkLoop: Bool = (ProcessInfo.processInfo.environment["ENGINE_QSA_BLKLOOP"] ?? "1") != "0"
 private let q4QSAGatherPartHpgKernel = MLXFast.metalKernel(
     name: "q4_qsa_gather_gqa_part_hpg", inputNames: ["q", "k", "v", "top", "params", "scale"], outputNames: ["po", "pm", "pl"], source: Q4LabKernelSource.qsa_sdpa_gather_gqa_part_hpg)
+private let q4QSAGatherPartHpgRTKernel = MLXFast.metalKernel(
+    name: "q4_qsa_gather_gqa_part_hpg_rt", inputNames: ["q", "k", "v", "top", "params", "scale", "rtv"], outputNames: ["po", "pm", "pl"],
+    source: "const int S = rtv[0];\nconst int K = rtv[1];\n" + Q4LabKernelSource.qsa_sdpa_gather_gqa_part_hpg)
 /// ENGINE_QSA_HPG: query heads per simdgroup in the prefill gather kernel (1 = the block-loop kernel). A K element is
 /// loaded ONCE and used for HPG heads, so the load instructions per useful FLOP fall by HPG. Lab at a 4096-row chunk
 /// over 135k of kv: 32.25 / 25.35 / 59.9 / 74.0 ms at HPG 1 / 2 / 3 / 4 -- 2 is 1.28x and BIT-IDENTICAL, 3 spills.
@@ -1354,16 +1803,142 @@ func q4QSAGather(q: MLXArray, keys k: MLXArray, values v: MLXArray, top: MLXArra
     let partKernel = verifyHpg ? q4QSAGatherPartHpgPosKernel : (hpg > 1 ? q4QSAGatherPartHpgKernel : ((q4QSABlkLoop && S > 16) ? q4QSAGatherPartBlkKernel : q4QSAGatherPartKernel))
     var tmpl: [(String, any KernelTemplateArg)] = [("T", q.dtype), ("D", D), ("H", H), ("KVH", KVH), ("S", S), ("R", R), ("K", K), ("PARTS", P)]
     if hpg > 1 { tmpl.append(("HPG", hpg)) }
-    let parts = partKernel([q, k, v, top, params, sc], template: tmpl,
+    let rtHpg = q4RuntimeRows && !verifyHpg && hpg > 1
+    if rtHpg { EngineWitness.hit("runtime_rows"); tmpl = [("T", q.dtype), ("D", D), ("H", H), ("KVH", KVH), ("R", R), ("PARTS", P), ("HPG", hpg)] }
+    let parts = (rtHpg ? q4QSAGatherPartHpgRTKernel : partKernel)([q, k, v, top, params, sc] + (rtHpg ? [q4RuntimeInts([S, K])] : []), template: tmpl,
                                       grid: (B * KVH * S * P * 32, G / hpg, 1), threadGroup: (32, G / hpg, 1),
                                       outputShapes: [[B, H, S, P, D], [B, H, S, P], [B, H, S, P]], outputDTypes: [.float32, .float32, .float32])
     return q4QSAMergeKernel([parts[0], parts[1], parts[2]], template: [("T", q.dtype), ("D", D), ("PARTS", P)],
                             grid: (B * H * S * D, 1, 1), threadGroup: (256, 1, 1), outputShapes: [[B, H, S, D]], outputDTypes: [q.dtype])[0]
 }
 
+// MARK: GDN prefill recurrence, R value rows per simdgroup (T-0194)
+/// The same recurrence as mlx-lm's gated_delta_step (Vendor/mlx-swift-lm/.../GatedDelta.swift) with the same per-row
+/// operation order, but each simdgroup carries R=4 value rows: k/q/g/beta are read once per step for 4 rows and the next
+/// step's inputs are loaded before this step's arithmetic. Bit-identical y and state; x2.0 at T=8192, x1.5 at T=1200,
+/// no gain at verify widths (C-0628, lab/e9/gdn_prefill_kernel_lab.py holds the same body).
+private let q4GDNRowsKernel = MLXFast.metalKernel(
+    name: "q4_gdn_rows", inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"], outputNames: ["y", "state_out"],
+    source: #"""
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv0 = thread_position_in_grid.y * R;
+        auto g_ = g + b_idx * T * Hv + hv_idx;
+        auto beta_ = beta + b_idx * T * Hv + hv_idx;
+        float state[R][n_per_t];
+        for (int r = 0; r < R; ++r)
+          for (int i = 0; i < n_per_t; ++i)
+            state[r][i] = static_cast<float>(state_in[(n * Dv + dv0 + r) * Dk + n_per_t * dk_idx + i]);
+        InT kc[n_per_t], qc[n_per_t], vc[R];
+        float gc, bc;
+        for (int i = 0; i < n_per_t; ++i) { kc[i] = k_[n_per_t * dk_idx + i]; qc[i] = q_[n_per_t * dk_idx + i]; }
+        for (int r = 0; r < R; ++r) vc[r] = v_[dv0 + r];
+        gc = g_[0]; bc = beta_[0];
+        for (int t = 0; t < T; ++t) {
+          InT kn[n_per_t], qn[n_per_t], vn[R];
+          float gn = 0.0f, bn = 0.0f;
+          if (t + 1 < T) {
+            auto o = (t + 1) * Hk * Dk + n_per_t * dk_idx;
+            for (int i = 0; i < n_per_t; ++i) { kn[i] = k_[o + i]; qn[i] = q_[o + i]; }
+            auto ov = (t + 1) * Hv * Dv + dv0;
+            for (int r = 0; r < R; ++r) vn[r] = v_[ov + r];
+            gn = g_[(t + 1) * Hv]; bn = beta_[(t + 1) * Hv];
+          }
+          float kv_mem[R];
+          for (int r = 0; r < R; ++r) {
+            kv_mem[r] = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] * gc;
+              kv_mem[r] += state[r][i] * kc[i];
+            }
+          }
+          for (int r = 0; r < R; ++r) kv_mem[r] = simd_sum(kv_mem[r]);
+          float out[R];
+          for (int r = 0; r < R; ++r) {
+            auto delta = (vc[r] - kv_mem[r]) * bc;
+            out[r] = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+              state[r][i] = state[r][i] + kc[i] * delta;
+              out[r] += state[r][i] * qc[i];
+            }
+          }
+          for (int r = 0; r < R; ++r) out[r] = simd_sum(out[r]);
+          if (thread_index_in_simdgroup == 0)
+            for (int r = 0; r < R; ++r) y[t * Hv * Dv + dv0 + r] = static_cast<InT>(out[r]);
+          for (int i = 0; i < n_per_t; ++i) { kc[i] = kn[i]; qc[i] = qn[i]; }
+          for (int r = 0; r < R; ++r) vc[r] = vn[r];
+          gc = gn; bc = bn;
+        }
+        for (int r = 0; r < R; ++r)
+          for (int i = 0; i < n_per_t; ++i)
+            state_out[(n * Dv + dv0 + r) * Dk + n_per_t * dk_idx + i] = static_cast<StT>(state[r][i]);
+"""#)
+/// ENGINE_GDN_ROWS=1: prefill chunks of at least q4GDNRowsMinT tokens run the recurrence through q4GDNRowsKernel
+let q4GDNRowsOn: Bool = (ProcessInfo.processInfo.environment["ENGINE_GDN_ROWS"] ?? "0") == "1"
+let q4GDNRowsMinT: Int = Int(ProcessInfo.processInfo.environment["ENGINE_GDN_ROWS_MIN_T"] ?? "64") ?? 64
+private let q4GDNRowsR = 4
+/// nil when the shape does not fit (the caller keeps the shipped kernel); q/k (B,T,Hk,Dk) v (B,T,Hv,Dv), g/beta fp32 (B,T,Hv)
+func q4GDNRows(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray?) -> (MLXArray, MLXArray)? {
+    let B = q.dim(0), T = q.dim(1), Hk = q.dim(2), Dk = q.dim(3), Hv = v.dim(2), Dv = v.dim(3)
+    guard Dk % 32 == 0, Dv % (q4GDNRowsR * 4) == 0, Hv % Hk == 0, g.dtype == .float32, beta.dtype == .float32 else { return nil }
+    var st = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if st.dtype != .float32 { st = st.asType(.float32) }
+    EngineWitness.hit("gdn_rows")
+    let r = q4GDNRowsKernel(
+        [q, k, v, g, beta, st, MLXArray(T)],
+        template: [("InT", q.dtype), ("StT", st.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv), ("R", q4GDNRowsR)],
+        grid: (32, Dv / q4GDNRowsR, B * Hv), threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], st.shape], outputDTypes: [q.dtype, st.dtype])
+    return (r[0], r[1])
+}
+
+/// gatedDeltaUpdate's gate math (MLXLLM computeGatedDeltaG and sigmoid, the same MLX ops in the same order), then q4GDNRows
+func q4GDNRowsFromGate(q: MLXArray, k: MLXArray, v: MLXArray, a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray,
+                       state: MLXArray?) -> (MLXArray, MLXArray)? {
+    let beta = sigmoid(b).asType(.float32)
+    let g = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+    return q4GDNRows(q: q, k: k, v: v, g: g, beta: beta, state: state)
+}
 // MARK: GDN prefill front end (body in Kernels/lab/gdn_conv_prefill.metal)
 private let q4GDNConvPrefillKernel = MLXFast.metalKernel(
     name: "q4_gdn_conv_prefill", inputNames: ["qkvz", "cs", "w"], outputNames: ["y"], source: Q4LabKernelSource.gdn_conv_prefill)
+private let q4GDNConvPrefillTailKernel = MLXFast.metalKernel(
+    name: "q4_gdn_conv_prefill_tail", inputNames: ["qkvz", "cs", "w"], outputNames: ["y", "tail"], source: Q4LabKernelSource.gdn_conv_prefill_tail)
+private let q4GDNConvPrefillTailRTKernel = MLXFast.metalKernel(
+    name: "q4_gdn_conv_prefill_tail_rt", inputNames: ["qkvz", "cs", "w", "rtv"], outputNames: ["y", "tail"],
+    source: "const int ROWS = rtv[0];\n" + Q4LabKernelSource.gdn_conv_prefill_tail)
+/// T-0156: ENGINE_GDN_CONV_PREFILL_TAIL=1 -- the fused prefill conv also writes the chunk's next conv state (its last CK-1
+/// mixed q|k|v rows) instead of a separate `contiguous(mixedQKV[S-3...])` op. W17-W22: with the separate op a rung-resumed
+/// chunk's stored conv state held garbage in a few layers (C-0492); with the fused kernel off it did not (W22 arm C).
+let q4GDNConvPrefillTail: Bool = (ProcessInfo.processInfo.environment["ENGINE_GDN_CONV_PREFILL_TAIL"] ?? "0") == "1"
+func q4GDNConvPrefillWithTail(qkvz: MLXArray, convState: MLXArray, convW: MLXArray, convDim: Int, kernel ck: Int, runtime: Bool = q4RuntimeRows) -> (MLXArray, MLXArray) {
+    let rows = qkvz.dim(0), RS = qkvz.dim(1)
+    let VEC = convDim % 8 == 0 ? 8 : (convDim % 4 == 0 ? 4 : 1)
+    EngineWitness.hit("gdn_conv_prefill_tail")
+    if runtime {
+        EngineWitness.hit("runtime_rows")
+        let r = q4GDNConvPrefillTailRTKernel(
+            [qkvz, convState.reshaped(ck - 1, convDim), convW.reshaped(convDim, ck), q4RuntimeInts([rows])],
+            template: [("T", qkvz.dtype), ("CONVD", convDim), ("QKVZ", RS), ("CK", ck), ("VEC", VEC)],
+            grid: (rows * convDim / VEC, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[rows, convDim], [ck - 1, convDim]], outputDTypes: [qkvz.dtype, qkvz.dtype])
+        return (r[0], r[1])
+    }
+    let r = q4GDNConvPrefillTailKernel(
+        [qkvz, convState.reshaped(ck - 1, convDim), convW.reshaped(convDim, ck)],
+        template: [("T", qkvz.dtype), ("CONVD", convDim), ("QKVZ", RS), ("CK", ck), ("VEC", VEC), ("ROWS", rows)],
+        grid: (rows * convDim / VEC, 1, 1), threadGroup: (256, 1, 1),
+        outputShapes: [[rows, convDim], [ck - 1, convDim]], outputDTypes: [qkvz.dtype, qkvz.dtype])
+    return (r[0], r[1])
+}
 /// ENGINE_GDN_CONV_PREFILL=0 restores the concatenate + Conv1d + silu chain
 let q4GDNConvPrefillOn: Bool = (ProcessInfo.processInfo.environment["ENGINE_GDN_CONV_PREFILL"] ?? "1") != "0"
 /// qkvz (rows, QKVZ) with the mixed q|k|v in the first convDim columns; convState (ck-1, convDim); w (convDim, ck)
@@ -1634,4 +2209,522 @@ func q4ReadBW(_ w: MLXArray, threads: Int = 1 << 18, tg: Int = 256) -> MLXArray 
     precondition(flat.dtype == .uint32 && flat.size % 4 == 0)
     return q4ReadBWKernel([flat, MLXArray([Int32(flat.size / 4)])], template: [],
                           grid: (threads, 1, 1), threadGroup: (tg, 1, 1), outputShapes: [[threads]], outputDTypes: [.uint32])[0]
+}
+
+// MARK: - T-0110: one-pass verify-block roll-back of the GDN state
+/// Row b of a verify block either keeps the forward's state (steps[b] < 0: a fully accepted row) or replays its first
+/// steps[b] positions from its pre-block state -- the body of mlx-swift-lm's gated_delta_step (the same per-thread
+/// arithmetic, simd_sum and step order), so a replayed row is bit-identical to the per-row call it replaces. The state is
+/// read once and written once per row; the B rows' selection that `which` did in a second full pass is the branch here.
+private let q4GDNRollbackKernel = MLXFast.metalKernel(
+    name: "q4_gdn_rollback",
+    inputNames: ["q", "k", "v", "g", "beta", "state_pre", "state_fwd", "steps", "T"],
+    outputNames: ["state_out"],
+    source: q4GDNRollbackSource)
+
+/// T-0151 (C-0466: the roll-back costs state traffic, ~0.33 ms per row at B16): the same kernel IN PLACE over the forward's
+/// state. "__donate6" makes the (ENGINE-forked) MLX custom kernel start output 0 as input 6 (state_fwd): its buffer when
+/// nothing else holds it, else a copy. A fully accepted row then needs no work at all; a replayed row is written exactly
+/// as before, so the result is the out-of-place kernel's bit for bit. ENGINE_GDN_ROLLBACK_INPLACE=1.
+private let q4GDNRollbackInPlaceKernel = MLXFast.metalKernel(
+    name: "q4_gdn_rollback_ip__donate6",
+    inputNames: ["q", "k", "v", "g", "beta", "state_pre", "state_fwd", "steps", "T"],
+    outputNames: ["state_out"],
+    source: q4GDNRollbackInPlaceSource)
+private let q4GDNRollbackCopyBranch = """
+        if (ns < 0) {
+          auto f_state = state_fwd + (n * Dv + dv_idx) * Dk;
+          for (int i = 0; i < n_per_t; ++i) { auto s_idx = n_per_t * dk_idx + i; o_state[s_idx] = f_state[s_idx]; }
+          return;
+        }
+    """
+private let q4GDNRollbackInPlaceSource: String = {
+    precondition(q4GDNRollbackSource.contains(q4GDNRollbackCopyBranch), "q4_gdn_rollback: the copy branch to drop was not found")
+    return q4GDNRollbackSource.replacingOccurrences(of: q4GDNRollbackCopyBranch, with: "        if (ns < 0) { return; }")
+}()
+let q4GDNRollbackInPlace: Bool = ProcessInfo.processInfo.environment["ENGINE_GDN_ROLLBACK_INPLACE"] == "1"
+
+private let q4GDNRollbackSource = """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+        int ns = steps[b_idx];
+        if (ns < 0) {
+          auto f_state = state_fwd + (n * Dv + dv_idx) * Dk;
+          for (int i = 0; i < n_per_t; ++i) { auto s_idx = n_per_t * dk_idx + i; o_state[s_idx] = f_state[s_idx]; }
+          return;
+        }
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+        auto i_state = state_pre + (n * Dv + dv_idx) * Dk;
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+        for (int t = 0; t < ns; ++t) {
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_[hv_idx];
+            kv_mem += state[i] * k_[s_idx];
+          }
+          kv_mem = simd_sum(kv_mem);
+          auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + k_[s_idx] * delta;
+            out += state[i] * q_[s_idx];
+          }
+          out = simd_sum(out);
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; g_ += Hv; beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+    """
+
+/// T-0110: the state of every row after its accepted prefix of a verify block (see the kernel above). `steps[b]` < 0 keeps
+/// `stateFwd`; q/k/v/g/beta are the block's tape [B, T, ...] with g/beta in float32 as gatedDeltaUpdate computes them.
+func q4GDNRollback(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, statePre: MLXArray, stateFwd: MLXArray,
+                   steps: [Int]) -> MLXArray {
+    let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3), Hv = v.dim(2), Dv = v.dim(3)
+    precondition(steps.count == B && statePre.dtype == .float32 && stateFwd.dtype == .float32)
+    if q4GDNRollbackInPlace { EngineWitness.hit("gdn_rollback_inplace") }
+    return (q4GDNRollbackInPlace ? q4GDNRollbackInPlaceKernel : q4GDNRollbackKernel)(
+        [q, k, v, g, beta, statePre, stateFwd, MLXArray(steps.map { Int32($0) }), MLXArray(T)],
+        template: [("InT", q.dtype), ("StT", statePre.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+        grid: (32, Dv, B * Hv), threadGroup: (32, 4, 1),
+        outputShapes: [statePre.shape], outputDTypes: [statePre.dtype])[0]
+}
+
+// MARK: - T-0110: batched indexer verify path over row-resident rows (same per-row arithmetic, one dispatch per group)
+
+/// `idx_score_fused2` for up to 16 row-resident rows in ONE dispatch: row b reads ITS OWN pooled buffer with its own block
+/// count N_b and context length kvLen_b, and its tiles are placed exactly as a one-row call places them (n0 clamped to
+/// N_b - TN), so every score is the per-row call's bit for bit. Output [B, S, NMAX]; columns >= N_b are left unwritten.
+/// params int32: [B, NMAX, S, RATIO, VIS] ++ N[B] ++ kvLen[B] ++ tileStart[B + 1]
+private func q4IdxScoreRowsSource(_ B: Int) -> String {
+    let src = Q4LabKernelSource.idx_score_fused2
+    let oldParams = "int N = params[0], S = params[1], kvLen = params[2], RATIO = params[3], VIS = params[4];"
+    let oldB = """
+int rowTiles = (S + TM - 1) / TM, colTiles = (N + TN - 1) / TN;
+int b = int(tg) / (rowTiles * colTiles);
+int rest = int(tg) % (rowTiles * colTiles);
+"""
+    let oldP = "const device T* pbase = pooled + ((ulong)b * N + n0) * D;"
+    let oldOut = "out[((ulong)b * S + s0 + r) * N + n0 + c] ="
+    for o in [oldParams, oldB, oldP, oldOut] { precondition(src.components(separatedBy: o).count == 2, "idx_score_fused2 changed shape") }
+    var sel = "const device T* pb0 = pooled0;\n"
+    for b in 1 ..< max(1, B) { sel += "if (b == \(b)) pb0 = pooled\(b);\n" }
+    return src
+        .replacingOccurrences(of: oldParams, with: """
+int BN = params[0], NMAX = params[1], S = params[2], RATIO = params[3], VIS = params[4];
+int tgi = int(threadgroup_position_in_grid.x);
+int b = 0;
+while (b + 1 < BN && tgi >= params[5 + 2 * BN + b + 1]) ++b;
+if (tgi >= params[5 + 3 * BN]) return;
+int N = params[5 + b], kvLen = params[5 + BN + b];
+""")
+        .replacingOccurrences(of: oldB, with: """
+int rowTiles = (S + TM - 1) / TM;
+int rest = tgi - params[5 + 2 * BN + b];
+""")
+        .replacingOccurrences(of: oldP, with: sel + "const device T* pbase = pb0 + (ulong)n0 * D;")
+        .replacingOccurrences(of: oldOut, with: "out[((ulong)b * S + s0 + r) * NMAX + n0 + c] =")
+}
+nonisolated(unsafe) private var q4IdxScoreRowsKernels: [Int: MLXFast.MLXFastKernel] = [:]
+/// q (B,S,H,D) with S the padded tile height; pooled[b] (1, cap_b, D) with cap_b >= n[b]
+func q4IdxScoreRows(q: MLXArray, pooled: [MLXArray], n: [Int], kvLen: [Int], ratio: Int, scale: Float,
+                    mi MI: Int, ni NI: Int, sg SG: Int) -> MLXArray {
+    let B = q.dim(0), S = q.dim(1), H = q.dim(2), D = q.dim(3)
+    let TM = SG * 8 * MI, TN = 8 * NI
+    precondition(B >= 1 && B <= 16 && pooled.count == B && n.count == B && kvLen.count == B && S >= TM && D % 8 == 0)
+    precondition(zip(pooled, n).allSatisfy { $0.0.dim(0) == 1 && $0.0.dim(1) >= $0.1 && $0.1 >= TN })
+    let NMAX = n.max()!
+    let rowTiles = (S + TM - 1) / TM
+    var starts = [0]
+    for b in 0 ..< B { starts.append(starts[b] + rowTiles * ((n[b] + TN - 1) / TN)) }
+    let kernel: MLXFast.MLXFastKernel
+    if let kk = q4IdxScoreRowsKernels[B] { kernel = kk } else {
+        kernel = MLXFast.metalKernel(name: "q4_idx_score_rows\(B)", inputNames: ["q"] + (0 ..< B).map { "pooled\($0)" } + ["params", "scale"],
+                                     outputNames: ["out"], source: q4IdxScoreRowsSource(B))
+        q4IdxScoreRowsKernels[B] = kernel
+    }
+    var p: [Int32] = [Int32(B), Int32(NMAX), Int32(S), Int32(ratio), 1]
+    p += n.map { Int32($0) }; p += kvLen.map { Int32($0) }; p += starts.map { Int32($0) }
+    return kernel([q] + pooled + [MLXArray(p), q4Const(scale)],
+                  template: [("T", q.dtype), ("D", D), ("H", H), ("MI", MI), ("NI", NI), ("SG", SG)],
+                  grid: (starts[B] * 32 * SG, 1, 1), threadGroup: (32 * SG, 1, 1),
+                  outputShapes: [[B, S, NMAX]], outputDTypes: [.float32])[0]
+}
+
+/// `topk_select` over B*S rows of a [B, S, NMAX] score tensor whose row b holds n[b] valid columns: the one-row body with
+/// the row's own n and the NMAX row stride, so each (b, s) selection is the per-row call's (same TG, same passes, same
+/// index-order compaction). params int32: [NMAX, K, S] ++ n[B]
+private let q4TopKRowsKernel: MLXFast.MLXFastKernel = {
+    let src = Q4LabKernelSource.topk_select
+    let oldN = "int n = params[0];\nconst device float* s = scores + (ulong)row * (ulong)n;"
+    precondition(src.components(separatedBy: oldN).count == 2, "topk_select changed shape")
+    return MLXFast.metalKernel(name: "q4_topk_select_rows", inputNames: ["scores", "params"], outputNames: ["top"],
+                               source: src.replacingOccurrences(of: oldN, with:
+        "int n = params[3 + int(row) / params[2]];\nconst device float* s = scores + (ulong)row * (ulong)params[0];"))
+}()
+func q4TopKRows(scores: MLXArray, n: [Int], k K: Int) -> MLXArray {
+    let B = scores.dim(0), S = scores.dim(1), NMAX = scores.dim(2), TG = q4TopKTG
+    precondition(scores.dtype == .float32 && n.count == B && n.allSatisfy { $0 >= K && $0 <= NMAX })
+    let p = MLXArray([Int32(NMAX), Int32(K), Int32(S)] + n.map { Int32($0) })
+    return q4TopKRowsKernel([scores.reshaped(B * S, NMAX), p], template: [("K", K), ("TG", TG)],
+                            grid: (B * S * TG, 1, 1), threadGroup: (TG, 1, 1), outputShapes: [[B * S, K]], outputDTypes: [.int32])[0]
+        .reshaped(B, S, K)
+}
+
+/// rows start[b] ..< start[b] + count[b] of each row-resident buffer [1, cap_b, D], concatenated -> [sum(count), D] (a copy)
+private func q4RowsGatherSource(_ B: Int) -> String {
+    var sel = "const device T* src = p0;\n"
+    for b in 1 ..< max(1, B) { sel += "if (b == \(b)) src = p\(b);\n" }
+    return """
+    uint gid = thread_position_in_grid.x;
+    int D = params[0], BN = params[1];
+    int r = int(gid) / D, d = int(gid) % D;
+    if (r >= params[2 + 2 * BN + BN]) return;
+    int b = 0;
+    while (b + 1 < BN && r >= params[2 + 2 * BN + b + 1]) ++b;
+    int srcRow = params[2 + b] + (r - params[2 + 2 * BN + b]);
+    \(sel)
+    out[(ulong)r * D + d] = src[(ulong)srcRow * D + d];
+    """
+}
+nonisolated(unsafe) private var q4RowsGatherKernels: [Int: MLXFast.MLXFastKernel] = [:]
+func q4RowsGather(_ bufs: [MLXArray], start: [Int], count: [Int]) -> MLXArray {
+    let B = bufs.count, D = bufs[0].dim(2)
+    precondition(B >= 1 && B <= 16 && start.count == B && count.count == B)
+    var off = [0]
+    for b in 0 ..< B { off.append(off[b] + count[b]) }
+    let kernel: MLXFast.MLXFastKernel
+    if let kk = q4RowsGatherKernels[B] { kernel = kk } else {
+        kernel = MLXFast.metalKernel(name: "q4_rows_gather\(B)", inputNames: (0 ..< B).map { "p\($0)" } + ["params"],
+                                     outputNames: ["out"], source: q4RowsGatherSource(B))
+        q4RowsGatherKernels[B] = kernel
+    }
+    // params: [D, B] ++ start[B] ++ count[B] (unused by the body, kept for the layout) ++ off[B+1]
+    var p: [Int32] = [Int32(D), Int32(B)]
+    p += start.map { Int32($0) }; p += count.map { Int32($0) }; p += off.map { Int32($0) }
+    return kernel(bufs + [MLXArray(p)], template: [("T", bufs[0].dtype)],
+                  grid: (max(1, off[B]) * D, 1, 1), threadGroup: (256, 1, 1),
+                  outputShapes: [[max(1, off[B]), D]], outputDTypes: [bufs[0].dtype])[0]
+}
+
+// MARK: - T-0110: expert-run gather QMV ("read once, use for every row of the expert")
+/// The routed-expert projection of SORTED (row, expert) pairs, MLX's `affine_gather_qmv_fast` arithmetic for 8-bit
+/// weights: one threadgroup takes a RUN of up to R consecutive pairs with the same expert and applies each weight tile it
+/// loads to all of them. Every pair's output is computed by the stock body's exact sequence (load_vector, the per-row qdot
+/// in K order, simd_sum), so only how often the expert's bytes come from memory changes. Pairs that are not the start of a
+/// run (or of an R-chunk of one) exit at once. x [P, K] T, ids [P] uint32 (sorted), w [E, N, K/4] uint32, scales/biases
+/// [E, N, K/GS] T -> y [P, N] T.  grid (32, 2 * N/8, P), threadgroup (32, 2, 1).
+private let q4GatherQMVRunsKernel = MLXFast.metalKernel(
+    name: "q4_gather_qmv_runs", inputNames: ["w", "scales", "biases", "x", "ids", "dims"], outputNames: ["y"],
+    source: """
+        constexpr int packs_per_thread = 2;
+        constexpr int num_simdgroups = NSG;
+        constexpr int results_per_simdgroup = RPS;
+        constexpr int pack_factor = 4;
+        constexpr int bytes_per_pack = 4;
+        constexpr int values_per_thread = pack_factor * packs_per_thread;
+        constexpr int block_size = values_per_thread * 32;
+        constexpr int scale_step_per_thread = GS / values_per_thread;
+        typedef float U;
+        const int K = dims[0], N = dims[1], P = dims[2];
+        uint3 tid = threadgroup_position_in_grid;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint simd_lid = thread_index_in_simdgroup;
+        int z = int(tid.z);
+        uint e = ids[z];
+        int pos = 0;
+        while (pos < z && pos < 4096 && ids[z - pos - 1] == e) ++pos;
+        if (pos % R != 0) return;
+        int cnt = 1;
+        while (cnt < R && z + cnt < P && ids[z + cnt] == e) ++cnt;
+
+        const int in_vec_size_w = K * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = K / GS;
+        const int out_row = int(tid.y) * (num_simdgroups * results_per_simdgroup) + int(simd_gid) * results_per_simdgroup;
+        const device uint8_t* ws = (const device uint8_t*)w + (ulong)e * N * in_vec_size_w;
+        const device T* sc = scales + (ulong)e * N * in_vec_size_g;
+        const device T* bi = biases + (ulong)e * N * in_vec_size_g;
+        ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        sc += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        bi += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+        thread U x_thread[R][values_per_thread];
+        thread U result[R][results_per_simdgroup];
+        thread U sum[R];
+        for (int r = 0; r < R; ++r) for (int q = 0; q < results_per_simdgroup; ++q) result[r][q] = 0;
+        const device T* xr = x + (ulong)z * K + simd_lid * values_per_thread;
+
+        for (int k = 0; k < K; k += block_size) {
+            for (int r = 0; r < R; ++r) {
+                if (r < cnt) {
+                    const device T* xx = xr + (ulong)r * K + k;
+                    U s0 = 0;
+                    for (int i = 0; i < values_per_thread; i++) { s0 += xx[i]; x_thread[r][i] = xx[i]; }
+                    sum[r] = s0;
+                }
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                const device uint8_t* wl = ws + row * in_vec_size_w;
+                U s = sc[row * in_vec_size_g];
+                U b = bi[row * in_vec_size_g];
+                for (int r = 0; r < R; ++r) {
+                    if (r < cnt) {
+                        U accum = 0;
+                        for (int i = 0; i < values_per_thread; i++) { accum += x_thread[r][i] * wl[i]; }
+                        result[r][row] += s * accum + sum[r] * b;
+                    }
+                }
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            sc += block_size / GS;
+            bi += block_size / GS;
+        }
+        for (int r = 0; r < R; ++r) {
+            if (r < cnt) {
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    U v = simd_sum(result[r][row]);
+                    if (simd_lid == 0) { y[((ulong)(z + r)) * N + out_row + row] = static_cast<T>(v); }
+                }
+            }
+        }
+    """)
+/// The same runs for a reduction length that is not a multiple of 512 (E9's down projection, K = 640): MLX's
+/// `affine_gather_qmv` (qmv_impl, one pack per thread, 128-wide blocks, then the guarded remainder with load_vector_safe /
+/// qdot_safe), for N a multiple of 8 so the stock body's last-tile shift is a no-op. Same per-pair arithmetic as the stock call.
+private let q4GatherQMVRunsSlowKernel = MLXFast.metalKernel(
+    name: "q4_gather_qmv_runs_slow", inputNames: ["w", "scales", "biases", "x", "ids", "dims"], outputNames: ["y"],
+    source: """
+        constexpr int num_simdgroups = 2;
+        constexpr int results_per_simdgroup = 4;
+        constexpr int packs_per_thread = 1;
+        constexpr int pack_factor = 4;
+        constexpr int bytes_per_pack = 4;
+        constexpr int values_per_thread = pack_factor * packs_per_thread;
+        constexpr int block_size = values_per_thread * 32;
+        constexpr int scale_step_per_thread = GS / values_per_thread;
+        typedef float U;
+        const int K = dims[0], N = dims[1], P = dims[2];
+        uint3 tid = threadgroup_position_in_grid;
+        uint simd_gid = simdgroup_index_in_threadgroup;
+        uint simd_lid = thread_index_in_simdgroup;
+        int z = int(tid.z);
+        uint e = ids[z];
+        int pos = 0;
+        while (pos < z && pos < 4096 && ids[z - pos - 1] == e) ++pos;
+        if (pos % R != 0) return;
+        int cnt = 1;
+        while (cnt < R && z + cnt < P && ids[z + cnt] == e) ++cnt;
+
+        const int in_vec_size_w = K * bytes_per_pack / pack_factor;
+        const int in_vec_size_g = K / GS;
+        const int out_row = int(tid.y) * (num_simdgroups * results_per_simdgroup) + int(simd_gid) * results_per_simdgroup;
+        if (out_row >= N) return;
+        const device uint8_t* ws = (const device uint8_t*)w + (ulong)e * N * in_vec_size_w;
+        const device T* sc = scales + (ulong)e * N * in_vec_size_g;
+        const device T* bi = biases + (ulong)e * N * in_vec_size_g;
+        ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+        sc += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+        bi += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+        thread U x_thread[R][values_per_thread];
+        thread U result[R][results_per_simdgroup];
+        thread U sum[R];
+        for (int r = 0; r < R; ++r) for (int q = 0; q < results_per_simdgroup; ++q) result[r][q] = 0;
+        const device T* xr = x + (ulong)z * K + simd_lid * values_per_thread;
+
+        int k = 0;
+        for (; k < K - block_size; k += block_size) {
+            for (int r = 0; r < R; ++r) {
+                if (r < cnt) {
+                    const device T* xx = xr + (ulong)r * K + k;
+                    U s0 = 0;
+                    for (int i = 0; i < values_per_thread; i++) { s0 += xx[i]; x_thread[r][i] = xx[i]; }
+                    sum[r] = s0;
+                }
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                const device uint8_t* wl = ws + row * in_vec_size_w;
+                U s = sc[row * in_vec_size_g];
+                U b = bi[row * in_vec_size_g];
+                for (int r = 0; r < R; ++r) {
+                    if (r < cnt) {
+                        U accum = 0;
+                        for (int i = 0; i < values_per_thread; i++) { accum += x_thread[r][i] * wl[i]; }
+                        result[r][row] += s * accum + sum[r] * b;
+                    }
+                }
+            }
+            ws += block_size * bytes_per_pack / pack_factor;
+            sc += block_size / GS;
+            bi += block_size / GS;
+        }
+        const int remaining = clamp(int(K - k - int(simd_lid) * values_per_thread), 0, values_per_thread);
+        if (remaining > 0) {
+            for (int r = 0; r < R; ++r) {
+                if (r < cnt) {
+                    const device T* xx = xr + (ulong)r * K + k;
+                    U s0 = 0;
+                    for (int i = 0; i < remaining; i++) { s0 += xx[i]; x_thread[r][i] = xx[i]; }
+                    for (int i = remaining; i < values_per_thread; i++) { x_thread[r][i] = 0; }
+                    sum[r] = s0;
+                }
+            }
+            for (int row = 0; row < results_per_simdgroup; row++) {
+                const device uint8_t* wl = ws + row * in_vec_size_w;
+                U s = sc[row * in_vec_size_g];
+                U b = bi[row * in_vec_size_g];
+                for (int r = 0; r < R; ++r) {
+                    if (r < cnt) {
+                        U accum = 0;
+                        for (int i = 0; i < remaining; i++) { accum += x_thread[r][i] * wl[i]; }
+                        result[r][row] += s * accum + sum[r] * b;
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < R; ++r) {
+            if (r < cnt) {
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                    U v = simd_sum(result[r][row]);
+                    if (simd_lid == 0) { y[((ulong)(z + r)) * N + out_row + row] = static_cast<T>(v); }
+                }
+            }
+        }
+    """)
+/// ENGINE_MOE_RUNS_SLOW (default 0 -- measured bit-identical but SLOWER on E9 down: B12/16/32 135.07/159.44/297.76 -> 136.38/161.67/308.88 ms; 1 = runs, 0 = the stock gather for K not a multiple of 512, i.e. E9's down projection)
+let q4MoERunsSlow: Bool = (ProcessInfo.processInfo.environment["ENGINE_MOE_RUNS_SLOW"] ?? "0") != "0"
+public func q4GatherQMVRunsSlow(x: MLXArray, ids: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray, groupSize GS: Int, runs R: Int) -> MLXArray {
+    let P = x.dim(0), K = x.dim(1), N = w.dim(1)
+    precondition(w.dtype == .uint32 && w.dim(2) * 4 == K && N % 8 == 0 && K % GS == 0 && ids.size == P)
+    return q4GatherQMVRunsSlowKernel([w, scales, biases, x, ids, MLXArray([Int32(K), Int32(N), Int32(P)])],
+                                     template: [("T", x.dtype), ("GS", GS), ("R", R)],
+                                     grid: (32, 2 * (N / 8), P), threadGroup: (32, 2, 1),
+                                     outputShapes: [[P, N]], outputDTypes: [x.dtype])[0]
+}
+/// T-0110: ENGINE_MOE_RUNS=R (default 2 -- measured: R=2 cuts the B8/12/16/32 round 3.0/4.0/5.2/6.6% bit-identically, R=3/4/8 lose; 0 = SwitchGLU's stock sorted gather) -- see q4GatherQMVRunsKernel
+let q4MoERuns: Int = Int(ProcessInfo.processInfo.environment["ENGINE_MOE_RUNS"] ?? "2") ?? 2
+/// T-0110 layout knobs (any value computes every output with the same arithmetic): simdgroups per threadgroup and output
+/// rows per simdgroup. ENGINE_MOE_RUNS_NSG (default 2) / ENGINE_MOE_RUNS_RPS (default 4) = qmv_fast's own layout.
+public let q4MoERunsNSG: Int = Int(ProcessInfo.processInfo.environment["ENGINE_MOE_RUNS_NSG"] ?? "2") ?? 2
+public let q4MoERunsRPS: Int = Int(ProcessInfo.processInfo.environment["ENGINE_MOE_RUNS_RPS"] ?? "4") ?? 4
+public func q4GatherQMVRuns(x: MLXArray, ids: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray, groupSize GS: Int, runs R: Int,
+                            nsg: Int = q4MoERunsNSG, rps: Int = q4MoERunsRPS) -> MLXArray {
+    let P = x.dim(0), K = x.dim(1), N = w.dim(1)
+    precondition(w.dtype == .uint32 && w.dim(2) * 4 == K && N % (nsg * rps) == 0 && K % 512 == 0 && ids.size == P)
+    return q4GatherQMVRunsKernel([w, scales, biases, x, ids, MLXArray([Int32(K), Int32(N), Int32(P)])],
+                                 template: [("T", x.dtype), ("GS", GS), ("R", R), ("NSG", nsg), ("RPS", rps)],
+                                 grid: (32, nsg * (N / (nsg * rps)), P), threadGroup: (32, nsg, 1),
+                                 outputShapes: [[P, N]], outputDTypes: [x.dtype])[0]
+}
+
+/// T-0110: install the expert-run gather for the SORTED SwitchGLU path (8-bit g64 banks, decode-sized pair counts only:
+/// at prefill widths the stock work-table GEMM keeps the call). x [P, 1, K] -> [P, 1, N].
+func q4InstallMoERuns() {
+    guard q4MoERuns > 0 else { return }
+    let maxPairs = Int(ProcessInfo.processInfo.environment["ENGINE_MOE_RUNS_MAX_PAIRS"] ?? "2047") ?? 2047
+    QuantizedSwitchLinear.sortedGatherOverride = { x, w, s, b, idx, gs, bits in
+        guard bits == 8, gs == 64, let b, x.dtype == .bfloat16, w.ndim == 3, x.ndim >= 2, x.dim(-2) == 1,
+              idx.size == x.size / x.dim(-1), idx.size <= maxPairs,
+              w.dim(1) % (q4MoERunsNSG * q4MoERunsRPS) == 0, w.dim(1) % 8 == 0 else { return nil }
+        let P = idx.size, K = x.dim(-1)
+        if K % 512 != 0 {
+            guard q4MoERunsSlow, K % gs == 0 else { return nil }
+            let y = q4GatherQMVRunsSlow(x: x.reshaped(P, K), ids: idx.asType(.uint32), w: w, scales: s, biases: b, groupSize: gs, runs: q4MoERuns)
+            return y.reshaped(x.shape.dropLast() + [w.dim(1)])
+        }
+        let y = q4GatherQMVRuns(x: x.reshaped(P, K), ids: idx.asType(.uint32), w: w, scales: s, biases: b, groupSize: gs, runs: q4MoERuns)
+        return y.reshaped(x.shape.dropLast() + [w.dim(1)])
+    }
+}
+
+// MARK: - T-0151 (operator, 2026-10-30): vLLM-style K+1 state slots, a lab probe
+/// The verify forward's recurrence (mlx-swift-lm gated_delta_step, same per-thread arithmetic, simd_sum and step order,
+/// no mask) that ALSO writes the state after every position: slots[b, t] = state after t + 1 steps. The starting state of
+/// row b is slot src_idx[b] of state_src [B, Tp, Hv, Dv, Dk] (a plain [B, Hv, Dv, Dk] state is Tp = 1, index 0), so the
+/// next round starts from slot keep[b] - 1 and no roll-back runs. ENGINE_GDN_SLOTS=1 (batchprobe batched rounds only).
+private let q4GDNFwdSlotsKernel = MLXFast.metalKernel(
+    name: "q4_gdn_fwd_slots",
+    inputNames: ["q", "k", "v", "g", "beta", "state_src", "src_idx", "T", "Tp"],
+    outputNames: ["y", "slots"],
+    source: """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+        auto i_state = state_src + (((b_idx * Tp + src_idx[b_idx]) * Hv + hv_idx) * Dv + dv_idx) * Dk;
+        auto o_slot = slots + (((b_idx * T) * Hv + hv_idx) * Dv + dv_idx) * Dk;
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+          auto s_idx = n_per_t * dk_idx + i;
+          state[i] = static_cast<float>(i_state[s_idx]);
+        }
+        for (int t = 0; t < T; ++t) {
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_[hv_idx];
+            kv_mem += state[i] * k_[s_idx];
+          }
+          kv_mem = simd_sum(kv_mem);
+          auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + k_[s_idx] * delta;
+            out += state[i] * q_[s_idx];
+          }
+          out = simd_sum(out);
+          if (thread_index_in_simdgroup == 0) {
+            y[dv_idx] = static_cast<InT>(out);
+          }
+          for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_slot[s_idx] = static_cast<StT>(state[i]);
+          }
+          q_ += Hk * Dk; k_ += Hk * Dk; v_ += Hv * Dv; y += Hv * Dv; g_ += Hv; beta_ += Hv;
+          o_slot += Hv * Dv * Dk;
+        }
+    """)
+let q4GDNSlots: Bool = ProcessInfo.processInfo.environment["ENGINE_GDN_SLOTS"] == "1"
+
+/// (y [B, T, Hv, Dv], slots [B, T, Hv, Dv, Dk]) from a starting state that is either plain [B, Hv, Dv, Dk] or slot
+/// `srcIdx[b]` of a previous round's slots [B, Tp, Hv, Dv, Dk].
+func q4GDNForwardSlots(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, stateSrc: MLXArray,
+                       srcIdx: MLXArray) -> (MLXArray, MLXArray) {
+    let B = k.dim(0), T = k.dim(1), Hk = k.dim(2), Dk = k.dim(3), Hv = v.dim(2), Dv = v.dim(3)
+    precondition(stateSrc.dtype == .float32 && (stateSrc.ndim == 4 || stateSrc.ndim == 5) && srcIdx.dtype == .int32)
+    let Tp = stateSrc.ndim == 5 ? stateSrc.dim(1) : 1
+    let o = q4GDNFwdSlotsKernel(
+        [q, k, v, g, beta, stateSrc, srcIdx, MLXArray(T), MLXArray(Tp)],
+        template: [("InT", q.dtype), ("StT", stateSrc.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+        grid: (32, Dv, B * Hv), threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], [B, T, Hv, Dv, Dk]], outputDTypes: [q.dtype, stateSrc.dtype])
+    return (o[0], o[1])
 }

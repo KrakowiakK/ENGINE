@@ -736,7 +736,7 @@ void CommandEncoder::barrier() {
   get_command_encoder()->memoryBarrier(MTL::BarrierScopeBuffers);
 }
 
-void CommandEncoder::end_encoding() {
+void CommandEncoder::end_encoding(bool wait_in_flight) {
   // Each command encoder has a unique fence. We also store a map of
   // all previous outputs of command encoders to their corresponding fence.
   // - The command encoder records its inputs and outputs.
@@ -770,6 +770,14 @@ void CommandEncoder::end_encoding() {
         if (waiting_on.find(it->second) == waiting_on.end()) {
           encoder_->waitForFence(it->second.get());
           waiting_on.insert(it->second);
+        }
+      }
+    }
+    // upstream #4689: a spin wait (fence_wait) must start after every earlier encoder, as it may block them
+    if (wait_in_flight) {
+      for (auto& [_, fence] : prev_ce_outputs_) {
+        if (waiting_on.insert(fence).second) {
+          encoder_->waitForFence(fence.get());
         }
       }
     }

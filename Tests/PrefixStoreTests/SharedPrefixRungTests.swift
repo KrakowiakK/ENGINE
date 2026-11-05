@@ -616,3 +616,44 @@ final class SharedPrefixRungTests: XCTestCase {
         XCTAssertEqual(e(0, 5000, 4096, 1, 1024), 1024)            // H25 canonical target (diagnostic)
     }
 }
+
+/// T-0097: a rung below 1024 (the WIDE admission on a plain model, client heads of 192-319 tokens): the schedule cuts a
+/// cold 770-token prompt's first chunk at 191, captures there, and a resumed prompt continues with chunkEnd's schedule.
+final class SharedPrefixShortRungTests: XCTestCase {
+    func testA191RungCutsTheFirstChunkAndCapturesThere() {
+        let margin = PrefillChunkPlan.sharedPrefixMargin
+        XCTAssertTrue(PrefillChunkPlan.sharedSplitEligible(promptCount: 770, rung: 191, margin: margin))
+        XCTAssertFalse(PrefillChunkPlan.sharedSplitEligible(promptCount: 446, rung: 191, margin: margin))
+        let first = PrefillChunkPlan.withSharedSplit(from: 0, end: 769, promptCount: 770, rung: 191, margin: margin)
+        XCTAssertEqual(first.end, 191); XCTAssertTrue(first.split)
+        XCTAssertTrue(PrefillChunkPlan.capturesSharedRung(from: 0, to: 191, promptCount: 770, rung: 191, margin: margin))
+        // after the rung: chunkEnd's own end (8192-wide, 512 rung alignment, one-token hot reserve) -> 769, then 770
+        let next = PrefillChunkPlan.end(from: 191, width: 8192, rungAlign: 512, promptCount: 770, qsaBudgetCut: 0,
+                                        canonicalTarget: nil, hotReserve: 1)
+        XCTAssertEqual(next, 769)
+        XCTAssertEqual(PrefillChunkPlan.withSharedSplit(from: 191, end: next, promptCount: 770, rung: 191, margin: margin).end, 769)
+        XCTAssertFalse(PrefillChunkPlan.capturesSharedRung(from: 191, to: 769, promptCount: 770, rung: 191, margin: margin))
+    }
+
+    /// T-0156: the same 191 rung on E9's docs geometry (ENGINE_SHARED_PREFIX_RUNG_SHORT: QSA budget cut 2048, 4096-wide
+    /// chunks, merge tail 4096, no hot reserve): a client-sized 1469-token prompt is [0,191) + [191,1469) cold and one
+    /// [191,1469) chunk resumed; a 3000-token prompt resumed finishes in one merged chunk; past the budget the schedule is
+    /// the cold one (2048, then width multiples).
+    func testA191RungOnTheIndexedDocsGeometry() {
+        let margin = PrefillChunkPlan.sharedPrefixMargin
+        let e = { (from: Int, n: Int) in
+            PrefillChunkPlan.end(from: from, width: 4096, rungAlign: 1, promptCount: n, qsaBudgetCut: 2048,
+                                 canonicalTarget: nil, hotReserve: 0, mergeTail: 4096)
+        }
+        let cold = PrefillChunkPlan.withSharedSplit(from: 0, end: e(0, 1469), promptCount: 1469, rung: 191, margin: margin)
+        XCTAssertEqual(cold.end, 191); XCTAssertTrue(cold.split)
+        XCTAssertTrue(PrefillChunkPlan.capturesSharedRung(from: 0, to: 191, promptCount: 1469, rung: 191, margin: margin))
+        XCTAssertEqual(e(191, 1469), 1469)
+        XCTAssertEqual(PrefillChunkPlan.withSharedSplit(from: 191, end: e(191, 1469), promptCount: 1469, rung: 191, margin: margin).end, 1469)
+        XCTAssertEqual(e(191, 3000), 3000)                       // merged across the budget (T-0111)
+        XCTAssertEqual(e(191, 9000), 2048)                       // longer: the budget cut, then the cold schedule
+        XCTAssertEqual(e(2048, 9000), 4096)
+        // too short for the split (rung + margin = 447): the first chunk is the whole prompt, no capture
+        XCTAssertFalse(PrefillChunkPlan.withSharedSplit(from: 0, end: e(0, 446), promptCount: 446, rung: 191, margin: margin).split)
+    }
+}

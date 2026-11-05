@@ -44,3 +44,34 @@ public final class DecisionWitness: @unchecked Sendable {
     public func record(_ key: String) { lock.lock(); counts[key, default: 0] += 1; lock.unlock() }
     public func snapshot() -> [String: Int] { lock.lock(); defer { lock.unlock() }; return counts }
 }
+
+/// T-0294 (Q-0001, operator 2026-11-05 C-0794): programming requests get reasoning effort `low` by default. A request is
+/// "programming" when it carries tool definitions (agentic coding sessions), contains a fenced code block, or has at least
+/// three lines that read as source code. Deliberately conservative: prose -- including OCR-corrected Polish text, where
+/// "import" is an ordinary word -- must not trip it; a request's own reasoning_effort always wins over any default.
+public enum ProgrammingRequestDetector {
+    /// each an anchored pattern for one kind of source line (a list, not one alternation: ICU rejected the combined form)
+    static let keywordLines: [NSRegularExpression] = [
+        #"^\s*def\s+\w+\s*\("#, #"^\s*class\s+\w+[\s:\(\{<]"#, #"^\s*import\s+[\w.]+\s*$"#, #"^\s*from\s+[\w.]+\s+import\s"#,
+        #"^\s*func\s+\w+\s*[\(<]"#, #"^\s*fn\s+\w+\s*[\(<]"#, #"^\s*(let|var|const)\s+\w+\s*[:=]"#, #"^\s*function\s+\w*\s*\("#,
+        #"^\s*return\s+\S.*;\s*$"#, #"^\s*#include\s*[<\"]"#, #"^\s*package\s+[\w.]+\s*;?\s*$"#,
+        #"^\s*(public|private|protected|static)\s+[\w<>\[\]]+\s+\w+\s*[\(=;]"#, #"^\s*(struct|enum|interface)\s+\w+\s*[\{<:]"#,
+        #"^\s*(if|for|while|switch)\s*\(.*\)\s*\{\s*$"#,
+    ].map { try! NSRegularExpression(pattern: $0) }
+    static let endsLikeCode = try! NSRegularExpression(pattern: #"(\{|\};?|\);|=>\s*\{?)\s*$"#)
+    public static func isProgramming(texts: [String], hasTools: Bool) -> Bool {
+        if hasTools { return true }
+        var codeLines = 0
+        for t in texts {
+            if t.contains("```") { return true }
+            for line in t.split(separator: "\n", omittingEmptySubsequences: true) {
+                let s = String(line); let r = NSRange(s.startIndex..., in: s)
+                if keywordLines.contains(where: { $0.firstMatch(in: s, range: r) != nil }) || endsLikeCode.firstMatch(in: s, range: r) != nil {
+                    codeLines += 1
+                    if codeLines >= 3 { return true }
+                }
+            }
+        }
+        return false
+    }
+}

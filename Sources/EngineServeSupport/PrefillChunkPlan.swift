@@ -6,7 +6,14 @@
 public enum PrefillChunkPlan {
     /// The end of the chunk that starts at `from`. `canonicalTarget` is nil unless the H25 canonical mode caps chunks.
     public static func end(from: Int, width: Int, rungAlign: Int, promptCount: Int, qsaBudgetCut: Int,
-                           canonicalTarget: Int?, hotReserve: Int) -> Int {
+                           canonicalTarget: Int?, hotReserve: Int, mergeTail: Int = 0) -> Int {
+        // T-0111: a prompt whose remainder from `from` is at most `mergeTail` tokens is finished in ONE chunk, even across
+        // the QSA budget (the rows below it attend sparse over all their blocks -- the dense result, another kernel).
+        if mergeTail > 0, qsaBudgetCut > 0, from < qsaBudgetCut, promptCount > qsaBudgetCut, promptCount - from <= mergeTail,
+           canonicalTarget == nil {
+            if hotReserve > 0, from < promptCount - hotReserve { return promptCount - hotReserve }
+            return promptCount
+        }
         // H57: a chunk ends on a multiple of its own width (after the budget cut at 2048 a 4096 schedule runs
         // 2048, 4096, 8192, 12288, ...), so the prefix-step rungs (every 8192) and the H54 anchors are still captured.
         let w = max(1, width)

@@ -37,6 +37,16 @@ import CoreImage
 
 installCrashTrace()
 
+/// T-0076: a plain Qwen3.5-MoE checkpoint (model_type qwen3_5_moe, e.g. Qwen3.5-397B-A17B) runs on ENGINE's own Qwen4Exp
+/// port in its plain mode -- MTP K, batched serving, image input. ENGINE_GENERIC_QWEN35=1 keeps the vendored mlx-swift-lm
+/// model instead (the parity reference).
+func registerPlainQwen35() async {
+    guard ProcessInfo.processInfo.environment["ENGINE_GENERIC_QWEN35"] != "1" else { return }
+    await LLMTypeRegistry.shared.registerModelType("qwen3_5_moe") { data in
+        Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
+    }
+}
+
 struct Options {
     var verb = ""
     var values: [String: String] = [:]
@@ -450,6 +460,7 @@ func bench(_ o: Options) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     applyWiredLimit()
     let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
     eval(context.model)
@@ -633,6 +644,7 @@ func logitsDump(_ o: Options) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     let l0 = Date()
     applyWiredLimit()
     let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
@@ -671,8 +683,12 @@ func logitsDump(_ o: Options) async throws {
 /// 309 GB bf16 model. Output: `<out>` = float32[S-1] NLL, `<out>.argmax` = int32[S-1] argmax ids.
 func nllDump(_ o: Options) async throws {
     setenv("ENGINE_FULL_LOGITS", "1", 1)
-    guard let modelPath = o.values["--model"], let idsPath = o.values["--ids"], let outPath = o.values["--out"] else {
-        throw EngineError.invalid("nll requires --model DIR --ids FILE.json --out FILE")
+    // T-0247 (greedy fidelity): --list FILE scores many sequences in one model load; each line "<ids.json> <out>" writes
+    // <out> = float32 NLL of each next id, <out>.top = float32 NLL of the argmax (gap = nll - top), <out>.argmax = int32
+    let listPath = o.values["--list"]
+    guard let modelPath = o.values["--model"],
+          let idsPath = o.values["--ids"] ?? (listPath != nil ? "" : nil), let outPath = o.values["--out"] ?? (listPath != nil ? "" : nil) else {
+        throw EngineError.invalid("nll requires --model DIR (--ids FILE.json --out FILE | --list FILE)")
     }
     let chunk = try o.int("--chunk", 1024)
     let tailSerial = try o.int("--tail-serial", 0)   // P070: feed the last N ids one at a time (the S == 1 decode path)
@@ -682,24 +698,83 @@ func nllDump(_ o: Options) async throws {
     // attention arm can be scored on decisiveness in one teacher-forced pass instead of a 6-minute sample.
     let trackId = try o.int("--track-id", -1)
     let dir = URL(fileURLWithPath: modelPath).resolvingSymlinksInPath()
-    let ids = try JSONDecoder().decode([Int].self, from: Data(contentsOf: URL(fileURLWithPath: idsPath)))
+    let ids = listPath != nil ? [] : try JSONDecoder().decode([Int].self, from: Data(contentsOf: URL(fileURLWithPath: idsPath)))
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     applyWiredLimit()
     let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
     eval(context.model)
     if let m = context.model as? Qwen4ExpModel { FileHandle.standardError.write((m.fusionWitness() + "\n").data(using: .utf8)!) }
     let model = context.model
+    if let listPath {
+        let lines = try String(contentsOfFile: listPath, encoding: .utf8).split(separator: "\n").map { $0.split(separator: " ").map(String.init) }
+        for ln in lines where ln.count == 2 {
+            let seq = try JSONDecoder().decode([Int].self, from: Data(contentsOf: URL(fileURLWithPath: ln[0])))
+            let c = model.newCache(parameters: nil)
+            var nl: [Float] = [], tp: [Float] = [], ax: [Int32] = []
+            var j = 0
+            while j < seq.count {
+                let hi = min(j + chunk, seq.count)
+                let l = model(MLXArray(seq[j ..< hi].map { Int32($0) })[.newAxis], cache: c)[0].asType(.float32)
+                let n = hi - j - (hi == seq.count ? 1 : 0)
+                if n > 0 {
+                    let lp = l[0 ..< n, 0...]
+                    let lse = logSumExp(lp, axis: -1)
+                    let tgt = MLXArray(seq[(j + 1) ... (j + n)].map { Int32($0) })
+                    let d = lse - takeAlong(lp, tgt[0..., .newAxis], axis: -1).squeezed(axis: -1)
+                    let t = lse - lp.max(axis: -1)
+                    let a = lp.argMax(axis: -1).asType(.int32)
+                    eval(d, t, a)
+                    nl += d.asArray(Float.self); tp += t.asArray(Float.self); ax += a.asArray(Int32.self)
+                } else { eval(l) }
+                j = hi
+            }
+            try Data(bytes: nl, count: nl.count * 4).write(to: URL(fileURLWithPath: ln[1]))
+            try Data(bytes: tp, count: tp.count * 4).write(to: URL(fileURLWithPath: ln[1] + ".top"))
+            try Data(bytes: ax, count: ax.count * 4).write(to: URL(fileURLWithPath: ln[1] + ".argmax"))
+            FileHandle.standardError.write("engine nll: \(ln[1]) \(nl.count) positions\n".data(using: .utf8)!)
+        }
+        return
+    }
     let cache = model.newCache(parameters: nil)
+    // T-0158: --capture-layers 5,15 --capture-out PREFIX appends each listed layer's hc-mean output (float16, rows x
+    // hidden) to PREFIX.L<i>.f16, one row per id, for an offline DFlash drafter replay
+    let captureLayers: [Int] = (o.values["--capture-layers"] ?? "").split(separator: ",").compactMap { Int($0) }
+    let captureOut = o.values["--capture-out"]
+    var captureHandles: [Int: FileHandle] = [:]
+    if !captureLayers.isEmpty, let captureOut {
+        Qwen4ExpModelInner.captureLayers = Set(captureLayers)
+        for l in captureLayers {
+            let path = "\(captureOut).L\(l).f16"
+            FileManager.default.createFile(atPath: path, contents: nil)
+            captureHandles[l] = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+        }
+    }
     var nll: [Float] = [], am: [Int32] = []
+    let timeFrom = try o.int("--time-from", -1)
+    var fwdMs: [Double] = []
+    var buildMs: [Double] = []
     var trackLp: [Float] = [], trackRank: [Int32] = []
     let t0 = Date()
     var i = 0
     while i < ids.count {
         let hi = i >= ids.count - tailSerial ? i + 1 : min(i + chunk, max(i + 1, ids.count - tailSerial))
         let x = MLXArray(ids[i ..< hi].map { Int32($0) })[.newAxis]
+        let tf0 = Date()
         let l = model(x, cache: cache)[0].asType(.float32)        // (rows, V)
+        if timeFrom >= 0 {   // T-0163: serial S-row forward cost (a fully accepted verify block), timed past --time-from ids
+            let tfb = Date()                                       // T-0173: graph built (host); eval = encode + GPU
+            eval(l)
+            if i >= timeFrom && hi - i == chunk { fwdMs.append(Date().timeIntervalSince(tf0) * 1e3); buildMs.append(tfb.timeIntervalSince(tf0) * 1e3) }
+        }
+        for (layer, fh) in captureHandles {
+            guard let c = Qwen4ExpModelInner.captured[layer] else { throw EngineError.invalid("capture: layer \(layer) not captured") }
+            let a = c[0].asType(.float16)
+            eval(a)
+            fh.write(a.asData(access: .copy).data)
+        }
         // targets for rows i..<hi are ids[i+1...hi]; the LAST row of the LAST chunk has no target
         let n = hi - i - (hi == ids.count ? 1 : 0)
         if n > 0 {
@@ -724,6 +799,13 @@ func nllDump(_ o: Options) async throws {
         i = hi
     }
     try Data(bytes: nll, count: nll.count * 4).write(to: URL(fileURLWithPath: outPath))
+    for fh in captureHandles.values { try fh.close() }
+    if timeFrom >= 0, !fwdMs.isEmpty {
+        let srt = fwdMs.sorted()
+        let bs = buildMs.sorted()
+        FileHandle.standardError.write(String(format: "engine nll: timed %d forwards of %d rows: median %.2f ms, p10 %.2f, p90 %.2f; host graph build median %.3f ms, mean forward %.3f ms\n",
+            srt.count, chunk, srt[srt.count / 2], srt[srt.count / 10], srt[srt.count * 9 / 10], bs[bs.count / 2], fwdMs.reduce(0, +) / Double(fwdMs.count)).data(using: .utf8)!)
+    }
     if trackId >= 0 {
         try Data(bytes: trackLp, count: trackLp.count * 4).write(to: URL(fileURLWithPath: outPath + ".track\(trackId).lp"))
         try Data(bytes: trackRank, count: trackRank.count * 4).write(to: URL(fileURLWithPath: outPath + ".track\(trackId).rank"))
@@ -847,6 +929,7 @@ func generateWithImage(_ o: Options, imagePath: String) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     // P039 unit 2: size the image BEFORE the weights. P037's guard sat AFTER `load` AND after the whole
     // vision tower had run -- its comment claimed "before 195 GB of weights get touched" and that was
     // simply false. An over-large image therefore died inside the tower with the model resident, which
@@ -1093,6 +1176,7 @@ func visionDump(_ o: Options) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     applyWiredLimit()
     let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
     guard let m = context.model as? Qwen4ExpModel, m.hasVision else { throw EngineError.invalid("vision-dump: no vision tower") }
@@ -1166,6 +1250,7 @@ func generateWithChatFile(_ o: Options, chatFilePath: String) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     let turns = try JSONDecoder().decode(
         [ChatFileTurn].self, from: Data(contentsOf: URL(fileURLWithPath: chatFilePath)))
     guard !turns.isEmpty else { throw EngineError.invalid("--chat-file: no turns in \(chatFilePath)") }
@@ -1414,6 +1499,7 @@ func generateText(_ o: Options) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     applyWiredLimit()
     let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
     eval(context.model)
@@ -1449,8 +1535,14 @@ func generateText(_ o: Options) async throws {
         if let eff, !["xhigh", "medium", "low"].contains(eff) {
             throw EngineError.invalid("--reasoning-effort must be xhigh, medium or low")
         }
+        // T-0158: --messages-file FILE.json ([{"role","content"}], e.g. a multi-turn suite prompt) instead of --prompt
+        var messages: [[String: any Sendable]] = [["role": "user", "content": promptText]]
+        if let mf = o.values["--messages-file"] {
+            let raw = try JSONDecoder().decode([[String: String]].self, from: Data(contentsOf: URL(fileURLWithPath: mf)))
+            messages = raw.map { $0.mapValues { $0 as any Sendable } }
+        }
         ids = try context.tokenizer.applyChatTemplate(
-            messages: [["role": "user", "content": promptText]], tools: nil,
+            messages: messages, tools: nil,
             additionalContext: eff.map { ["reasoning_effort": $0 as any Sendable] })
     } else {
         ids = context.tokenizer.encode(text: promptText, addSpecialTokens: false)
@@ -1482,6 +1574,28 @@ func generateText(_ o: Options) async throws {
         stateCache = StateCacheConfig(dir: dir, identity: try StateCache.identity(dir: dir_model, witness: witness), step: step, writeExact: exact).indexed(for: ids)
         FileHandle.standardError.write("engine generate: state cache \(dir.path) step \(step) exact-entry \(exact ? "on" : "off")\n".data(using: .utf8)!)
     }
+    if let dfDir = o.values["--dflash"], let m = context.model as? Qwen4ExpModel {
+        // T-0163: DFlash2 block drafter with a confidence-gated verify length on the serial path (DFlash2.swift)
+        let drafter = try DFlash2Drafter(dir: dfDir)
+        let L = try o.int("--dflash-block", 8)
+        let tau = Float(o.values["--dflash-tau"] ?? "0.35") ?? 0.35
+        let g0 = Date()
+        var ttft = 0.0
+        let (toks, st) = dflashGenerate(model: m, drafter: drafter, prompt: ids, maxTokens: maxTokens, block: L, tau: tau,
+                                        onPrefill: { ttft = Date().timeIntervalSince(g0) })
+        let total = Date().timeIntervalSince(g0)
+        print(context.tokenizer.decode(tokenIds: toks))
+        FileHandle.standardError.write(String(format: "\nengine generate[dflash L=%d tau=%.2f]: ttft %.2f s, decode %.2f tok/s over %d tokens; rounds %d, accepted %d/%d drafts (%.2f), %.2f tokens/round, mean verify %.2f positions\n",
+            L, tau, ttft, Double(toks.count) / (total - ttft), toks.count, st.rounds, st.accepted, st.drafted, Double(st.accepted) / Double(max(1, st.drafted)),
+            Double(st.committed) / Double(max(1, st.rounds)), Double(st.drafted + st.rounds) / Double(max(1, st.rounds))).data(using: .utf8)!)
+        FileHandle.standardError.write("  verify-length histogram (drafts): \(st.kHistogram.sorted { $0.key < $1.key }.map { "m\($0.key)=\($0.value)" }.joined(separator: " "))\n".data(using: .utf8)!)
+        if let f = o.values["--ids-out"] {
+            try JSONEncoder().encode(ids + toks).write(to: URL(fileURLWithPath: f))
+            try JSONEncoder().encode(["prompt": ids.count, "generated": toks.count, "rounds": st.rounds, "drafted": st.drafted,
+                                      "accepted": st.accepted, "committed": st.committed]).write(to: URL(fileURLWithPath: f + ".stats"))
+        }
+        return
+    }
     if let kStr = o.values["--mtp"], let K = Int(kStr), K >= 1, let m = context.model as? Qwen4ExpModel {
         let g0 = Date()
         var ttft = 0.0
@@ -1500,6 +1614,11 @@ func generateText(_ o: Options) async throws {
             FileHandle.standardError.write("  verify rows \(tot) by top-2 margin: <0.01 logit \(under(10)) \(pct(under(10))), <0.05 \(under(50)) \(pct(under(50))), <0.1 \(under(100)) \(pct(under(100))), <0.5 \(under(500)) \(pct(under(500))), <1.0 \(under(1000)) \(pct(under(1000)))\n".data(using: .utf8)!)
         }
         print("TOKENS:", toks.prefix(24).map(String.init).joined(separator: ","))
+        if let f = o.values["--ids-out"] {   // T-0158: prompt + generated ids, the trajectory for `engine nll --ids`
+            try JSONEncoder().encode(ids + toks).write(to: URL(fileURLWithPath: f))
+            try JSONEncoder().encode(["prompt": ids.count, "generated": toks.count, "rounds": st.rounds, "drafted": st.drafted,
+                                      "accepted": st.accepted, "committed": st.committed]).write(to: URL(fileURLWithPath: f + ".stats"))
+        }
         return
     }
     let model = context.model
@@ -2373,6 +2492,7 @@ func batchProbe(_ o: Options) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+    await registerPlainQwen35()
     applyWiredLimit()
     let context = try await LLMModelFactory.shared.load(from: dir, using: #huggingFaceTokenizerLoader())
     eval(context.model)
@@ -2696,7 +2816,9 @@ func batchProbe(_ o: Options) async throws {
         precondition(lens.count == B, "--ragged-lengths must list one length per row")
         precondition(all.count > lens.max()! + 8, "corpus too short")
         var ref: [[Int]] = []
-        for r in 0 ..< B {
+        // T-0109: --no-solo skips the lone-request reference (timing and the stage profile only)
+        let noSolo = o.values["--no-solo"] != nil
+        for r in 0 ..< B where !noSolo {
             let (toks, st) = speculativeGenerate(model: qm, prompt: Array(all[0 ..< lens[r]]), maxTokens: steps + KB + 1, depth: KB)
             ref.append(toks)
             FileHandle.standardError.write("  solo row \(r) len \(lens[r]): \(toks.prefix(8)) acceptance \(String(format: "%.2f", Double(st.accepted) / Double(max(1, st.drafted))))\n".data(using: .utf8)!)
@@ -2707,14 +2829,24 @@ func batchProbe(_ o: Options) async throws {
             let (n0, sp) = primeRowSpec(qm, ids: Array(all[0 ..< lens[r]]), cache: cache, chunk: max(1, prefillStep))
             caches.append(cache); specs.append(sp); pending.append(n0)
         }
-        let batched = qm.stackCaches(caches); qm.resetRaggedState()
+        // T-0109: ENGINE_ROW_RESIDENT_KV=1 stacks the rows as the server does (row-resident pool); default the stacked pool
+        let rowResident = ProcessInfo.processInfo.environment["ENGINE_ROW_RESIDENT_KV"] == "1"
+        let batched = rowResident ? qm.stackCachesRowResident(caches) : qm.stackCaches(caches); qm.resetRaggedState()
         let pool = stackSpecPool(qm, specs)
+        let warmRounds = try o.int("--warm-rounds", 0)   // rounds run before the clock and the profile start
         var lengths = lens
         var got: [[Int]] = (0 ..< B).map { [pending[$0]] }
         var rounds = 0, drafted = 0, accepted = 0
         let rowsIn = (0 ..< B).map { _ in BatchRoundRow() }
-        let t0 = Date()
+        var t0 = Date()
+        var warmed = warmRounds == 0
         while got.map({ $0.count }).min()! < steps + 1 {
+            if !warmed && rounds == warmRounds {
+                warmed = true
+                t0 = Date(); Q4Prof.reset()
+                for b in 0 ..< B { got[b] = [got[b].last!] }
+                rounds = 0; drafted = 0; accepted = 0
+            }
             let out = runBatchedMTPRound(qm, caches: batched, spec: pool, pending: pending, lengths: lengths, K: KB, rows: rowsIn)
             for b in 0 ..< B {
                 got[b] += out[b].tokens
@@ -2725,8 +2857,14 @@ func batchProbe(_ o: Options) async throws {
             rounds += 1
         }
         let secs = Date().timeIntervalSince(t0)
+        Q4Prof.report()
+        // T-0110: --tokens-out FILE writes every row's committed stream (A/B identity of two arms of the same rounds)
+        if let tf = o.values["--tokens-out"] {
+            let body = "[" + got.map { "[" + $0.map(String.init).joined(separator: ",") + "]" }.joined(separator: ",\n") + "]\n"
+            try body.write(toFile: tf, atomically: true, encoding: .utf8)
+        }
         var identical = 0
-        for b in 0 ..< B {
+        for b in 0 ..< B where !noSolo {
             let n = min(steps, got[b].count, ref[b].count)
             if Array(got[b].prefix(n)) == Array(ref[b].prefix(n)) { identical += 1 }
             else {
@@ -2735,11 +2873,35 @@ func batchProbe(_ o: Options) async throws {
             }
         }
         let committed = got.reduce(0) { $0 + $1.count - 1 }
+        if q4GDNSlotsEnv { FileHandle.standardError.write("gdn slot forwards \(Qwen4ExpModel.gdnSlotForwards)\n".data(using: .utf8)!) }
+        if rollbackTimingMode != nil, !rollbackTimingWallMs.isEmpty {   // T-0151: the warm rounds are excluded
+            let n = min(rounds, rollbackTimingWallMs.count)
+            func mean(_ a: [Double]) -> Double { a.suffix(n).reduce(0, +) / Double(n) }
+            func medianOf(_ a: [Double]) -> Double { let s = a.suffix(n).sorted(); return s[s.count / 2] }
+            print(String(format: "{\"rollback_timing\": \"%@\", \"rounds\": %d, \"build_ms_mean\": %.3f, \"wall_ms_mean\": %.3f, \"wall_ms_median\": %.3f, \"partial_rows_mean\": %.2f}",
+                         rollbackTimingMode!, n, mean(rollbackTimingBuildMs), mean(rollbackTimingWallMs), medianOf(rollbackTimingWallMs),
+                         Double(rollbackTimingPartialRows.suffix(n).reduce(0, +)) / Double(n)))
+        }
         print(String(format: "{\"batched_mtp\": %d, \"batch\": %d, \"lengths\": %@, \"rounds\": %d, \"ms_per_round\": %.2f, \"acceptance\": %.3f, \"tokens_per_round\": %.2f, \"rows_identical_to_solo\": %d, \"decode_tps_total\": %.2f}",
             KB, B, String(describing: lens), rounds, secs / Double(rounds) * 1e3, Double(accepted) / Double(max(1, drafted)), Double(committed) / Double(max(1, rounds)), identical, Double(committed) / secs))
         return
     }
     if o.values["--ragged"] != nil, let vrs = o.values["--verify-rows"], let VS = Int(vrs), VS > 1 {
+        // T-0142 (D-0043): the mixed prefill+verify step against the two separate calls (MixedProbe.swift)
+        if o.values["--depths"] != nil {   // T-0152: packed per-row-depth verify block (MixedProbe.swift)
+            try t0152PackedDepthProbe(o, model: model, corpus: all, batch: B, promptTokens: promptTokens,
+                                      prefillStep: prefillStep, verifyRows: VS)
+            return
+        }
+        if o.values["--mixed-chunk"] != nil, o.values["--serial-verify"] == "1" {
+            try t0148SerialMixedProbe(o, model: model, corpus: all, promptTokens: promptTokens, prefillStep: prefillStep, verifyRows: VS)
+            return
+        }
+        if o.values["--mixed-chunk"] != nil {
+            try t0142MixedProbe(o, model: model, corpus: all, batch: B, promptTokens: promptTokens,
+                                prefillStep: prefillStep, verifyRows: VS)
+            return
+        }
         // P099 (INST-ENG-043): the batched VERIFY block priced -- each step forwards VS teacher-forced tokens per
         // row (the row's own corpus continuation, so acceptance is 100% by construction and the step cost is what
         // is measured), no rollback. Row 0 at B = 1 is checked against the serial S = VS block on the same tokens.
@@ -3003,6 +3165,18 @@ do {
         let sem = DispatchSemaphore(value: 0)
         let box = FailureBox()
         Task.detached { do { try await visionDump(o) } catch { box.error = error }; sem.signal() }
+        sem.wait()
+        if let e = box.error { throw e }
+    case "packprobe":
+        let sem = DispatchSemaphore(value: 0)
+        let box = FailureBox()
+        Task.detached { do { try await packProbe(o) } catch { box.error = error }; sem.signal() }
+        sem.wait()
+        if let e = box.error { throw e }
+    case "towerbench":
+        let sem = DispatchSemaphore(value: 0)
+        let box = FailureBox()
+        Task.detached { do { try await towerBench(o) } catch { box.error = error }; sem.signal() }
         sem.wait()
         if let e = box.error { throw e }
     case "tokbench":

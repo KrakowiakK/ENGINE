@@ -466,8 +466,12 @@ public final class HotPrefixStore {
     /// input graph. Compact arrays are reused, so capturing and later storing a rung does not
     /// copy its state twice. Logical counters do not describe allocator rounding;
     /// strict-budget charges separately include both sharing and allocator slack.
+    /// T-0156 (diagnostic A/B): ENGINE_RUNG_DEEP_COPY=1 -- every compacted array gets a buffer of its own (`contiguous` of an
+    /// already-contiguous array shares the source buffer, so a stored rung / an imported head could alias a live row's
+    /// buffer). `x + zeros` writes into the fresh zeros buffer (the only donatable input), the values unchanged.
+    static let deepCopy = ProcessInfo.processInfo.environment["ENGINE_RUNG_DEEP_COPY"] == "1"
     private static func compact(_ arrays: [String: MLXArray]) -> [String: MLXArray] {
-        let result = arrays.mapValues { contiguous($0) }
+        let result = arrays.mapValues { deepCopy ? $0 + MLXArray.zeros(like: $0) : contiguous($0) }
         eval(Array(result.values))
         return result
     }
@@ -1013,6 +1017,8 @@ public final class HotPrefixStore {
         }
         if quiet { if found != nil { coalescedHits += 1 }; return found }
         if found != nil { hits += 1 } else { misses += 1 }
+        // T-0191: an MTP request that could only resume from an entry without draft rows (it then decodes without drafts)
+        if preferMTP, let f = found, !f.hasMTP { EngineWitness.hit("prefer_mtp_fallbacks") }
         if canonicalWidth == nil { recordRegret(ids, got: found?.length ?? 0) }
         if debug {
             lastDebugQuery = ids

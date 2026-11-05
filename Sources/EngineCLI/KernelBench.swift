@@ -44,6 +44,8 @@ enum KernelBench {
 
     static func run(_ args: [String]) throws {
         if args.contains("moe-decode") { return try moeDecode(args) }
+        if args.contains("shared-fold") { return try sharedFoldBench(args) }
+        if args.contains("moe-prefill") { return try moePrefillBench(args) }
         if args.contains("head") { return try headBench(args) }
         if args.contains("gather") { return gatherBench(args) }
         if args.contains("qmmsweep") { return try qmmSweep(args) }
@@ -190,6 +192,140 @@ enum KernelBench {
                          msDown * 1e3, dnReadMB, dnReadMB / max(msDown, 1e-6), dnMustMB, roof(dnReadMB), 100 * (dnMustMB / max(msDown, 1e-6)) / roof(dnReadMB),
                          msAll * 1e3))
             FileHandle.standardError.write("    dispatch: \(Q4MoEDecodeBench.witness(T: T, bits: bits))\n".data(using: .utf8)!)
+        }
+    }
+
+    // MARK: T-0179 -- `engine kernelbench --case moe-prefill [--file layer0_mlp_e9.safetensors] [--rows 2048,4096,8192,16384]`
+    // E9's routed-expert MLP at prefill widths exactly as SwitchGLU runs it (gatherSort, sorted gather_qmm gate / up,
+    // silu*up, sorted gather_qmm down, unsort), on one real layer's 8-bit banks and REAL routing: rows come from the
+    // prefill router dumps runs/rt.i32.<layer> (4096 rows x top-10 each), concatenated across layers past 4096 rows.
+    // Against it, dense 8-bit qmm of the SAME FLOPs (x[T, D] x W[K*I, D]^T twice, then [T, K*I] x W[D, K*I]^T), which
+    // is what the experts would cost with perfectly dense, unragged rows. Reports ms and TFLOPS per MoE call and the mean
+    // rows per active expert. Each timing chains 4 calls with different routings (one eval).
+    static func moePrefillBench(_ args: [String]) throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let path = argValue(args, "--file") ?? "runs/flashnext/layer0_mlp_e9.safetensors"
+        let Ts = (argValue(args, "--rows") ?? "2048,4096,8192,16384").split(separator: ",").compactMap { Int($0) }
+        let raw = try loadArrays(url: URL(fileURLWithPath: path))
+        func bank(_ n: String) throws -> (MLXArray, MLXArray, MLXArray) {
+            guard let w = raw["switch_mlp.\(n).weight"], let s = raw["switch_mlp.\(n).scales"], let b = raw["switch_mlp.\(n).biases"] else { throw EngineError.usage }
+            return (w, s, b)
+        }
+        let gate = try bank("gate_proj"), up = try bank("up_proj"), down = try bank("down_proj")
+        let E = gate.0.dim(0), I = gate.0.dim(1), D = gate.0.dim(2) * 4, K = 10
+        var routing: [Int32] = []
+        for l in 0 ..< 48 {
+            guard let d = FileManager.default.contents(atPath: "runs/rt.i32.\(l)") else { break }
+            routing += d.withUnsafeBytes { Array($0.bindMemory(to: Int32.self)) }
+        }
+        let rowsAvail = routing.count / K
+        MLXRandom.seed(9)
+        func dense(_ n: Int, _ k: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let q = quantized((MLXRandom.normal([n, k]) * 0.02).asType(.bfloat16), groupSize: 64, bits: 8); return (q.wq, q.scales, q.biases!)
+        }
+        let dGU = [dense(K * I, D), dense(K * I, D)], dDn = dense(D, K * I)
+        eval(dGU[0].0, dGU[1].0, dDn.0)
+        print("engine kernelbench moe-prefill: E=\(E) K=\(K) D=\(D) I=\(I), 8-bit g64, real routing rows available \(rowsAvail), MLX_GATHER_QMM_NARROW_BELOW=\(ProcessInfo.processInfo.environment["MLX_GATHER_QMM_NARROW_BELOW"] ?? "-")")
+        for T in Ts where T <= rowsAvail {
+            let x = (MLXRandom.normal([T, D]) * 0.5).asType(.bfloat16)
+            let NC = 4
+            var idxs: [MLXArray] = []; var active = 0
+            for c in 0 ..< NC {
+                let off = (c * 997 * K) % max(1, (rowsAvail - T) * K + 1)
+                let sl = Array(routing[off ..< off + T * K])
+                active += Set(sl).count
+                idxs.append(MLXArray(sl).reshaped([T, K]).asType(.uint32))
+            }
+            eval(x, idxs)
+            func moe(_ xi: MLXArray, _ idx: MLXArray) -> MLXArray {
+                let (xs, ix, inv) = gatherSort(x: expandedDimensions(xi, axes: [-2, -3]), indices: idx)
+                let g = gatherQuantizedMM(xs, gate.0, scales: gate.1, biases: gate.2, rhsIndices: ix, transpose: true, groupSize: 64, bits: 8, sortedIndices: true)
+                let u = gatherQuantizedMM(xs, up.0, scales: up.1, biases: up.2, rhsIndices: ix, transpose: true, groupSize: 64, bits: 8, sortedIndices: true)
+                let h = g * sigmoid(g) * u
+                let y = gatherQuantizedMM(h, down.0, scales: down.1, biases: down.2, rhsIndices: ix, transpose: true, groupSize: 64, bits: 8, sortedIndices: true)
+                return scatterUnsort(x: y, invOrder: inv, shape: [T, K]).squeezed(axes: [-2])
+            }
+            func denseMoE(_ xi: MLXArray) -> MLXArray {
+                let g = quantizedMatmul(xi, dGU[0].0, scales: dGU[0].1, biases: dGU[0].2, transpose: true, groupSize: 64, bits: 8)
+                let u = quantizedMatmul(xi, dGU[1].0, scales: dGU[1].1, biases: dGU[1].2, transpose: true, groupSize: 64, bits: 8)
+                return quantizedMatmul(g * sigmoid(g) * u, dDn.0, scales: dDn.1, biases: dDn.2, transpose: true, groupSize: 64, bits: 8)
+            }
+            let msG = timed(5) { var xi = x; var last = x; for c in 0 ..< NC { last = moe(xi, idxs[c]); xi = x + (last[0 ..< 1, 0, 0 ..< 1] * 0).asType(x.dtype) }; return last } / Double(NC)
+            let msD = timed(5) { var xi = x; var last = x; for _ in 0 ..< NC { last = denseMoE(xi); xi = x + (last[0 ..< 1, 0 ..< 1] * 0).asType(x.dtype) }; return last } / Double(NC)
+            let flops = 2.0 * Double(T * K) * Double(3 * I * D)
+            print(String(format: "  T=%5d  rows/active expert %.1f (active %.0f of %d)  gather MoE %.2f ms = %.1f TFLOPS | dense same FLOPs %.2f ms = %.1f TFLOPS | ratio %.2fx",
+                         T, Double(T * K) / (Double(active) / Double(NC)), Double(active) / Double(NC), E, msG, flops / msG / 1e9, msD, flops / msD / 1e9, msG / msD))
+        }
+    }
+
+    // MARK: T-0173 -- `engine kernelbench --case shared-fold [--file layer0_mlp_e9.safetensors] [--rows 4] [--reps 3]`
+    // Why is the folded shared expert (ENGINE_MOE_SHARED_FOLD=1) slower per round than the shipped path (C-0552)? Times each
+    // stage of both paths (Q4SharedFoldBench) as a DEPENDENT chain of NROT calls in one eval (as moeDecode), at T rows of one
+    // sequence's real routing (runs/rt.i32.0). The shared expert is a different real routed expert per call (same 8-bit g64
+    // layout and I=640 as E9's shared expert), so its bytes are not SLC-resident across calls, as across 48 layers.
+    static func sharedFoldBench(_ args: [String]) throws {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let path = args.first(where: { $0.hasSuffix(".safetensors") }) ?? "runs/flashnext/layer0_mlp_e9.safetensors"
+        let T = Int(argValue(args, "--rows") ?? "4") ?? 4, reps = Int(argValue(args, "--reps") ?? "3") ?? 3
+        let raw = try loadArrays(url: URL(fileURLWithPath: path))
+        func bank(_ n: String) throws -> Q4SharedFoldBench.Bank {
+            guard let w = raw["switch_mlp.\(n).weight"], let s = raw["switch_mlp.\(n).scales"], let b = raw["switch_mlp.\(n).biases"] else { throw EngineError.usage }
+            return (w, s, b)
+        }
+        let gate = try bank("gate_proj"), up = try bank("up_proj"), down = try bank("down_proj")
+        let E = gate.0.dim(0), I = gate.0.dim(1), D = gate.0.dim(2) * 4, K = 10, NROT = 32
+        precondition(D == 2560 && I == 640, "unexpected expert geometry")
+        guard let dump = FileManager.default.contents(atPath: "runs/rt.i32.0") else { throw EngineError.invalid("no runs/rt.i32.0") }
+        let rows: [[Int32]] = dump.withUnsafeBytes { (b: UnsafeRawBufferPointer) -> [[Int32]] in
+            let v = Array(b.bindMemory(to: Int32.self)); return stride(from: 0, to: v.count - K + 1, by: K).map { Array(v[$0 ..< $0 + K]) }
+        }
+        MLXRandom.seed(1)
+        let x = (MLXRandom.normal([T, D]) * 0.5).asType(.bfloat16)
+        let w = softmax(MLXRandom.normal([T, K]), axis: -1).asType(.bfloat16)
+        let g = MLXRandom.normal([T]).asType(.bfloat16)
+        var sets: [MLXArray] = []
+        var shared: [(sgu: Q4SharedFoldBench.Bank, sdown: Q4SharedFoldBench.Bank, sg: Q4SharedFoldBench.Bank, su: Q4SharedFoldBench.Bank)] = []
+        func cp(_ a: MLXArray) -> MLXArray { concatenated([a], axis: 0) }
+        for r in 0 ..< NROT {
+            let base = 100 + r * 97
+            sets.append(MLXArray((0 ..< T).flatMap { rows[(base + $0) % rows.count] }).reshaped([T, K]))
+            let e = (r * 16 + 7) % E
+            let sg = (cp(gate.0[e]), cp(gate.1[e]), cp(gate.2[e])), su = (cp(up.0[e]), cp(up.1[e]), cp(up.2[e]))
+            let sgu = (concatenated([gate.0[e], up.0[e]], axis: 0), concatenated([gate.1[e], up.1[e]], axis: 0), concatenated([gate.2[e], up.2[e]], axis: 0))
+            shared.append((sgu: sgu, sdown: (cp(down.0[e]), cp(down.1[e]), cp(down.2[e])), sg: sg, su: su))
+        }
+        let routers = (0 ..< NROT).map { _ in (MLXRandom.normal([E + 1, D]) * 0.02).asType(.bfloat16) }
+        eval(routers)
+        eval(x, w, g, sets)
+        for s in shared { eval(s.sgu.0, s.sgu.1, s.sgu.2, s.sdown.0, s.sdown.1, s.sdown.2, s.sg.0, s.sg.1, s.sg.2, s.su.0, s.su.1, s.su.2) }
+        // numerics: the folded output against the shipped one on set 0
+        do {
+            let s = shared[0]
+            let a = Q4SharedFoldBench.stage("p_all", x: x, idx: sets[0], w: w, g: g, gate: gate, up: up, down: down, sgu: s.sgu, sdown: s.sdown, sg: s.sg, su: s.su, E: E, K: K, D: D, I: I)
+            let b = Q4SharedFoldBench.stage("f_all", x: x, idx: sets[0], w: w, g: g, gate: gate, up: up, down: down, sgu: s.sgu, sdown: s.sdown, sg: s.sg, su: s.su, E: E, K: K, D: D, I: I)
+            let d = abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self), m = abs(a.asType(.float32)).max().item(Float.self)
+            print(String(format: "engine kernelbench shared-fold: T=%d E=%d K=%d D=%d I=%d NROT=%d; fold vs shipped max|d| %.3e (max|ref| %.3e)", T, E, K, D, I, NROT, d, m))
+        }
+        let stages = (argValue(args, "--stages") ?? "p_gu,p_rt,p_sh,p_all,f_gu,f_rt,f_all,f_gu_k,f_rt_k,f_sh,r_r,p_all_r,f_all_r,p_rt_r").split(separator: ",").map(String.init)
+        var res: [String: [Double]] = [:]
+        for rep in 0 ..< reps {
+            for st in (rep % 2 == 0 ? stages : stages.reversed()) {
+                func chain() -> MLXArray {
+                    var xi = x, last = x
+                    for i in 0 ..< NROT {
+                        let s = shared[i]
+                        last = Q4SharedFoldBench.stage(st, x: xi, idx: sets[i], w: w, g: g, gate: gate, up: up, down: down,
+                                                       sgu: s.sgu, sdown: s.sdown, sg: s.sg, su: s.su, E: E, K: K, D: D, I: I, router: routers[i])
+                        xi = x + (last.reshaped(-1)[0 ..< 1] * 0).asType(x.dtype)
+                    }
+                    return last
+                }
+                res[st, default: []].append(timed(7) { chain() } / Double(NROT) * 1e3)
+            }
+        }
+        for st in stages {
+            let v = res[st]!
+            print(String(format: "  %-7@ us per call: %@  median %.1f", st as NSString, v.map { String(format: "%.1f", $0) }.joined(separator: " ") as NSString, v.sorted()[v.count / 2]))
         }
     }
 
@@ -1145,9 +1281,12 @@ enum KernelBench {
         print("engine kernelbench moe-rows: VENDORED mlx, layer \(layerTag), \(bits)-bit, gather_qmm path (the engine above 8 rows), \(String(format: "%.2f", perExpert / 1e6)) MB per expert (3 banks)")
         MLXRandom.seed(6)
         let NROT = 16
-        let cases: [(Int, String)] = argValue(args, "--h51") != nil
+        // T-0110: --cases T:pattern,... (e.g. 64:seq4x16,128:seq4x32 -- 16 / 32 verify rows of 4 positions)
+        let custom: [(Int, String)]? = argValue(args, "--cases").map { $0.split(separator: ",").map { c in
+            let p = c.split(separator: ":"); return (Int(p[0])!, String(p[1])) } }
+        let cases: [(Int, String)] = custom ?? (argValue(args, "--h51") != nil
             ? [(8, "seq4x2"), (12, "seq4x3"), (16, "seq4x4"), (20, "seq4x5"), (24, "seq4x6"), (32, "seq4x8"), (20, "far"), (32, "far")]
-            : [(4, "seq"), (8, "seq"), (8, "far"), (12, "far"), (16, "far"), (16, "seq4x4"), (24, "far"), (32, "far"), (32, "seq4x8")]
+            : [(4, "seq"), (8, "seq"), (8, "far"), (12, "far"), (16, "far"), (16, "seq4x4"), (24, "far"), (32, "far"), (32, "seq4x8")])
         for (T, pattern) in cases {
             let x = (MLXRandom.normal([T, D]) * 0.5).asType(.bfloat16)
             var sets: [MLXArray] = []; var distinctSum = 0
@@ -1213,6 +1352,37 @@ enum KernelBench {
                         xi = x + (last[0 ..< 1, 0 ..< 1] * 0).asType(.bfloat16)
                     }
                     return last
+                }
+                // T-0110: the expert-run gather over the same sorted pairs (gate, up, act, down), --runs-cfgs R:NSG:RPS,...
+                func runsChain(_ R: Int, _ nsg: Int, _ rps: Int) -> MLXArray {
+                    var xi = x; var last = x
+                    for i in 0 ..< NROT {
+                        let idx = sets[i]
+                        let (xs, ids, inv) = gatherSort(x: expandedDimensions(xi, axes: [-2, -3]), indices: idx)
+                        let P = ids.size
+                        let x2 = xs.reshaped(P, D), id32 = ids.asType(.uint32)
+                        let g = q4GatherQMVRuns(x: x2, ids: id32, w: gate.0, scales: gate.1, biases: gate.2, groupSize: gs, runs: R, nsg: nsg, rps: rps)
+                        let u = q4GatherQMVRuns(x: x2, ids: id32, w: up.0, scales: up.1, biases: up.2, groupSize: gs, runs: R, nsg: nsg, rps: rps)
+                        let h = (g * sigmoid(g)) * u
+                        // down (K = 640) is not a qmv_fast shape: the engine keeps the stock gather there too
+                        let d = gatherQuantizedMatmul(h.reshaped(P, 1, h.dim(-1)), down.0, scales: down.1, biases: down.2, rhsIndices: ids,
+                                                      transpose: true, groupSize: gs, bits: bits, sortedIndices: true)
+                        let yk = scatterUnsort(x: d.reshaped(P, 1, 1, D), invOrder: inv, shape: idx.shape).squeezed(axis: -2)
+                        last = yk.sum(axis: 1)
+                        xi = x + (last[0 ..< 1, 0 ..< 1] * 0).asType(.bfloat16)
+                    }
+                    return last
+                }
+                if let cfgs = argValue(args, "--runs-cfgs") {
+                    let ref = sortedChain()
+                    var line = "      runs:"
+                    for c in cfgs.split(separator: ",") {
+                        let v = c.split(separator: ":").map { Int($0)! }
+                        let ms = timed(5) { runsChain(v[0], v[1], v[2]) } / Double(NROT)
+                        let same = (runsChain(v[0], v[1], v[2]) .== ref).all().item(Bool.self)
+                        line += String(format: " R%d/%d/%d %.1f us %@", v[0], v[1], v[2], ms * 1e3, same ? "=" : "DIFF")
+                    }
+                    print(line)
                 }
                 let msS = timed(5) { sortedChain() } / Double(NROT)
                 let msF = timed(5) { fusedChain() } / Double(NROT)

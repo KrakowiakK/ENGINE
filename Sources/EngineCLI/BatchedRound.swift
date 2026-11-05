@@ -23,6 +23,8 @@ struct BatchRowSpec {
 final class BatchSpecPool {
     var headCache: KVCache
     var headLens: [Int]
+    /// the rows' mRoPE shifts (0 for text rows), in pool order; set by the batch owner when it stacks the pool
+    var ropeDeltas: [Int]? = nil
     /// P106 H56: the next round's first drafts stay on the device (`d1Dev`) when a round ends, so the owner does not wait for
     /// the re-prime: the GPU runs it while the host commits the round, dispatches the next step and builds its draft chain
     /// (Metal trace, H53: 6.8 % GPU idle in batched decode, ~2.5 ms/round of it this wait). Host readers (`d1`: unstack, the
@@ -77,6 +79,13 @@ final class RoundTrace {
 nonisolated(unsafe) let roundTraceShared = RoundTrace()
 let roundD1Device: Bool = ProcessInfo.processInfo.environment["ENGINE_ROUND_D1_DEVICE"] != "0"
 let roundPrequeueDrafts: Bool = ProcessInfo.processInfo.environment["ENGINE_ROUND_PREQUEUE_DRAFTS"] != "0"
+/// T-0151 (lab instrument, batchprobe): ENGINE_ROLLBACK_TIMING=1 synchronises the GPU before the trunk roll-back and
+/// again after it, and records the host build time and the synchronised wall time of the roll-back alone, per round.
+/// =null keeps both synchronisations but builds no roll-back (the sync overhead; the rounds' state is then wrong).
+let rollbackTimingMode: String? = ProcessInfo.processInfo.environment["ENGINE_ROLLBACK_TIMING"].flatMap { $0.isEmpty ? nil : $0 }   // "" = off (W10 first try)
+nonisolated(unsafe) var rollbackTimingBuildMs: [Double] = []
+nonisolated(unsafe) var rollbackTimingWallMs: [Double] = []
+nonisolated(unsafe) var rollbackTimingPartialRows: [Int] = []
 /// H60 activation witness: queued chains taken by the next round vs dropped (a plain step or a different K). The discard gate
 /// requires both > 0 on its pre-queue arm, so it cannot PASS without exercising the paths it vouches for. Model thread only.
 nonisolated(unsafe) var roundPrequeueTaken = 0, roundPrequeueDiscarded = 0
@@ -88,7 +97,7 @@ func draftChain(_ qm: Qwen4ExpModel, spec: BatchSpecPool, K: Int) -> [MLXArray] 
     var Slast = spec.Slast
     var headRows = spec.headLens
     for _ in 1 ..< K {
-        let (m, s2) = Qwen4ExpBatch.with(headRows) { mtp(hidden: Slast, tokens: draftArrs.last![0..., .newAxis], embed: embed, cache: spec.headCache) }
+        let (m, s2) = Qwen4ExpBatch.with(headRows, deltas: spec.ropeDeltas) { mtp(hidden: Slast, tokens: draftArrs.last![0..., .newAxis], embed: embed, cache: spec.headCache) }
         draftArrs.append(qm.draftToken(m[0..., -1, 0...]))
         Slast = s2
         headRows = headRows.map { $0 + 1 }
@@ -143,6 +152,7 @@ func primeRowSpec(_ qm: Qwen4ExpModel, ids: [Int], cache: [KVCache], chunk: Int)
 
 /// Per-row inputs of a round beyond the token stream.
 struct BatchRoundRow {
+    var ropeDelta: Int = 0             // the row's mRoPE shift (image requests); 0 for text
     var greedy: Bool = true
     var bias: Float = 0                // the row's soft-stop bias at this position (applied to every verify row)
     var biasGated = false              // T-0045: the bias acts only on verify rows whose input token ends a line / paragraph
@@ -154,14 +164,40 @@ struct BatchRoundRow {
 /// One batched round. `pending[b]` is row b's token not yet in the cache, `lengths[b]` its committed length.
 /// Returns, per row, the committed tokens (accepted drafts + the bonus) and the accepted count; the caches hold
 /// `lengths[b] + accepted[b] + 1` tokens per row afterwards and `spec` is re-primed.
+/// T-0144: set by Serve's mixed step for exactly one batched MTP round (model thread only): the round's trunk verify forward
+/// (block [B, K+1], the pool caches, row lengths, rope shifts) -> (logits, pre-mixer stream). Consumed (reset) by the round;
+/// a step that runs no MTP round leaves it set and the caller clears it.
+nonisolated(unsafe) var roundForwardOverride: ((MLXArray, [KVCache], [Int], [Int]) -> (MLXArray, MLXArray))? = nil
+
+/// T-0247 (D-0088, design C-0723): copy-mode lookup drafts inside a batched round. `K` is the round's verify width (the
+/// block holds K drafts per row), `realK[b]` row b's real drafts, `lookups[b]` row b's lookup drafts (nil: its MTP drafts,
+/// the last one repeated past the MTP depth). Built by the caller from planCopyBlock; nil = the plain MTP round.
+struct BatchCopyRound {
+    let K: Int
+    let realK: [Int]
+    let lookups: [[Int]?]
+    /// T-0247 (C-0720): verify through the packed per-row-depth forward (forwardPacked): row b runs realK[b] + 1 real
+    /// positions, pads cost ~0.4 ms instead of a full position (C-0443). GDN, PLE and QSA still see the padded block,
+    /// so the roll-back is unchanged (C-0723).
+    var packed: Bool = false
+}
+
+/// T-0265 (C-0680): ENGINE_BATCH_MTP_DEPTH_CUM=<p> -- a third MTP draft only for rows whose head is confident: the round
+/// drafts 3, reads each row's p1*p2*p3 on the host (no prequeue: the read needs the chain) and verifies through the packed
+/// per-row-depth forward with depth 3 where the product >= p, else 2. Greedy rows without a bias, outside copy and mixed rounds.
+let batchDepthCum: Double? = ProcessInfo.processInfo.environment["ENGINE_BATCH_MTP_DEPTH_CUM"].flatMap(Double.init)
+nonisolated(unsafe) var batchDepthRounds = 0, batchDepthRows = 0, batchDepthRows3 = 0
+
 func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecPool, pending: [Int], lengths: [Int],
-                        K: Int, rows: [BatchRoundRow], samplerParams: (temp: Float, topK: Int, topP: Float)? = nil)
+                        K: Int, rows: [BatchRoundRow], samplerParams: (temp: Float, topK: Int, topP: Float)? = nil,
+                        copy copyIn: BatchCopyRound? = nil)
     -> [(tokens: [Int], accepted: Int)] {
+    var copy = copyIn
     let mtp = qm.mtp!, embed = qm.model.embedTokens
     let B = pending.count
     let tr = roundTraceShared
     var probArrs: [MLXArray] = []
-    if tr.probs { qm.draftProbSink = { probArrs.append($0) } }
+    if tr.probs || batchDepthCum != nil { qm.draftProbSink = { probArrs.append($0) } }
     defer { qm.draftProbSink = nil }
     tr.stamp("r_start")
     // drafts: K-1 chained head steps, ragged over the rows' head lengths (H60: already queued by the previous round)
@@ -177,12 +213,61 @@ func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecP
     }
     spec.prequeued = nil
     tr.stamp("r_drafts_queued")
+    // T-0265: per-row depth from the head's confidence (d1's from the last re-prime in spec.p1, d2/d3 from this chain)
+    if copy == nil, K == 3, let thr = batchDepthCum, roundForwardOverride == nil,
+       rows.allSatisfy({ $0.greedy && $0.bias <= 0 }), probArrs.count >= 2 {
+        var cum = probArrs[probArrs.count - 2].reshaped(-1) * probArrs[probArrs.count - 1].reshaped(-1)
+        if let p1 = spec.p1, p1.dim(0) == B { cum = cum * p1.reshaped(-1) }
+        let c = cum.asType(.float32).asArray(Float.self)
+        let realK = c.map { Double($0) >= thr ? 3 : 2 }
+        copy = BatchCopyRound(K: realK.max()!, realK: realK, lookups: Array(repeating: nil, count: B), packed: true)
+        batchDepthRounds += 1; batchDepthRows += B; batchDepthRows3 += realK.filter { $0 == 3 }.count
+    }
     // the verify block [B, K+1]: pending + drafts per row
-    let block = concatenated([MLXArray(pending.map { Int32($0) })[0..., .newAxis]] + draftArrs.map { $0[0..., .newAxis] }, axis: 1)
-    let (vl, vh) = Qwen4ExpBatch.with(lengths) { qm.forwardHidden(block, cache: caches) }          // (B,K+1,V), (B,K+1,hc*d)
-    var l = vl
+    // T-0247: with copy drafts the block is KB+1 wide; MTP rows repeat their last draft past K (never accepted: realK cap)
+    let KB = copy?.K ?? K
+    var blockCols: [MLXArray] = draftArrs.map { $0[0..., .newAxis] }
+    if let copy {
+        let mask = MLXArray(copy.lookups.map { $0 != nil }).reshaped(B, 1)
+        blockCols = (0 ..< KB).map { t in
+            let m = draftArrs[min(t, K - 1)][0..., .newAxis].asType(.int32)
+            let lk = MLXArray(copy.lookups.map { l -> Int32 in
+                guard let l, !l.isEmpty else { return 0 }; return Int32(l[min(t, l.count - 1)]) }).reshaped(B, 1)
+            return which(mask, lk, m)
+        }
+    }
+    let block = concatenated([MLXArray(pending.map { Int32($0) })[0..., .newAxis]] + blockCols, axis: 1)
+    // T-0156: ENGINE_NAN_WITNESS=1 (diagnostic): which row state already holds NaN BEFORE this round's forward
+    let nanBefore: [String]? = nanWitnessOn ? nanWitnessState(qm, caches: caches, lengths: lengths) : nil
+    // T-0144: a mixed step replaces this forward once with one over [prefill chunk ; this block] (Serve's mixedStep)
     let biases = rows.map { $0.bias }
-    if biases.contains(where: { $0 > 0 }) {
+    // T-0247 (C-0720): the packed copy round -- greedy rows without a think-close bias, outside a mixed step; its
+    // predictions are taken on the P real positions and spread back to [B, KB+1] (a pad repeats its row's last real
+    // position, which the realK cap never reads past)
+    let packedLayout: Qwen4ExpPackedRows? = {
+        guard let copy, copy.packed, roundForwardOverride == nil, rows.allSatisfy({ $0.greedy }),
+              !biases.contains(where: { $0 > 0 }) else { return nil }
+        return Qwen4ExpPackedRows(depths: copy.realK.map { $0 + 1 }, positions: KB + 1)
+    }()
+    let (vl, vh): (MLXArray, MLXArray)
+    var packedPreds: MLXArray? = nil
+    roundForwardOverrideWasSet = roundForwardOverride != nil
+    if let mixed = roundForwardOverride {
+        roundForwardOverride = nil
+        (vl, vh) = mixed(block, caches, lengths, rows.map { $0.ropeDelta })
+    } else if let layout = packedLayout {
+        let (pl, ph) = qm.forwardPacked(block, cache: caches, rows: lengths, deltas: rows.map { $0.ropeDelta }, packed: layout)
+        let spread = MLXArray(layout.spread)
+        packedPreds = pl.reshaped(layout.total, -1).argMax(axis: -1).asType(.int32).take(spread, axis: 0).reshaped(B, KB + 1)
+        vh = ph.reshaped(layout.total, -1).take(spread, axis: 0).reshaped(B, KB + 1, -1)
+        vl = pl
+        batchCopyPackedRounds += 1
+    } else {
+        (vl, vh) = Qwen4ExpBatch.with(lengths, deltas: rows.map { $0.ropeDelta }) { qm.forwardHidden(block, cache: caches) }   // (B,K+1,V), (B,K+1,hc*d)
+    }
+    var l = vl
+    if let nanBefore, packedPreds == nil { nanWitnessRound(vl, before: nanBefore, lengths: lengths, pending: pending, mixed: roundForwardOverrideWasSet) }
+    if packedPreds == nil, biases.contains(where: { $0 > 0 }) {
         var add = MLXArray(biases).reshaped([B, 1])
         if rows.contains(where: { $0.biasGated }), let mask = engineBoundaryMask {
             let g = MLXArray(rows.map { $0.biasGated ? Float(1) : 0 }).reshaped([B, 1])
@@ -193,15 +278,18 @@ func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecP
     }
     let V = l.dim(-1)
     let preds: MLXArray
-    if rows.allSatisfy({ $0.greedy }) {
+    if let packedPreds {
+        preds = packedPreds
+    } else if rows.allSatisfy({ $0.greedy }) {
         preds = l.argMax(axis: -1).asType(.int32)                                           // (B, K+1)
-    } else if let p = samplerParams, let t = sampleTopKBlock(l.reshaped(B * (K + 1), V), temp: p.temp, topK: p.topK, topP: p.topP,
-                                                             draw: { i in rows[i / (K + 1)].drawKey?() }) {
-        preds = t.reshaped(B, K + 1).asType(.int32)
+    } else if let p = samplerParams, let t = sampleTopKBlock(l.reshaped(B * (KB + 1), V), temp: p.temp, topK: p.topK, topP: p.topP,
+                                                             draw: { i in rows[i / (KB + 1)].drawKey?() }) {
+        preds = t.reshaped(B, KB + 1).asType(.int32)
+        EngineWitness.hit(p.topK > 0 && p.topK < V ? "sampled_rows_topk" : "sampled_rows_fullvocab", B * (KB + 1))   // T-0191
     } else {
         preds = l.argMax(axis: -1).asType(.int32)
     }
-    let draftsCat = concatenated(draftArrs.map { $0[0..., .newAxis] }, axis: 1)               // (B, K)
+    let draftsCat = concatenated(blockCols, axis: 1)                                         // (B, KB)
     let bothArr = concatenated([preds.reshaped(-1), draftsCat.reshaped(-1)], axis: 0)
     tr.stamp("r_verify_built")
     let both = bothArr.asArray(Int32.self).map { Int($0) }   // ONE host read
@@ -209,10 +297,11 @@ func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecP
     var out: [(tokens: [Int], accepted: Int)] = []
     var keep: [Int] = []
     for b in 0 ..< B {
-        let pr = Array(both[(b * (K + 1)) ..< ((b + 1) * (K + 1))])
-        let dr = Array(both[(B * (K + 1) + b * K) ..< (B * (K + 1) + (b + 1) * K)])
+        let pr = Array(both[(b * (KB + 1)) ..< ((b + 1) * (KB + 1))])
+        let dr = Array(both[(B * (KB + 1) + b * KB) ..< (B * (KB + 1) + (b + 1) * KB)])
+        let realK = copy?.realK[b] ?? K
         var a = 0
-        while a < K && pr[a] == dr[a] { a += 1 }
+        while a < realK && pr[a] == dr[a] { a += 1 }
         if rows[b].thinkOpen, rows[b].bias > 0, let ci = (0 ..< a).first(where: { dr[$0] == engineThinkCloseId }) { a = ci }
         if let si = (0 ..< a).first(where: { rows[b].stopIds.contains(dr[$0]) }) { a = si }
         out.append((Array(dr.prefix(a)) + [pr[a]], a))
@@ -221,11 +310,11 @@ func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecP
     // roll back per row, then re-prime the head on every row's accepted rows in one padded call. H56: the head re-prime
     // does not read the trunk caches, so with ENGINE_ROUND_D1_DEVICE (default) it is queued FIRST and the trunk roll-back
     // graph is built while the GPU runs it (the same operations, only their construction order changes).
-    if !roundD1Device { qm.rollbackRows(caches, blockRows: K + 1, keep: keep, lengths: lengths) }   // clears the tapes too
+    if !roundD1Device { qm.rollbackRows(caches, blockRows: KB + 1, keep: keep, lengths: lengths) }   // clears the tapes too
     let Sp = keep.max()!
     var tokPad: [Int32] = []
     for b in 0 ..< B { let t = out[b].tokens; tokPad += (t + Array(repeating: t.last!, count: Sp - t.count)).map { Int32($0) } }
-    let (m2, s3) = Qwen4ExpBatch.with(spec.headLens) {
+    let (m2, s3) = Qwen4ExpBatch.with(spec.headLens, deltas: spec.ropeDeltas) {
         mtp(hidden: vh[0..., 0 ..< Sp, 0...], tokens: MLXArray(tokPad).reshaped(B, Sp), embed: embed, cache: spec.headCache)
     }
     let pick = MLXArray((0 ..< B).map { Int32(keep[$0] - 1) })                                   // each row's last real re-prime row
@@ -235,13 +324,24 @@ func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecP
     let d1 = qm.draftToken(mLast)
     asyncEval(d1, sLast)
     tr.stamp("r_reprime_queued")
-    if roundD1Device { qm.rollbackRows(caches, blockRows: K + 1, keep: keep, lengths: lengths) }
+    if let mode = rollbackTimingMode, roundD1Device {
+        let gdn = caches.compactMap { $0 as? ArraysCache }
+        eval([d1, sLast] + gdn.flatMap { $0.state })                      // GPU idle: everything queued so far is done
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        if mode != "null" { qm.rollbackRows(caches, blockRows: KB + 1, keep: keep, lengths: lengths) }
+        let t1 = DispatchTime.now().uptimeNanoseconds
+        eval(gdn.flatMap { $0.state })
+        let t2 = DispatchTime.now().uptimeNanoseconds
+        rollbackTimingBuildMs.append(Double(t1 - t0) / 1e6); rollbackTimingWallMs.append(Double(t2 - t0) / 1e6)
+        rollbackTimingPartialRows.append(keep.filter { $0 < KB + 1 }.count)
+    } else if roundD1Device { qm.rollbackRows(caches, blockRows: KB + 1, keep: keep, lengths: lengths) }
     if roundD1Device { spec.d1Dev = d1.dtype == .int32 ? d1 : d1.asType(.int32) } else { spec.d1 = d1.asArray(Int32.self).map { Int($0) } }
     tr.stamp("r_reprime_read")
     spec.Slast = sLast
     spec.headLens = (0 ..< B).map { spec.headLens[$0] + keep[$0] }
     qm.rewindHeadRows(lengths: spec.headLens)
-    if roundPrequeueDrafts, roundD1Device, K > 1, !tr.probs {
+    if batchDepthCum != nil, !tr.probs { spec.p1 = probArrs.count > draftProbCount ? probArrs[draftProbCount].reshaped(-1) : nil }
+    if roundPrequeueDrafts, roundD1Device, K > 1, !tr.probs, batchDepthCum == nil {
         let pooled = qm.headRaggedPooled
         let next = draftChain(qm, spec: spec, K: K)
         asyncEval(next.last!)
@@ -249,6 +349,15 @@ func runBatchedMTPRound(_ qm: Qwen4ExpModel, caches: [KVCache], spec: BatchSpecP
         qm.headRaggedPooled = pooled
     }
     tr.stamp("r_end")
+    if nanWitnessOn {   // T-0156: the state AFTER this round's roll-back (dirty after = the round made it; clean after but dirty
+                        // before the next round = something between rounds)
+        let after = nanWitnessState(qm, caches: caches, lengths: (0 ..< B).map { lengths[$0] + keep[$0] })
+        for b in 0 ..< B where !after[b].isEmpty && after[b].split(separator: ",").count < 20 && nanWitnessLines < 400 {
+            nanWitnessLines += 1
+            FileHandle.standardError.write(("engine nan witness: AFTER round \(nanWitnessRounds) B=\(B) row \(b) length \(lengths[b] + keep[b]) "
+                + "keep \(keep[b]) state_bad_after=[\(after[b].prefix(600))] lengths=\(lengths)\n").data(using: .utf8)!)
+        }
+    }
     if tr.enabled {
         tr.set("B", B); tr.set("K", K); tr.set("acc", out.map { $0.accepted }); tr.set("greedy", rows.allSatisfy { $0.greedy })
         tr.set("lengths", lengths)
@@ -279,17 +388,95 @@ func rowHeadKeepAlive(_ qm: Qwen4ExpModel, spec: inout BatchRowSpec, hidden: MLX
 
 func batchedHeadKeepAlive(_ qm: Qwen4ExpModel, spec: BatchSpecPool, hidden: MLXArray, next: [Int]) {
     var probArrs: [MLXArray] = []
-    if roundTraceShared.probs { qm.draftProbSink = { probArrs.append($0) } }
+    if roundTraceShared.probs || batchDepthCum != nil { qm.draftProbSink = { probArrs.append($0) } }
     defer { qm.draftProbSink = nil; spec.p1 = probArrs.first?.reshaped(-1) }
     if spec.prequeued != nil { roundPrequeueDiscarded += 1 }
     spec.prequeued = nil            // H60: a plain step instead of the round the chain was queued for (host state is the round's end)
     let mtp = qm.mtp!, embed = qm.model.embedTokens
     let B = next.count
-    let (m, s) = Qwen4ExpBatch.with(spec.headLens) { mtp(hidden: hidden, tokens: MLXArray(next.map { Int32($0) }).reshaped(B, 1), embed: embed, cache: spec.headCache) }
+    let (m, s) = Qwen4ExpBatch.with(spec.headLens, deltas: spec.ropeDeltas) { mtp(hidden: hidden, tokens: MLXArray(next.map { Int32($0) }).reshaped(B, 1), embed: embed, cache: spec.headCache) }
     let d1 = qm.draftToken(m[0..., -1, 0...])
     asyncEval(d1, s)
     // H60: the keep-alive's first drafts stay on the device too (H56's rule); host readers materialise them lazily
     if roundD1Device { spec.d1Dev = d1.dtype == .int32 ? d1 : d1.asType(.int32) } else { spec.d1 = d1.asArray(Int32.self).map { Int($0) } }
     spec.Slast = s
     spec.headLens = spec.headLens.map { $0 + 1 }
+}
+let q4GDNSlotsEnv: Bool = ProcessInfo.processInfo.environment["ENGINE_GDN_SLOTS"] == "1"
+
+
+// MARK: - T-0156 NaN witness (diagnostic, ENGINE_NAN_WITNESS=1; off by default, never in a production launcher)
+/// A short-rung E9 server answered "li" + 1398 '!' for one resumed request under concurrency (C-0486): NaN logits from the
+/// second token. The witness reports, per batched round, every row whose logits hold NaN, and for each such row the
+/// (layer, slot) cache arrays that ALREADY held NaN before the round's forward -- corrupted state in -- or none: the
+/// round's own forward made it. Only an incident's first rounds are reported (a row bad in >= 20 arrays has propagated), at most 400 lines.
+let nanWitnessOn = ProcessInfo.processInfo.environment["ENGINE_NAN_WITNESS"] == "1"
+nonisolated(unsafe) var roundForwardOverrideWasSet = false
+nonisolated(unsafe) private var nanWitnessLines = 0
+nonisolated(unsafe) private var nanWitnessRounds = 0
+
+/// Per row: the names of the cache arrays (layer.slot) holding NaN or |x| > 1e5 in that row's valid range (empty: clean).
+func nanWitnessState(_ qm: Qwen4ExpModel, caches: [KVCache], lengths: [Int]) -> [String] {
+    let B = lengths.count
+    var names: [String] = []
+    var flags: [MLXArray] = []
+    func add(_ name: String, _ x: MLXArray?) {
+        guard let x, [DType.float32, .float16, .bfloat16].contains(x.dtype) else { return }
+        let f = x.asType(.float32)   // NaN, or a magnitude no healthy state reaches (garbage memory reads as huge finite values too)
+        names.append(name); flags.append((isNaN(f) .|| (abs(f) .> Float(1e5))).any().reshaped([1]))
+    }
+    for b in 0 ..< B {
+        let view: [KVCache?] = caches.map { c in
+            if let rows = Qwen4ExpModel.rowResidentRows(c) { return rows[b] }
+            if B == 1, c is CacheList { return c }   // a single row's own caches (prefill end, pool join)
+            if let a = c as? ArraysCache {
+                let o = ArraysCache(size: 6)
+                for sl in 0 ..< 4 { if let x = a[sl], x.dim(0) > b { o[sl] = x[b ..< (b + 1)] } }
+                return o
+            }
+            return nil
+        }
+        for (i, c) in view.enumerated() {
+            if let l = c as? CacheList, let kv = l[0] as? KVCacheSimple {
+                let n = min(lengths[b], kv.rawKeys?.dim(2) ?? 0)
+                add("b\(b).L\(i).k", kv.rawKeys.map { $0[0..., 0..., 0 ..< n, 0...] })
+                add("b\(b).L\(i).v", kv.rawValues.map { $0[0..., 0..., 0 ..< n, 0...] })
+                let idx = l[1] as! ArraysCache
+                if let i0 = idx[0] { add("b\(b).L\(i).i0", i0[0..., 0 ..< min(n, i0.dim(1)), 0...]) }
+                add("b\(b).L\(i).i1", idx[1])
+            } else if let a = c as? ArraysCache {
+                for sl in 0 ..< 4 { add("b\(b).L\(i).a\(sl)", a[sl]) }
+            }
+        }
+    }
+    guard !flags.isEmpty else { return Array(repeating: "", count: B) }
+    let f = concatenated(flags, axis: 0).asArray(Bool.self)
+    var per = Array(repeating: "", count: B)
+    for (k, name) in names.enumerated() where f[k] {
+        let b = Int(name.dropFirst().prefix { $0 != "." })!
+        per[b] += (per[b].isEmpty ? "" : ",") + String(name.drop { $0 != "." }.dropFirst())
+    }
+    return per
+}
+
+func nanWitnessRound(_ logits: MLXArray, before: [String], lengths: [Int], pending: [Int], mixed: Bool) {
+    nanWitnessRounds += 1
+    let B = lengths.count
+    let rowNaN = isNaN(logits.asType(.float32)).any(axes: [1, 2]).asArray(Bool.self)
+    // only the FIRST rounds of an incident: a row whose state is already bad in >= 20 arrays has fully propagated
+    for b in 0 ..< B where (rowNaN[b] || !before[b].isEmpty) && before[b].split(separator: ",").count < 20 && nanWitnessLines < 400 {
+        nanWitnessLines += 1
+        FileHandle.standardError.write(("engine nan witness: round \(nanWitnessRounds) B=\(B) mixed=\(mixed) row \(b) length \(lengths[b]) "
+            + "pending \(pending[b]) logits_nan=\(rowNaN[b]) state_nan_before=[\(before[b].prefix(600))] "
+            + "lengths=\(lengths)\n").data(using: .utf8)!)
+    }
+}
+
+/// T-0156: one row's own caches at a named point (prefill end, pool join); logs only when something is bad.
+func nanWitnessPoint(_ qm: Qwen4ExpModel, _ point: String, caches: [KVCache], length: Int, note: String) {
+    let bad = nanWitnessState(qm, caches: caches, lengths: [length])[0]
+    if !bad.isEmpty, bad.split(separator: ",").count < 20, nanWitnessLines < 400 {   // a propagated row is not news
+        nanWitnessLines += 1
+        FileHandle.standardError.write("engine nan witness: \(point) length \(length) \(note) state_bad=[\(bad.prefix(600))]\n".data(using: .utf8)!)
+    }
 }

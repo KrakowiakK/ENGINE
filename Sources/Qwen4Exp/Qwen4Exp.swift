@@ -95,10 +95,23 @@ public enum Qwen4ExpPrefillWidth {
     nonisolated(unsafe) public static var canonicalRows: Int =
         Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_WIDTH_CANONICAL"] ?? "0") ?? 0
     nonisolated(unsafe) public static var blockedCalls = 0
+    /// T-0186: the row partition of a packed forward's [1, total, .] blocks (set only while one runs, on the owner). With
+    /// canonicalRows > 0 each segment is blocked from its own first row, exactly as its solo forward would be.
+    nonisolated(unsafe) public static var segments: [Int]? = nil
+    nonisolated(unsafe) public static var segmentedCalls = 0
 }
 
 private func prefillProjection(_ linear: Linear, _ x: MLXArray, _ part: String) -> MLXArray {
     let R = Qwen4ExpPrefillWidth.canonicalRows
+    if R > 0, x.ndim == 3, x.dim(0) == 1, let segs = Qwen4ExpPrefillWidth.segments, segs.count > 1, segs.reduce(0, +) == x.dim(1) {
+        Qwen4ExpPrefillWidth.segmentedCalls += 1
+        var o = 0, parts: [MLXArray] = []
+        for n in segs {
+            for b in stride(from: o, to: o + n, by: n > R ? R : n) { parts.append(linear(x[0..., b ..< min(o + n, b + (n > R ? R : n)), 0...])) }
+            o += n
+        }
+        return concatenated(parts, axis: 1)
+    }
     if R > 0, x.ndim == 3, x.dim(0) == 1, x.dim(1) > R {
         Qwen4ExpPrefillWidth.blockedCalls += 1
         let S = x.dim(1)
@@ -220,6 +233,10 @@ public struct Qwen4ExpTextConfiguration: Decodable, Sendable {
     public var tieWordEmbeddings: Bool = false
     /// first id of the special-token block at the top of the vocabulary (Qwen3.8-Flash-Next: 248044); used by the draft-head trim
     public var vocabSpecialsFrom: Int = 248044
+    /// T-0076: a PLAIN Qwen3.5-MoE checkpoint (text model_type qwen3_5_moe_text, e.g. Qwen3.5-397B-A17B): no
+    /// hyper-connections (one residual stream, input/post-attention RMSNorms, a final `model.norm`), no n-gram/PLE, no
+    /// QSA indexer (dense attention at every length), and the Qwen3.5 MTP head (fc over [emb, hidden]).
+    public var plain: Bool = false
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -336,6 +353,13 @@ public struct Qwen4ExpTextConfiguration: Decodable, Sendable {
             layerTypes = (0..<hiddenLayers).map {
                 ($0 + 1) % fullAttentionInterval == 0 ? "full_attention" : "linear_attention"
             }
+        }
+        if modelType.hasPrefix("qwen3_5") {
+            plain = true
+            hcCount = 1; pleLayerIds = []
+            indexerNHeads = 0; indexerKVHeads = 0
+            indexerBudget = Int(Int32.max)      // never sparse: the indexer is absent
+            outputGateType = "silu"             // Qwen3.5 GDN output norm gates with silu(z) (HF Qwen3NextRMSNormGated)
         }
     }
 }
@@ -537,11 +561,16 @@ enum Qwen4ExpEnv {
 
 public enum Qwen4ExpBatch {
     nonisolated(unsafe) public static var rowOffsets: [Int]? = nil
+    /// Per-row rotary position shift: a row whose prompt held an image (mRoPE) sits at `offset + delta` on all three
+    /// axes once its visual span is behind it, which a 1-D rope table at that position reproduces exactly. nil (every
+    /// text-only batch) is the unchanged program.
+    nonisolated(unsafe) public static var rowRopeDeltas: [Int]? = nil
     public static var active: Bool { rowOffsets != nil }
-    /// Run `body` with the per-row lengths installed, and always take them down again.
-    public static func with<R>(_ rows: [Int], _ body: () throws -> R) rethrows -> R {
+    /// Run `body` with the per-row lengths (and rope shifts) installed, and always take them down again.
+    public static func with<R>(_ rows: [Int], deltas: [Int]? = nil, _ body: () throws -> R) rethrows -> R {
         rowOffsets = rows
-        defer { rowOffsets = nil }
+        rowRopeDeltas = deltas.flatMap { d in d.contains { $0 != 0 } ? d : nil }
+        defer { rowOffsets = nil; rowRopeDeltas = nil }
         return try body()
     }
 
@@ -612,6 +641,8 @@ final class Qwen4ExpQSAIndexer: Module {
     /// P039 GATE-IS-NOT-INERT ABLATION: force the PRE-P039 scalar rope for pooled block starts and for
     /// the indexer queries even on a visual sequence. If the answer above the budget survives this,
     /// the mRoPE rope was never being tested and the gate is worthless. Outputs are wrong on purpose.
+    /// T-0110: ENGINE_IDX_ROWS_BATCHED=0 restores the per-row pooling and verify selection of row-resident rows
+    static let idxRowsBatched: Bool = ProcessInfo.processInfo.environment["ENGINE_IDX_ROWS_BATCHED"] != "0"
     static let scalarBlockRope: Bool = ProcessInfo.processInfo.environment["ENGINE_IDX_SCALAR_ROPE"] == "1"
     /// P039 ACTIVATION_WITNESS for the pooled-block rope: says which branch actually ran.
     static let ropeWitness: Bool = ProcessInfo.processInfo.environment["ENGINE_VISION_WITNESS"] == "1"
@@ -653,6 +684,17 @@ final class Qwen4ExpQSAIndexer: Module {
     /// dtype -- so the KV cache update, the indexer, the selection, the gate and o_proj all still run and
     /// the difference is the gather kernel alone. It is the one term of the attention layer that reads the
     /// 6.4 GB KV cache, and its access pattern is set by the selected ids. TIMING ONLY.
+    /// T-0110 timing-only ablations of the batched VERIFY (S > 1) attention: `vindexer` (no per-row score / top-k),
+    /// `vgather` (no KV gather + merge), `vkv` (no per-row K/V write). Output is wrong by construction.
+    static let ablVerifyIndexer: Bool = (ProcessInfo.processInfo.environment["ENGINE_ABL_SKIP"] ?? "").split(separator: ",").contains("vindexer")
+    static let ablVerifyGather: Bool = (ProcessInfo.processInfo.environment["ENGINE_ABL_SKIP"] ?? "").split(separator: ",").contains("vgather")
+    static let ablVerifyKV: Bool = (ProcessInfo.processInfo.environment["ENGINE_ABL_SKIP"] ?? "").split(separator: ",").contains("vkv")
+    /// T-0110 cost probes that keep the output exact: ENGINE_DUP=vgather|gdnrecur|moe|vindexer runs that op a second time
+    /// and adds 0 x the copy, so routing and acceptance are unchanged and the round grows by the op's own cost.
+    static let dup: Set<String> = Set((ProcessInfo.processInfo.environment["ENGINE_DUP"] ?? "").split(separator: ",").map(String.init))
+    /// T-0172: the fewest rows a forward needs before an ENGINE_DUP point duplicates it (default 9 = the B12/B32 probes'
+    /// "> 8"; 2 reaches the single-stream verify block of S = K+1 rows)
+    static let dupMinRows: Int = Int(ProcessInfo.processInfo.environment["ENGINE_DUP_MIN_ROWS"] ?? "") ?? 9
     static let ablQSAGather: Bool = (ProcessInfo.processInfo.environment["ENGINE_ABL_SKIP"] ?? "")
         .split(separator: ",").map(String.init).contains("qsagather")
     /// P095: ENGINE_RAGGED_SELECT=masked -- when the rows of a ragged step have DIFFERENT block counts,
@@ -809,7 +851,7 @@ final class Qwen4ExpQSAIndexer: Module {
     /// values in the same [B, nBlocks, D] layout `asType` makes of the stacked view. Growth is per row
     /// and carries only the row's valid prefix.
     func raggedDecode(qk: MLXArray, rope: Qwen4ExpRotary, keyCache: ArraysCache, rows: [Int],
-                      rowCaches: [ArraysCache]? = nil) -> [Int]? {
+                      rowCaches: [ArraysCache]? = nil, mropeSection: [Int] = [11, 11, 10]) -> [Int]? {
         lastTop = nil; lastTopRagged = nil
         let B = qk.dim(0), S = qk.dim(1)
         // P099: S > 1 query rows per row (a verify block per row); S == 1 is the P080 path, untouched.
@@ -819,6 +861,10 @@ final class Qwen4ExpQSAIndexer: Module {
         let kvLenRow = rows.map { $0 + S }
         let kvLenMax = kvLenRow.max()!
         if let rc = rowCaches { precondition(rc.count == B, "row-resident indexer: one cache per row") }
+        // T-0098: per-row rope shift of an image row (nil for a text-only batch: the unchanged program)
+        let deltas = Qwen4ExpBatch.rowRopeDeltas
+        if let deltas { precondition(deltas.count == B, "ragged indexer needs one rope shift per row") }
+        if rowCaches == nil { precondition(deltas == nil, "image rows batch only in a row-resident pool") }
         // slot 0 stays a capacity buffer; the difference is that each row writes at its own position
         let allK: MLXArray?
         if let rc = rowCaches {
@@ -833,6 +879,21 @@ final class Qwen4ExpQSAIndexer: Module {
                     kc[0] = nb
                 }
                 kc[0]![0..., rows[b] ..< (rows[b] + S), 0...] = rawK[b ..< (b + 1)]
+                // T-0098: an image row keeps slot 2, its full 3-axis mRoPE position history, as the serial step does:
+                // a token after the visual span sits at offset + delta on all three axes (`Qwen4ExpBatch.rowRopeDeltas`).
+                if kc[2] != nil {
+                    let cap2 = kc[2]!.dim(2)
+                    if kvLenRow[b] > cap2 {
+                        let want = kvLenRow[b] + max(Self.idxStep, cap2 / 8)
+                        let newCap = Qwen4ExpCacheCapacity.bounded(((want + Self.idxStep - 1) / Self.idxStep) * Self.idxStep, need: kvLenRow[b])
+                        let nb = MLXArray.zeros([3, 1, newCap], dtype: .int32)
+                        if rows[b] > 0 { nb[0..., 0..., 0 ..< rows[b]] = kc[2]![0..., 0..., 0 ..< rows[b]] }
+                        kc[2] = nb
+                    }
+                    let p0 = Int32(rows[b] + (deltas?[b] ?? 0))
+                    let pos = MLXArray((0 ..< S).map { p0 + Int32($0) }).reshaped(1, 1, S)
+                    kc[2]![0..., 0..., rows[b] ..< (rows[b] + S)] = broadcast(pos, to: [3, 1, S])
+                }
             }
             allK = nil
         } else {
@@ -863,6 +924,11 @@ final class Qwen4ExpQSAIndexer: Module {
         if raggedPooled.count != B { raggedPooled = rows.map { $0 / ratio } }
         let pooledStacked: MLXArray?
         if let rc = rowCaches {
+            // T-0110: rows that gained blocks are pooled in one pass (gather of their new raw rows, mean, norm, rope over the
+            // concatenation -- each block's arithmetic is the per-row pass's, measured bit-identical) when >= 2 rows need it
+            let batchPool = Self.idxRowsBatched && B >= 2
+                && (0 ..< B).filter({ raggedPooled[$0] < nBlocksRow[$0] }).count >= 2
+            var poolJobs: [(b: Int, from: Int, to: Int)] = []
             for b in 0 ..< B {
                 let kc = rc[b]
                 let poolCap = kc[1]?.dim(1) ?? 0
@@ -875,16 +941,44 @@ final class Qwen4ExpQSAIndexer: Module {
                     if let old = kc[1] { let keep = min(poolCap, raggedPooled[b]); if keep > 0 { nb[0..., 0 ..< keep, 0...] = old[0..., 0 ..< keep, 0...] } }
                     kc[1] = nb
                 }
-                if raggedPooled[b] < nBlocksRow[b] {
+                if raggedPooled[b] < nBlocksRow[b], batchPool, kc[2] == nil {
+                    poolJobs.append((b, raggedPooled[b], nBlocksRow[b]))   // T-0110: pooled below for all such rows at once
+                } else if raggedPooled[b] < nBlocksRow[b] {
                     let from = raggedPooled[b], to = nBlocksRow[b]
                     let newRaw = kc[0]![0..., (from * ratio) ..< (to * ratio), 0...]
                         .reshaped(1, to - from, ratio, headDim)
                     var p = kNorm(newRaw.asType(.float32).mean(axis: 2).asType(rawK.dtype))
                     let starts = Self.int32Range(from, to, scale: ratio)
-                    let (cosK, sinK) = rope.tables(expandedDimensions(starts, axis: 0))
+                    let (cosK, sinK): (MLXArray, MLXArray)
+                    if !Self.scalarBlockRope, let posBuf = kc[2] {
+                        // T-0098: an image row's block starts take the rows of the mRoPE table, as the serial path does
+                        let bs = take(posBuf[0..., 0..., 0 ..< kvLenRow[b]], starts, axis: 2)   // (3, 1, n)
+                        (cosK, sinK) = rope.tablesMRope(bs, section: mropeSection)
+                    } else {
+                        (cosK, sinK) = rope.tables(expandedDimensions(starts, axis: 0))
+                    }
                     p = Qwen4ExpRotary.apply(p, cos: cosK, sin: sinK)
                     kc[1]![0..., from ..< to, 0...] = p
                     raggedPooled[b] = to
+                }
+            }
+            var j0 = 0
+            while j0 < poolJobs.count {
+                let jobs = Array(poolJobs[j0 ..< min(poolJobs.count, j0 + 16)])
+                j0 += jobs.count
+                let total = jobs.reduce(0) { $0 + $1.to - $1.from }
+                let raw = q4RowsGather(jobs.map { rc[$0.b][0]! }, start: jobs.map { $0.from * ratio },
+                                       count: jobs.map { ($0.to - $0.from) * ratio })
+                var p = kNorm(raw.reshaped(1, total, ratio, headDim).asType(.float32).mean(axis: 2).asType(rawK.dtype))
+                let starts = MLXArray(jobs.flatMap { j in (j.from ..< j.to).map { Int32($0 * ratio) } })
+                let (cosK, sinK) = rope.tables(expandedDimensions(starts, axis: 0))
+                p = Qwen4ExpRotary.apply(p, cos: cosK, sin: sinK)
+                var off = 0
+                for j in jobs {
+                    let n = j.to - j.from
+                    rc[j.b][1]![0..., j.from ..< j.to, 0...] = p[0..., off ..< (off + n), 0...]
+                    raggedPooled[j.b] = j.to
+                    off += n
                 }
             }
             pooledStacked = nil
@@ -916,10 +1010,46 @@ final class Qwen4ExpQSAIndexer: Module {
             return rowCaches![b][1]![0..., 0 ..< nb, 0...]
         }
         // the query of row b is roped at row b's own position (rows[b] + s for the s-th row of its block)
-        let qPos: [Int32] = rows.flatMap { r in (0 ..< S).map { Int32(r + $0) } }
+        let qPos: [Int32] = rows.indices.flatMap { b in (0 ..< S).map { Int32(rows[b] + (deltas?[b] ?? 0) + $0) } }
         let (cosQ, sinQ) = rope.tables(rowPositions: qPos, B: B, S: S)   // (B,S,d)
         var qn = qNorm(q)
         qn = Qwen4ExpRotary.apply(qn, cos: expandedDimensions(cosQ, axis: 2), sin: expandedDimensions(sinQ, axis: 2))
+        if S > 1, Self.ablVerifyIndexer {
+            // T-0110 TIMING ONLY: no per-row score / top-k -- every row attends its first k blocks
+            let k = min(blockTopK, nBlocksRow.min()!)
+            let t = tiled(Self.int32Range(0, k).reshaped(1, 1, k), repetitions: [B, S, 1])
+            lastTopRagged = (t, nBlocksRow)
+            return nBlocksRow
+        }
+        if S > 1, Self.idxRowsBatched, let rc = rowCaches, B >= 2, Self.topKSelect, q4IdxScoreDecodeOn, q4IdxScoreFusedOn,
+           S < q4IdxScoreSG * 8 * q4IdxScoreMI, nBlocksMax < q4TopKPartsMinN,
+           nBlocksRow.allSatisfy({ $0 >= 8 * q4IdxScoreNI && $0 >= blockTopK }), rc.allSatisfy({ $0[1]!.dtype == qn.dtype }) {
+            // T-0110: the per-row verify selection below, for all rows in one score and one top-k dispatch per 16 rows. Each
+            // row is scored by the same tile code on its own pooled buffer, block count and context length, and selected by
+            // the same one-threadgroup radix body over its own n -- the per-row calls' ids in the same order.
+            var mi = 1
+            while 8 * mi < S { mi *= 2 }
+            let TM = 8 * mi
+            let qpad = S == TM ? qn : concatenated([tiled(qn[0..., 0 ..< 1, 0..., 0...], repetitions: [1, TM - S, 1, 1]), qn], axis: 1)
+            var tops: [MLXArray] = []
+            var g0 = 0
+            while g0 < B {
+                let g1 = min(B, g0 + 16)
+                let nb = Array(nBlocksRow[g0 ..< g1])
+                let sT = q4IdxScoreRows(q: qpad[g0 ..< g1], pooled: rc[g0 ..< g1].map { $0[1]! }, n: nb,
+                                        kvLen: Array(kvLenRow[g0 ..< g1]), ratio: ratio, scale: sqrt(Float(headDim)),
+                                        mi: mi, ni: q4IdxScoreNI, sg: 1)
+                tops.append(q4TopKRows(scores: sT[0..., (TM - S) ..< TM, 0...], n: nb, k: blockTopK))
+                g0 = g1
+            }
+            var t = tops.count == 1 ? tops[0] : concatenated(tops, axis: 0)               // (B,S,K)
+            let kvPos = MLXArray((0 ..< B).flatMap { b in (0 ..< S).map { Int32(kvLenRow[b] - S + $0) } }).reshaped(B, S, 1)
+            let nbArr = MLXArray(nBlocksRow.map { Int32($0) }).reshaped(B, 1, 1)
+            let endSel = t * Int32(ratio) + Int32(ratio - 1)
+            t = which(endSel .<= kvPos, t, nbArr)
+            lastTopRagged = (t.asType(.int32), nBlocksRow)
+            return nBlocksRow
+        }
         if S > 1 {
             // P099: each row's block scored and selected exactly as the serial verify block scores its own
             // (the decode-branch fused score at TM = 8 with the row's visibility, the same top-k, the same
@@ -1437,6 +1567,7 @@ final class Qwen4ExpQSAIndexer: Module {
         }
         if bisect == 3 && S <= 16 { eval(top); return nil }
         if Q4Fused.qsaGather && S <= Self.gatherMaxS && (S > 1 || kvLen >= Self.gatherMinKV) {
+            EngineWitness.hit(S > 4096 ? "qsa_gather_wide" : "qsa_gather")
             // gather path (P017): hand the block ids to the attention kernel; no token mask over the whole kv. S > 1 always (token
             // fidelity, OBS-ENG-030); S = 1 above ENGINE_QSA_GATHER_MIN_KV (the masked vector kernel is as fast below ~12k: lab
             // 0.256 vs 0.259 ms at 8k, in situ 8k serial 57.03 vs 56.66)
@@ -1501,7 +1632,8 @@ final class Qwen4ExpAttention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: Qwen4ExpRMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: Qwen4ExpRMSNorm
-    @ModuleInfo(key: "indexer") var indexer: Qwen4ExpQSAIndexer
+    /// nil for a plain Qwen3.5 checkpoint (T-0076): dense attention at every length
+    @ModuleInfo(key: "indexer") var indexer: Qwen4ExpQSAIndexer?
 
     init(_ a: Qwen4ExpTextConfiguration) {
         nHeads = a.attentionHeads
@@ -1514,7 +1646,7 @@ final class Qwen4ExpAttention: Module {
         _oProj.wrappedValue = Linear(nHeads * headDim, d, bias: false)
         _qNorm.wrappedValue = Qwen4ExpRMSNorm(dimensions: headDim, eps: a.rmsNormEps)
         _kNorm.wrappedValue = Qwen4ExpRMSNorm(dimensions: headDim, eps: a.rmsNormEps)
-        _indexer.wrappedValue = Qwen4ExpQSAIndexer(a)
+        if !a.plain { _indexer.wrappedValue = Qwen4ExpQSAIndexer(a) }
         super.init()
     }
 
@@ -1572,6 +1704,7 @@ final class Qwen4ExpAttention: Module {
             precondition(rows.count == B, "ragged decode needs one length per row, got \(rows.count) for B=\(B)")
             // P099: S > 1 = a verify block per row (teacher-forced or drafted); the S == 1 program is unchanged.
             var qkviR = q8Proj(qkviProj, x)
+            if S > 1, B * S >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("attnproj") { qkviR = qkviR + q8Proj(qkviProj, x + 0) * 0 }
             // P095: the S = 1 ablation keys, ported so the batched step's attention can be split the
             // way OBS-ENG-089 split the serial one. TIMING ONLY, output wrong by construction, and each
             // key means exactly what it means on the single-sequence path below.
@@ -1584,43 +1717,79 @@ final class Qwen4ExpAttention: Module {
             // P106 H48: a row-resident pool hands this layer a marker; the rows' own caches are behind it
             let rowLists = Qwen4ExpBatch.rowResident(kvc)
             if let rowLists { precondition(rowLists.count == B, "row-resident pool: one cache per row, got \(rowLists.count) for B=\(B)") }
-            guard let nBlocksRow = indexer.raggedDecode(qk: pr[3], rope: rope, keyCache: idxc, rows: rows,
-                                                        rowCaches: rowLists?.map { $0[1] as! ArraysCache }),
-                  let topR = indexer.lastTopRagged?.0 else {
-                preconditionFailure("P080 M1 batches only rows past the indexer budget; got lengths \(rows)")
+            var nBlocksRow: [Int] = []
+            var topR = MLXArray(Int32(0))
+            if let indexer {
+                guard let nb = indexer.raggedDecode(qk: pr[3], rope: rope, keyCache: idxc, rows: rows,
+                                                    rowCaches: rowLists?.map { $0[1] as! ArraysCache }, mropeSection: mropeSection),
+                      let t = indexer.lastTopRagged?.0 else {
+                    preconditionFailure("P080 M1 batches only rows past the indexer budget; got lengths \(rows)")
+                }
+                nBlocksRow = nb; topR = t
+                Q4Prof.mark("attn.indexer", [topR])
             }
-            Q4Prof.mark("attn.indexer", [topR])
             let qg = pr[0].reshaped(B, S, nHeads, 2 * headDim)
             var qR = qNorm(qg[.ellipsis, 0 ..< headDim]).transposed(0, 2, 1, 3)
             let gateR = qg[.ellipsis, headDim...].reshaped(B, S, nHeads * headDim)
             var kR = kNorm(pr[1].reshaped(B, S, nKVHeads, headDim)).transposed(0, 2, 1, 3)
             let vR = pr[2].reshaped(B, S, nKVHeads, headDim).transposed(0, 2, 1, 3)
-            let rPos: [Int32] = rows.flatMap { r in (0 ..< S).map { Int32(r + $0) } }
+            let deltas = Qwen4ExpBatch.rowRopeDeltas
+            if let deltas { precondition(deltas.count == B, "ragged decode needs one rope shift per row, got \(deltas.count) for B=\(B)") }
+            let rPos: [Int32] = rows.indices.flatMap { b in (0 ..< S).map { Int32(rows[b] + (deltas?[b] ?? 0) + $0) } }
             let (cR, sR) = rope.tables(rowPositions: rPos, B: B, S: S)                       // (B,S,d)
             let ce = expandedDimensions(cR, axis: 1), se = expandedDimensions(sR, axis: 1)  // (B,1,S,d)
             qR = Qwen4ExpRotary.apply(qR, cos: ce, sin: se)
             kR = Qwen4ExpRotary.apply(kR, cos: ce, sin: se)
-            if !(Self.ablKVUpdate && S == 1) {
+            if !(Self.ablKVUpdate && S == 1), !(Qwen4ExpQSAIndexer.ablVerifyKV && S > 1) {
                 if let rowLists {
                     for b in 0 ..< B {
                         (rowLists[b][0] as! KVCacheSimple).updateRow(keys: kR[b ..< (b + 1)], values: vR[b ..< (b + 1)], at: rows[b])
+                    }
+                    if S > 1, B * S >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("vkv") {
+                        for b in 0 ..< B {
+                            (rowLists[b][0] as! KVCacheSimple).updateRow(keys: kR[b ..< (b + 1)] + 0, values: vR[b ..< (b + 1)] + 0, at: rows[b])
+                        }
                     }
                 } else { kvc.updateRagged(keys: kR, values: vR, at: rows) }
             }
             let kvLenMax = rows.max()! + S
             let outR: MLXArray
-            if Qwen4ExpQSAIndexer.ablQSAGather, S == 1 { outR = qR }
+            if indexer == nil {
+                // T-0076 plain Qwen3.5: dense attention per row over its own committed keys (bottom-right causal)
+                var outs: [MLXArray] = []
+                for b in 0 ..< B {
+                    let len = rows[b] + S
+                    let (Kb, Vb): (MLXArray, MLXArray)
+                    if let rowLists {
+                        let kv = rowLists[b][0] as! KVCacheSimple
+                        Kb = kv.rawKeys![0..., 0..., 0 ..< len, 0...]; Vb = kv.rawValues![0..., 0..., 0 ..< len, 0...]
+                    } else {
+                        Kb = kvc.rawKeys![b ..< (b + 1), 0..., 0 ..< len, 0...]; Vb = kvc.rawValues![b ..< (b + 1), 0..., 0 ..< len, 0...]
+                    }
+                    outs.append(MLXFast.scaledDotProductAttention(queries: qR[b ..< (b + 1)], keys: Kb, values: Vb, scale: scale,
+                                                                  mask: S > 1 ? .causal : .none))
+                }
+                outR = B == 1 ? outs[0] : concatenated(outs, axis: 0)
+            }
+            else if Qwen4ExpQSAIndexer.ablQSAGather, S == 1 { outR = qR }
+            else if Qwen4ExpQSAIndexer.ablVerifyGather, S > 1 { outR = qR }
             else if let rowLists {
                 // the ragged kernel's arithmetic is per (row, head, query row): B one-row calls on the
                 // rows' own buffers compute what the B-row call computes on the stacked pool
-                outR = q4QSAGatherRaggedRows(q: qR, keys: rowLists.map { ($0[0] as! KVCacheSimple).rawKeys! },
-                                             values: rowLists.map { ($0[0] as! KVCacheSimple).rawValues! }, top: topR,
-                                             rowOffsets: rows, rowNBlocks: nBlocksRow, ratio: indexer.ratio, scale: scale)
+                let ks = rowLists.map { ($0[0] as! KVCacheSimple).rawKeys! }, vs = rowLists.map { ($0[0] as! KVCacheSimple).rawValues! }
+                var o = q4QSAGatherRaggedRows(q: qR, keys: ks, values: vs, top: topR,
+                                              rowOffsets: rows, rowNBlocks: nBlocksRow, ratio: indexer!.ratio, scale: scale)
+                if S > 1, Qwen4ExpQSAIndexer.dup.contains("vgather") {
+                    let o2 = q4QSAGatherRaggedRows(q: qR + 0, keys: ks, values: vs, top: topR,
+                                                   rowOffsets: rows, rowNBlocks: nBlocksRow, ratio: indexer!.ratio, scale: scale)
+                    o = o + o2 * 0
+                }
+                outR = o
             }
             else if Self.raggedSDPA, S == 1, kvLenMax < Qwen4ExpQSAIndexer.gatherMinKV {
                 // P095 U3-H: the serial program's attention at this context -- SDPA over the sparse
                 // mask (selected blocks + the row's own tail), one mask row per sequence over kvLenMax.
-                let ratio = indexer.ratio, nBlocksMax = nBlocksRow.max()!
+                let ratio = indexer!.ratio, nBlocksMax = nBlocksRow.max()!
                 let nbRow = MLXArray(nBlocksRow.map { Int32($0) }).reshaped(B, 1, 1)
                 var keep = MLXArray.zeros([B, 1, nBlocksMax + 1], dtype: .bool)
                 keep = putAlong(keep, topR, values: MLXArray(true), axis: -1)[.ellipsis, 0 ..< nBlocksMax]
@@ -1638,12 +1807,13 @@ final class Qwen4ExpAttention: Module {
                                                          scale: scale, mask: .array(maskR))
             } else {
                 outR = q4QSAGatherRagged(q: qR, keys: kvc.rawKeys!, values: kvc.rawValues!, top: topR,
-                                         rowOffsets: rows, rowNBlocks: nBlocksRow, ratio: indexer.ratio, scale: scale)
+                                         rowOffsets: rows, rowNBlocks: nBlocksRow, ratio: indexer!.ratio, scale: scale)
             }
             Q4Prof.mark("attn.core", [outR])
             let gatedR = (S == 1 ? outR.reshaped(B, 1, nHeads * headDim) : outR.transposed(0, 2, 1, 3).reshaped(B, S, nHeads * headDim)) * sigmoid(gateR)
             if Self.ablOProj { return gatedR[.ellipsis, 0 ..< oProj.weight.dim(0)] }   // a slice keeps the front end alive
-            let projR = q8Proj(oProj, gatedR)
+            var projR = q8Proj(oProj, gatedR)
+            if S > 1, B * S >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("attnproj") { projR = projR + q8Proj(oProj, gatedR + 0) * 0 }
             Q4Prof.mark("attn.oproj", [projR])
             // P081 witness, second stage: row 0's q/k after rope, the gather output and the layer's
             // attention result. With the indexer already proven identical between B=1 and B=2, this
@@ -1663,9 +1833,9 @@ final class Qwen4ExpAttention: Module {
         }
         Q4Prof.mark("attn.qkvi", [qkvi])
         let parts = split(qkvi, indices: [qDim, qDim + kvDim, qDim + 2 * kvDim], axis: -1)
-        let sparse = indexer(qk: parts[3], rope: rope, keyCache: indexerCache, offset: offset, pos3: pos3,
-                             mropeSection: mropeSection)
-        if Q4Prof.active { var a: [MLXArray] = []; if let t = indexer.lastTop?.0 { a.append(t) }; if let m = sparse { a.append(m) }; Q4Prof.mark("attn.indexer", a) }
+        let sparse = indexer.flatMap { $0(qk: parts[3], rope: rope, keyCache: indexerCache, offset: offset, pos3: pos3,
+                                           mropeSection: mropeSection) }
+        if Q4Prof.active { var a: [MLXArray] = []; if let t = indexer?.lastTop?.0 { a.append(t) }; if let m = sparse { a.append(m) }; Q4Prof.mark("attn.indexer", a) }
         if Q4Fused.attnFront && S == 1 {
             // decode: q/k norm + partial rope + v + sigmoid(gate) in one kernel (no transposes, no slices); sdpa output (B,H,1,D) is
             // already in (B,1,H*D) order, so the gated product feeds o_proj without a copy
@@ -1676,7 +1846,7 @@ final class Qwen4ExpAttention: Module {
             var fm = mask
             if let sparse { fm = .array(Self.sparseMask(sparse, S: S, offset: offset)) }
             let out: MLXArray
-            if let (top, nBlocks, kvLen) = indexer.lastTop, let kvc = cache as? KVCacheSimple {
+            if let indexer, let (top, nBlocks, kvLen) = indexer.lastTop, let kvc = cache as? KVCacheSimple {
                 // P054: ENGINE_ABL_SKIP=attnkvstale pays the write's own cost in full but hands the
                 // gather the PRE-write arrays anyway, to separate OBS-ENG-122 (2)'s growing cost from
                 // a read-side confound `attnkv` (which skips the write too) cannot isolate on its own.
@@ -1722,7 +1892,7 @@ final class Qwen4ExpAttention: Module {
         let out: MLXArray
         let gqa = nHeads / nKVHeads
         let rowsPerCall = max(1, 32 / gqa)                       // MLX's sdpa_vector takes q_len * gqa <= 32 query rows per kv head
-        if let (top, nBlocks, kvLen) = indexer.lastTop, S <= Qwen4ExpQSAIndexer.gatherMaxS, let kvc = cache as? KVCacheSimple {
+        if let indexer, let (top, nBlocks, kvLen) = indexer.lastTop, S <= Qwen4ExpQSAIndexer.gatherMaxS, let kvc = cache as? KVCacheSimple {
             if !(Self.ablKVUpdate && S == 1) {
                 if Self.kvUpdateLean { kvc.updateNoReturn(keys: k, values: v) } else { _ = kvc.update(keys: k, values: v) }
             }
@@ -1813,9 +1983,81 @@ final class Qwen4ExpGatedDeltaNet: Module {
     /// state after the first `n` rows of the last multi-token block (no projections re-run)
     /// P099: per-row replay after a batched verify block -- row b keeps its first keep[b] rows of the tape; rows that
     /// kept the whole block are left as the forward wrote them (the same computation).
+    /// T-0110: roll back ALL rows of a verify block in one masked recurrence call instead of one call per partially
+    /// accepted row (36 layers x B rows of slices, gate math, a kernel and slice updates per round). Row b replays its
+    /// first keep[b] steps from its pre-block state: the masked kernel skips steps t >= keep[b] and leaves the state
+    /// untouched there, so every row runs exactly the arithmetic of its own per-row call (same kernel body, same per-thread
+    /// order, elementwise gate math), and a fully accepted row keeps the forward's state as before. ENGINE_GDN_ROW_REPLAY=1
+    /// restores the per-row loop.
+    static let rowReplay = ProcessInfo.processInfo.environment["ENGINE_GDN_ROW_REPLAY"] == "1"
+
+    /// T-0151 slot probe: the slot each row's next round starts from (ENGINE_GDN_SLOTS=1), keyed by the layer cache
+    nonisolated(unsafe) static var slotIdx: [ObjectIdentifier: MLXArray] = [:]
+    /// witness: how many verify forwards took the slot kernel (the W10 first try ran none: the gate branch it lived in is off)
+    nonisolated(unsafe) public static var slotForwards = 0
+    /// the slot forward for a batched verify block, nil when the probe is off or the block does not qualify
+    func slotForward(q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, cache: ArraysCache?, B: Int, S: Int)
+        -> (MLXArray, MLXArray)? {
+        guard q4GDNSlots, let cache, S > 1, S <= 16, B > 1, let st = cache[1], st.dtype == .float32 else { return nil }
+        let id = ObjectIdentifier(cache)
+        let idx = st.ndim == 5 ? (Self.slotIdx[id] ?? MLXArray.full([B], values: MLXArray(Int32(st.dim(1) - 1))))
+                               : MLXArray.zeros([B], dtype: .int32)
+        let r = q4GDNForwardSlots(q: q, k: k, v: v, g: g, beta: beta, stateSrc: st, srcIdx: idx)
+        Self.slotIdx[id] = MLXArray.full([B], values: MLXArray(Int32(S - 1)))   // all accepted until a roll-back says otherwise
+        Self.slotForwards += 1
+        return r
+    }
+    /// a slot-mode state [B, T, Hv, Dv, Dk] back to the plain [B, Hv, Dv, Dk] state at each row's slot (any other reader)
+    static func materializeSlots(_ cache: ArraysCache) {
+        guard let st = cache[1], st.ndim == 5 else { return }
+        let B = st.dim(0), T = st.dim(1)
+        let idx = slotIdx[ObjectIdentifier(cache)] ?? MLXArray.full([B], values: MLXArray(Int32(T - 1)))
+        let flat = MLXArray((0 ..< B).map { Int32($0 * T) }) + idx
+        cache[1] = st.reshaped([B * T] + Array(st.shape.dropFirst(2))).take(flat, axis: 0)
+        slotIdx[ObjectIdentifier(cache)] = nil
+    }
+
     func replayPrefixRows(cache: ArraysCache, keep: [Int]) {
         guard let tape = cache.prefixReplayTape else { return }
         let S = tape.rowCount, B = keep.count
+        if q4GDNSlots, let st = cache[1], st.ndim == 5, st.dim(1) == S {
+            // slot probe: no state work at all -- the next forward starts each row from its slot keep - 1
+            Self.slotIdx[ObjectIdentifier(cache)] = MLXArray(keep.map { Int32($0 - 1) })
+            let partial = keep.map { $0 < S }
+            let ci = MLXArray((0 ..< B).flatMap { b in (0 ..< tape.convStateRows).map { Int32(keep[b] + $0) } })
+                .reshaped(B, tape.convStateRows, 1)
+            cache[0] = which(MLXArray(partial).reshaped(B, 1, 1), takeAlong(tape.convInput, ci, axis: 1), cache[0]!)
+            cache.prefixReplayTape = nil
+            return
+        }
+        // T-0151 in-situ ablation (TIMING ONLY, the state stays the forward's): ENGINE_ABL_SKIP=rollback skips the whole
+        // roll-back, =rollbackssm only the recurrent-state half (gate math + q4_gdn_rollback), keeping the conv gather
+        let abl = Qwen4ExpDecoderLayer.ablSkip
+        if abl.contains("rollback") { cache.prefixReplayTape = nil; return }
+        if !Self.rowReplay, B > 1, let pre = tape.ssmPre {
+            let partial = keep.map { $0 < S }
+            if abl.contains("rollbackssm") {
+                let ci = MLXArray((0 ..< B).flatMap { b in (0 ..< tape.convStateRows).map { Int32(keep[b] + $0) } })
+                    .reshaped(B, tape.convStateRows, 1)
+                cache[0] = which(MLXArray(partial).reshaped(B, 1, 1), takeAlong(tape.convInput, ci, axis: 1), cache[0]!)
+                _ = pre
+                cache.prefixReplayTape = nil
+                return
+            }
+            // the replay's gate math (gatedDeltaUpdate: sigmoid(b) and computeGatedDeltaG, elementwise) for all rows at once
+            let beta = sigmoid(tape.b).asType(.float32)
+            let g = exp(-exp(aLogEff.asType(.float32)) * softplus(tape.a + dtBias))
+            cache[1] = q4GDNRollback(q: tape.q, k: tape.k, v: tape.v, g: g, beta: beta,
+                                     statePre: pre.dtype == .float32 ? pre : pre.asType(.float32), stateFwd: cache[1]!,
+                                     steps: (0 ..< B).map { partial[$0] ? keep[$0] : -1 })
+            // conv state: row b's rows n ..< n + convStateRows of its concatenated conv input (a gather, the same values)
+            let ci = MLXArray((0 ..< B).flatMap { b in (0 ..< tape.convStateRows).map { Int32(keep[b] + $0) } })
+                .reshaped(B, tape.convStateRows, 1)
+            let rolled = takeAlong(tape.convInput, ci, axis: 1)
+            cache[0] = which(MLXArray(partial).reshaped(B, 1, 1), rolled, cache[0]!)
+            cache.prefixReplayTape = nil
+            return
+        }
         var state = cache[1]!, conv = cache[0]!
         for b in 0 ..< B where keep[b] < S {
             let n = keep[b]
@@ -1849,7 +2091,8 @@ final class Qwen4ExpGatedDeltaNet: Module {
 
     func callAsFunction(_ x: MLXArray, cache: ArraysCache?) -> MLXArray {
         let B = x.dim(0), S = x.dim(1)
-        let qkvz = q8Proj(inProjQKVZ, x)
+        var qkvz = q8Proj(inProjQKVZ, x)
+        if S > 1, B * S >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("gdnin") { qkvz = qkvz + q8Proj(inProjQKVZ, x + 0) * 0 }
         let mixedQKV = qkvz[.ellipsis, 0 ..< convDim]
         let z = qkvz[.ellipsis, convDim...].reshaped(B, S, nV, dV)
         let ba = prefillProjection(inProjBA, x, "ba")
@@ -1885,7 +2128,14 @@ final class Qwen4ExpGatedDeltaNet: Module {
         // replay tape (partial-acceptance rollback of an MTP verify block) still needs the concatenated form, but only
         // for the small S it is ever replayed at -- a prefill chunk is never rolled back.
         let convOut: MLXArray
-        if q4GDNConvPrefillOn && S > 64 && S >= convKernel - 1 && B == 1 {
+        if q4GDNConvPrefillOn && q4GDNConvPrefillTail && S > 64 && S >= convKernel - 1 && B == 1 {
+            // T-0156: the next conv state from the same kernel (no separate strided-slice copy)
+            let (y, tail) = q4GDNConvPrefillWithTail(qkvz: qkvz.reshaped(B * S, qkvz.dim(-1)), convState: convState,
+                                                     convW: conv1d.weight, convDim: convDim, kernel: convKernel)
+            convOut = y.reshaped(B, S, convDim)
+            convInput = tail.reshaped(B, convKernel - 1, convDim)
+            if let cache { cache[0] = convInput }
+        } else if q4GDNConvPrefillOn && S > 64 && S >= convKernel - 1 && B == 1 {
             convOut = q4GDNConvPrefill(qkvz: qkvz.reshaped(B * S, qkvz.dim(-1)), convState: convState,
                                        convW: conv1d.weight, convDim: convDim, kernel: convKernel)
                 .reshaped(B, S, convDim)
@@ -1920,7 +2170,7 @@ final class Qwen4ExpGatedDeltaNet: Module {
         }
         }
         Q4Prof.mark("gdn.headnorm", [q, k, v])
-        let out: MLXArray, newState: MLXArray
+        var out: MLXArray, newState: MLXArray
         let ablG = Qwen4ExpDecoderLayer.ablSkip
         if ablG.contains("gdnrecur") {
             // timing ablation only: no gate math, no recurrence
@@ -1931,9 +2181,32 @@ final class Qwen4ExpGatedDeltaNet: Module {
         } else if Q4Fused.gdnGate {
             if aLogT == nil || aLogT!.dtype != x.dtype { aLogT = aLogEff.asType(x.dtype); dtBiasT = dtBias.asType(x.dtype); eval(aLogT!, dtBiasT!) }
             let (g, beta) = q4GDNGate(ba: ba, aLog: aLogT!, dtBias: dtBiasT!, nV: nV)
-            (out, newState) = gatedDeltaUpdatePrecomputed(q: q, k: k, v: v, g: g, beta: beta, state: cache?[1], mask: nil)
+            if let (o, ns) = slotForward(q: q, k: k, v: v, g: g, beta: beta, cache: cache, B: B, S: S) { (out, newState) = (o, ns) } else {
+            if let cache { Self.materializeSlots(cache) }
+            if q4GDNRowsOn, S >= q4GDNRowsMinT, let r = q4GDNRows(q: q, k: k, v: v, g: g, beta: beta, state: cache?[1]) {
+                (out, newState) = r     // T-0194: bit-identical, x1.5-2 at prefill lengths (C-0628)
+            } else {
+                (out, newState) = gatedDeltaUpdatePrecomputed(q: q, k: k, v: v, g: g, beta: beta, state: cache?[1], mask: nil)
+            }
+            }
+            if S > 1, Qwen4ExpQSAIndexer.dup.contains("gdnrecur") {
+                let (o2, s2) = gatedDeltaUpdatePrecomputed(q: q + 0, k: k, v: v, g: g, beta: beta, state: cache?[1], mask: nil)
+                out = out + o2 * 0; newState = newState + s2 * 0
+            }
+        } else if q4GDNSlots, let cache, S > 1, S <= 16, B > 1,
+                  let (o, ns) = slotForward(q: q, k: k, v: v, g: exp(-exp(aLogEff.asType(.float32)) * softplus(a + dtBias)),
+                                            beta: sigmoid(b).asType(.float32), cache: cache, B: B, S: S) {
+            (out, newState) = (o, ns)   // gate math exactly as gatedDeltaUpdate computes it (computeGatedDeltaG, sigmoid)
         } else {
-            (out, newState) = gatedDeltaUpdate(q: q, k: k, v: v, a: a, b: b, aLog: aLogEff, dtBias: dtBias, state: cache?[1], mask: nil)
+            if let cache { Self.materializeSlots(cache) }
+            // T-0194: production's path (ENGINE_FUSE_MASK has no gdnGate bit; W95's first arm wired only the gdnGate branch
+            // and the kernel never ran, C-0629)
+            if q4GDNRowsOn, S >= q4GDNRowsMinT,
+               let r = q4GDNRowsFromGate(q: q, k: k, v: v, a: a, b: b, aLog: aLogEff, dtBias: dtBias, state: cache?[1]) {
+                (out, newState) = r
+            } else {
+                (out, newState) = gatedDeltaUpdate(q: q, k: k, v: v, a: a, b: b, aLog: aLogEff, dtBias: dtBias, state: cache?[1], mask: nil)
+            }
         }
         Q4Prof.mark("gdn.recur", [out, newState])
         if let cache {
@@ -1950,12 +2223,13 @@ final class Qwen4ExpGatedDeltaNet: Module {
             }
         }
         // the recurrence runs in float32; the model runs in x.dtype (bf16) -- do not let fp32 leak out
-        let r: MLXArray
+        var r: MLXArray
         if Qwen4ExpDecoderLayer.ablSkip.contains("gdnnorm") {
             r = q8Proj(outProj, out.reshaped(B, S, valueDim))   // timing ablation only: no gated norm
         } else if Q4Fused.gdnFront {
             let n = q4GatedNormSG(out, weight: norm.weight, gate: z, headDim: dV, eps: norm.eps, sigmoidGate: norm.sigmoidGate, outDType: x.dtype)
             r = q8Proj(outProj, n.reshaped(B, S, valueDim))
+            if S > 1, B * S >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("gdnout") { r = r + q8Proj(outProj, n.reshaped(B, S, valueDim) + 0) * 0 }
         } else if Q4Fused.gatedNorm {
             let n = q4GatedNorm(out, weight: norm.weight, gate: z, headDim: dV, eps: norm.eps, sigmoidGate: norm.sigmoidGate, outDType: x.dtype)
             r = q8Proj(outProj, n.reshaped(B, S, valueDim))
@@ -2034,6 +2308,8 @@ final class Qwen4ExpSparseMoeBlock: Module {
             if w.dim(-1) == inDim / 8, s.dim(-1) == inDim / 32 { return Q4ExpertBank(w: w, s: s, b: b, bits: 4, group: 32) }
             // 8-bit: 4 values per uint32 -> in/4; g64: scales last dim = in/64
             if Q4Fused.moeExperts8, w.dim(-1) == inDim / 4, s.dim(-1) == inDim / 64 { return Q4ExpertBank(w: w, s: s, b: b, bits: 8, group: 64) }
+            // T-0076: 8-bit g32 (a GGUF Q8_0 bank carried exactly); the 8-bit kernels take the group as GS
+            if Q4Fused.moeExperts8, w.dim(-1) == inDim / 4, s.dim(-1) == inDim / 32 { return Q4ExpertBank(w: w, s: s, b: b, bits: 8, group: 32) }
             return nil
         }
         let D = gateSG.weight.dim(-1)
@@ -2041,11 +2317,31 @@ final class Qwen4ExpSparseMoeBlock: Module {
         let I = g.w.dim(1)
         guard let d = bank("down_proj", inDim: I) else { return nil }
         // MIXED formats would read one bank with the other's unpack. Refuse rather than compute garbage.
-        guard g.bits == u.bits, u.bits == d.bits else { return nil }
+        guard g.bits == u.bits, u.bits == d.bits, g.group == u.group else { return nil }   // gate/up share one scale index
         // the no-lane variant has no 8-bit twin (q4MoEExperts precondition)
         guard g.bits == 4 || Q4Fused.moeDownLane else { return nil }
         banksCache = (g, u, d, I)
         return banksCache
+    }
+    /// T-0173: the shared expert's weights split into the routed-expert layout (gate | up halves of the merged 8-bit g64
+    /// gate_up_proj, and down_proj), materialized once; nil when the shared expert is not 8-bit g64 with intermediate I
+    private var sharedBankCache: (gw: MLXArray, gs: MLXArray, gb: MLXArray, uw: MLXArray, us: MLXArray, ub: MLXArray,
+                                  dw: MLXArray, ds: MLXArray, db: MLXArray)? = nil
+    private var sharedBankTried = false
+    func sharedBank(I: Int) -> (gw: MLXArray, gs: MLXArray, gb: MLXArray, uw: MLXArray, us: MLXArray, ub: MLXArray,
+                                dw: MLXArray, ds: MLXArray, db: MLXArray)? {
+        if sharedBankTried { return sharedBankCache }
+        sharedBankTried = true
+        guard let gu = sharedExpert.gateUpProj as? QuantizedLinear, let dn = sharedExpert.downProj as? QuantizedLinear,
+              gu.bits == 8, gu.groupSize == 64, dn.bits == 8, dn.groupSize == 64, let gub = gu.biases, let dnb = dn.biases,
+              gu.weight.dim(0) == 2 * I else { return nil }
+        let copy = { (a: MLXArray) in concatenated([a], axis: 0) }
+        let r = (gw: copy(gu.weight[0 ..< I]), gs: copy(gu.scales[0 ..< I]), gb: copy(gub[0 ..< I]),
+                 uw: copy(gu.weight[I ..< (2 * I)]), us: copy(gu.scales[I ..< (2 * I)]), ub: copy(gub[I ..< (2 * I)]),
+                 dw: dn.weight, ds: dn.scales, db: dnb)
+        eval(r.gw, r.gs, r.gb, r.uw, r.us, r.ub)
+        sharedBankCache = r
+        return r
     }
     /// P025: what the fused expert path actually resolves to on THIS checkpoint. Read at decode
     /// widths (rows = 1), which is the only place the path is reachable.
@@ -2143,6 +2439,39 @@ final class Qwen4ExpSparseMoeBlock: Module {
         }
         if Q4Fused.moeExperts && rows <= q4MoEFusedMaxRows, let banks = expertBanks() {
             let xf = x.reshaped(rows, x.dim(-1)); let idf = idx.reshaped(rows, topK); let wf = w.reshaped(rows, topK)
+            // T-0173: the shared expert as slot K of the multi-row expert kernels (ENGINE_MOE_SHARED_FOLD=1, default off)
+            if q8MoESharedFold, Q4Fused.moeDownLane, Q4Fused.moeExperts8MR, rows >= 2, rows <= 8, banks.0.bits == 8,
+               banks.0.group == 64, let sh = sharedBank(I: banks.3) {
+                if q8MoESharedFoldMode == 2 {
+                    let yk = q8MoEExpertsFoldKernelsK(x: xf, idx: idf, gate: banks.0, up: banks.1, down: banks.2, shared: sh,
+                                                      experts: numExperts, K: topK, D: x.dim(-1), I: banks.3)
+                    return q4MoECombine(y: yk, w: wf, shared: sharedExpert(x), gate: sgate, topK: topK, d: x.dim(-1))
+                }
+                if q8MoESharedFoldMode == 4 {   // TIMING ONLY: the shared expert skipped (wrong output) -- its in-model cost
+                    let yk = q4MoEExpertsK(x: xf, idx: idf, gate: banks.0, up: banks.1, down: banks.2, K: topK, D: x.dim(-1), I: banks.3)
+                    return q4MoECombine(y: yk, w: wf, shared: MLXArray.zeros(x.shape, dtype: x.dtype), gate: sgate, topK: topK, d: x.dim(-1))
+                }
+                if q8MoESharedFoldMode == 3 {
+                    let yk = q4MoEExpertsK(x: xf, idx: idf, gate: banks.0, up: banks.1, down: banks.2, K: topK, D: x.dim(-1), I: banks.3)
+                    let shf = q8MoESharedOnly(x: xf, shared: sh, experts: numExperts, D: x.dim(-1), I: banks.3).reshaped(x.shape)
+                    return q4MoECombine(y: yk, w: wf, shared: shf, gate: sgate, topK: topK, d: x.dim(-1))
+                }
+                let folded = q8MoEExpertsSharedFold(x: xf, idx: idf, w: wf, sharedGate: sgate.reshaped(rows),
+                                                    gate: banks.0, up: banks.1, down: banks.2, shared: sh,
+                                                    experts: numExperts, K: topK, D: x.dim(-1), I: banks.3, outShape: x.shape)
+                if q8MoESharedFoldCheck {
+                    // instrument: the shipped path on the same input, compared once per call (host sync: diagnostic only)
+                    let yk = q4MoEExpertsK(x: xf, idx: idf, gate: banks.0, up: banks.1, down: banks.2, K: topK, D: x.dim(-1), I: banks.3)
+                    let ref = q4MoECombine(y: yk, w: wf, shared: sharedExpert(x), gate: sgate, topK: topK, d: x.dim(-1))
+                    let shRef = sharedExpert(x).reshaped(rows, x.dim(-1)).asType(.float32)
+                    let shNew = q8MoESharedOnly(x: xf, shared: sh, experts: numExperts, D: x.dim(-1), I: banks.3).asType(.float32)
+                    let d = abs(folded.asType(.float32) - ref.asType(.float32)).max().item(Float.self)
+                    let m = abs(ref.asType(.float32)).max().item(Float.self)
+                    let ds = abs(shNew - shRef).max().item(Float.self), ms = abs(shRef).max().item(Float.self)
+                    FileHandle.standardError.write(String(format: "shared-fold-check rows=%d combined max|d| %.3e (ref max %.3e) shared max|d| %.3e (ref max %.3e)\n", rows, d, m, ds, ms).data(using: .utf8)!)
+                }
+                return folded
+            }
             if Q4Fused.moeDownLane {
                 let yk = q4MoEExpertsK(x: xf, idx: idf, gate: banks.0, up: banks.1, down: banks.2, K: topK, D: x.dim(-1), I: banks.3)
                 return q4MoECombine(y: yk, w: wf, shared: sharedExpert(x), gate: sgate, topK: topK, d: x.dim(-1))
@@ -2151,7 +2480,8 @@ final class Qwen4ExpSparseMoeBlock: Module {
                                  K: topK, D: x.dim(-1), I: banks.3).reshaped(x.shape)
             return y + sigmoid(sgate) * sharedExpert(x)
         }
-        let yk = switchMLP(x, idx)
+        var yk = switchMLP(x, idx)
+        if rows >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("moe") { yk = yk + switchMLP(x + 0, idx) * 0 }
         if Q4Fused.moeCombine {
             return q4MoECombine(y: yk, w: w, shared: sharedExpert(x), gate: sgate, topK: topK, d: x.dim(-1))
         }
@@ -2251,7 +2581,8 @@ final class Qwen4ExpGatedResidual: Module {
         // MTP drafts run-to-run nondeterministic. lab/hc_chain_dram.py: 61.6 -> 41.0 us per HC (rows=1), 86.3 -> 51.8 (rows=4).
         let winj = inject?.weight ?? MLXArray.zeros([hc, hc * d], dtype: hyper.dtype)
         let (mixed, injp): (MLXArray, MLXArray)
-        if Q4Fused.hcSplitK, let parts = q8ProjSplitKPartials(mixDown, normed, split: Self.hcSplit) {
+        if Q4Fused.hcSplitK, let parts = q8ProjSplitKPartials(mixDown, normed, split: Self.hcSplit, maxRows: q8SplitKMaxRows) {
+            if normed.size / (hc * d) > 8 { EngineWitness.hit("hc_splitk_rows_9_16") }
             (mixed, injp) = q4HCUpMix(down: parts, normed: normed, up: up, winj: winj, hc: hc, d: d, downSplits: Self.hcSplit)
         } else {
             let down = q8Proj(mixDown, normed)
@@ -2270,6 +2601,24 @@ final class Qwen4ExpGatedResidual: Module {
         }
         let normed = pre ?? hcNorm(hyper)
         Q4Prof.mark("hc.norm", [normed])
+        // T-0115/T-0117: verify widths (17..64 rows) through the three straight-line kernels (Qwen4ExpHCVerify.swift);
+        // ENGINE_HC_VERIFY_CHECK logs them against the qmm path per call and keeps the qmm result
+        if q4HCVerifyFusedOn || q4HCVerifyCheck, debugSink == nil, Q4Fused.hcMix, Q4Fused.hcInject, q4HCMixInjectOn, let inject,
+           inject.weight.dtype == hyper.dtype, let dq = mixDown as? QuantizedLinear, let uq = mixUp as? QuantizedLinear,
+           let r = q4HCVerifyFused(normed: normed, down: dq, up: uq, winj: inject.weight, hc: hc, d: d) {
+            if !q4HCVerifyCheck { Q4Prof.mark("hc.mix", [r.0, r.1]); return r }
+            let down = prefillProjection(mixDown, normed, "hc")
+            let u = mixUp(Q4Fused.siluDiv ? q4SiluDiv(down, by: hc) : q4Silu(down / Float(hc)))
+            let (m0, i0) = q4HCMixInject(normed: normed, u: u, winj: inject.weight, hc: hc, d: d, rows: q4HCMixInjectRows)
+            let dm = abs(r.0.asType(.float32) - m0.asType(.float32)).max().item(Float.self)
+            let am = abs(m0.asType(.float32)).max().item(Float.self)
+            let di = abs(r.1.asType(.float32) - i0.asType(.float32)).max().item(Float.self)
+            let ai = abs(i0.asType(.float32)).max().item(Float.self)
+            let ne = (r.0.asType(.float32) .!= m0.asType(.float32)).asType(.float32).mean().item(Float.self)
+            FileHandle.standardError.write(String(format: "hcv-check rows=%d max|d| mixed %.3e (max|ref| %.3e, %.4f of elements differ) inj %.3e (max|ref| %.3e)\n",
+                                                  hyper.size / (hc * d), dm, am, ne, di, ai).data(using: .utf8)!)
+            return (m0, i0)
+        }
         debugSink?("hc_normed", normed)
         debugSink?("hc_norm_weight", expandedDimensions(hcNorm.weight, axis: 0))
         let down = prefillProjection(mixDown, normed, "hc")
@@ -2522,6 +2871,39 @@ private let qwen4ExpNgramRowsKernel = MLXFast.metalKernel(
         }
         """
 )
+/// T-0198 (ENGINE_RUNTIME_ROWS=1): the same body with T from an int32 input
+private let qwen4ExpNgramRowsRTKernel = MLXFast.metalKernel(
+    name: "qwen4_exp_ngram_rows_rt",
+    inputNames: ["hist", "mults", "vocab", "offs", "rtv"],
+    outputNames: ["rows"],
+    source: """
+        const uint T = uint(rtv[0]);
+        uint idx = thread_position_in_grid.x;            // b * T + t
+        uint b = idx / T;
+        uint t = idx % T;
+        uint base = b * (CTX + T);
+        uint pos = t + CTX;                              // position in the history row
+        long seg = CTX + 1;                              // >= any shift we use
+        for (uint back = 1; back <= CTX; ++back) {
+            if (hist[base + pos - back] == EOS) { seg = (long)back - 1; break; }
+        }
+        ulong mixed = (ulong)(long)hist[base + pos] * (ulong)mults[0];
+        uint p = 1;
+        for (uint n = 2; n <= NGRAM; ++n) {
+            for (; p < n; ++p) {
+                long shifted = (seg >= (long)p) ? (long)hist[base + pos - p] : (long)EOS;
+                mixed ^= (ulong)shifted * (ulong)mults[p];
+            }
+            uint h0 = (n - 2) * HPN;
+            for (uint hh = h0; hh < h0 + HPN; ++hh) {
+                long m = (long)mixed;
+                long v = vocab[hh];
+                long r = m % v; if (r < 0) r += v;
+                rows[idx * NHEADS + hh] = (int)(r + offs[hh]);
+            }
+        }
+        """
+)
 
 final class Qwen4ExpNGramEmbedding: Module {
     /// Built from the config (seed) at init; REPLACED after load by the checkpoint's own
@@ -2609,6 +2991,15 @@ final class Qwen4ExpNGramEmbedding: Module {
     func rowIdsDevice(ids: MLXArray, prev: MLXArray) -> MLXArray {
         let B = ids.dim(0), T = ids.dim(1), ctx = hash.ngramSize - 1
         let hist = concatenated([prev.asType(.int32), ids.asType(.int32)], axis: 1)
+        if q4RuntimeRows {
+            EngineWitness.hit("runtime_rows")
+            return qwen4ExpNgramRowsRTKernel(
+                [hist, multsDev!, vocabDev!, offsDev!, q4RuntimeInts([T])],
+                template: [("CTX", ctx), ("NGRAM", hash.ngramSize), ("HPN", hash.headsPerNgram),
+                           ("NHEADS", hash.nHeads), ("EOS", hash.eos)],
+                grid: (B * T, 1, 1), threadGroup: (min(B * T, 256), 1, 1),
+                outputShapes: [[B, T, hash.nHeads]], outputDTypes: [.int32])[0]
+        }
         return qwen4ExpNgramRowsKernel(
             [hist, multsDev!, vocabDev!, offsDev!],
             template: [("T", T), ("CTX", ctx), ("NGRAM", hash.ngramSize), ("HPN", hash.headsPerNgram),
@@ -2720,8 +3111,11 @@ final class Qwen4ExpDecoderLayer: Module {
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen4ExpAttention?
     @ModuleInfo(key: "mlp") var mlp: Qwen4ExpSparseMoeBlock
     @ModuleInfo(key: "ple") var ple: Qwen4ExpPLELayer?
-    @ModuleInfo(key: "attn_hyper_connection") var attnHC: Qwen4ExpGatedResidual
-    @ModuleInfo(key: "mlp_hyper_connection") var mlpHC: Qwen4ExpGatedResidual
+    @ModuleInfo(key: "attn_hyper_connection") var attnHC: Qwen4ExpGatedResidual!
+    @ModuleInfo(key: "mlp_hyper_connection") var mlpHC: Qwen4ExpGatedResidual!
+    /// T-0076 plain Qwen3.5: one residual stream with pre-norms instead of the hyper-connections
+    @ModuleInfo(key: "input_layernorm") var inputNorm: Qwen4ExpRMSNorm?
+    @ModuleInfo(key: "post_attention_layernorm") var postNorm: Qwen4ExpRMSNorm?
 
     init(_ a: Qwen4ExpTextConfiguration, layerIdx: Int) {
         isLinear = a.layerTypes[layerIdx] == "linear_attention"
@@ -2734,9 +3128,36 @@ final class Qwen4ExpDecoderLayer: Module {
         if let pleIdx = a.pleLayerIds.firstIndex(of: layerIdx + 1) {
             _ple.wrappedValue = Qwen4ExpPLELayer(a, pleLayerIndex: pleIdx)
         }
-        _attnHC.wrappedValue = Qwen4ExpGatedResidual(a)
-        _mlpHC.wrappedValue = Qwen4ExpGatedResidual(a)
+        if a.plain {
+            _inputNorm.wrappedValue = Qwen4ExpRMSNorm(dimensions: a.hiddenSize, eps: a.rmsNormEps)
+            _postNorm.wrappedValue = Qwen4ExpRMSNorm(dimensions: a.hiddenSize, eps: a.rmsNormEps)
+        } else {
+            _attnHC.wrappedValue = Qwen4ExpGatedResidual(a)
+            _mlpHC.wrappedValue = Qwen4ExpGatedResidual(a)
+        }
         super.init()
+    }
+
+    /// T-0076: the plain Qwen3.5 layer -- h + mixer(norm(h)), then + moe(norm(.)).
+    func plainForward(_ h: MLXArray, rope: Qwen4ExpRotary, mask: MLXFast.ScaledDotProductAttentionMaskMode,
+                      cache: KVCache?, dump: ((String, MLXArray) -> Void)?, pos3: MLXArray?, mropeSection: [Int]) -> MLXArray {
+        var x = inputNorm!(h)
+        dump?("attn_in", x)
+        if let linearAttn {
+            x = linearAttn(x, cache: cache as? ArraysCache)
+        } else {
+            let list = cache as? CacheList
+            x = selfAttn!(x, rope: rope, mask: mask, cache: list?[0], indexerCache: list?[1] as? ArraysCache, pos3: pos3, mropeSection: mropeSection)
+        }
+        dump?("attn_out", x)
+        let h1 = h + x
+        let y = postNorm!(h1)
+        let m = mlp(y)
+        Q4Prof.mark("moe", [m])
+        dump?("mlp_out", m)
+        let r = h1 + m
+        dump?("layer", r)
+        return r
     }
 
     private static let combineCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: false) { a in
@@ -2749,7 +3170,7 @@ final class Qwen4ExpDecoderLayer: Module {
         return hyper + prod.reshaped(lead + [-1])
     }
     /// combine; when `next` (the HC that consumes the result) runs the fused chain, also emit its grouped norm
-    private func combineChained(_ hyper: MLXArray, _ x: MLXArray, _ inject: MLXArray, next: Qwen4ExpGatedResidual?) -> (MLXArray, MLXArray?) {
+    func combineChained(_ hyper: MLXArray, _ x: MLXArray, _ inject: MLXArray, next: Qwen4ExpGatedResidual?) -> (MLXArray, MLXArray?) {
         // P020 unit 7 (prefill): the combine wrote the 84 MB residual stream and the next hyper-connection's grouped
         // norm read it straight back. One kernel does both -- bit-identical, one fewer full pass over the stream.
         if q4HCChainPrefill, Q4Fused.hcMix, Q4Fused.hcInject, let next, inject.ndim == 2 || inject.ndim == 3,
@@ -2797,6 +3218,9 @@ final class Qwen4ExpDecoderLayer: Module {
                      cache: KVCache?, ids: MLXArray, prev: MLXArray, normedIn: MLXArray?, next: Qwen4ExpGatedResidual?,
                      dump: ((String, MLXArray) -> Void)? = nil,
                      pos3: MLXArray? = nil, mropeSection: [Int] = [11, 11, 10]) -> (MLXArray, MLXArray?) {
+        if inputNorm != nil {
+            return (plainForward(h, rope: rope, mask: mask, cache: cache, dump: dump, pos3: pos3, mropeSection: mropeSection), nil)
+        }
         var h = h
         var normedIn = normedIn
         let abl = Self.ablSkip
@@ -2812,13 +3236,19 @@ final class Qwen4ExpDecoderLayer: Module {
             return (h + tiled(x, repetitions: [1, 1, attnHC.hc]), nil)
         }
         if let ple, !Qwen4ExpEnv.noPLE, !abl.contains("ple") {
-            let p = ple(h, ids: ids, prev: prev, cache: cache as? ArraysCache)
+            var p = ple(h, ids: ids, prev: prev, cache: cache as? ArraysCache)
+            if h.size / h.dim(-1) >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("ple") {
+                p = p + ple(h + 0, ids: ids, prev: prev, cache: nil) * 0
+            }
             Q4Prof.mark("ple", [p])
             dump?("ple", p)
             h = h + p
             normedIn = nil                                   // the residual changed after the previous combine
         }
         var (x, inj) = attnHC(h, normed: dump == nil ? normedIn : nil)
+        let dupS = Qwen4ExpQSAIndexer.dup, dupOK = h.size / h.dim(-1) >= Qwen4ExpQSAIndexer.dupMinRows
+        if dupOK, dupS.contains("hc") { let (xd, jd) = attnHC(h + 0, normed: nil); x = x + xd * 0; inj = inj! + jd! * 0 }
+        if dupOK, dupS.contains("noop") { x = x + (x + 0) * 0 }
         Q4Prof.mark("hc_attn", [x, inj!])
         dump?("attn_in", x)
         if dump != nil { FileHandle.standardError.write("dtype: h=\(h.dtype) attn_in=\(x.dtype) inj=\(inj!.dtype)\n".data(using: .utf8)!) }
@@ -2829,14 +3259,18 @@ final class Qwen4ExpDecoderLayer: Module {
             let list = cache as? CacheList
             x = selfAttn!(x, rope: rope, mask: mask, cache: list?[0], indexerCache: list?[1] as? ArraysCache, pos3: pos3, mropeSection: mropeSection)
             // P070: the QSA block ids this call attended through (gather path only; the mask path leaves lastTop nil)
-            if dump != nil, let t = selfAttn!.indexer.lastTop { dump?("top", t.0.asType(.float32)) }
+            if dump != nil, let t = selfAttn!.indexer?.lastTop { dump?("top", t.0.asType(.float32)) }
         }
         dump?("attn_out", x)   // P070: the mixer output (GDN or QSA attention) before the hyper-connection combine
         if dump != nil { FileHandle.standardError.write("dtype: block_out=\(x.dtype)\n".data(using: .utf8)!) }
-        let (h1, n1) = combineChained(h, x, inj!, next: dump == nil ? mlpHC : nil)
+        var (h1, n1) = combineChained(h, x, inj!, next: dump == nil ? mlpHC : nil)
+        if dupOK, dupS.contains("comb") { let (hd, nd) = combineChained(h + 0, x, inj!, next: mlpHC); h1 = h1 + hd * 0; if let n1v = n1, let ndv = nd { n1 = n1v + ndv * 0 } }
         h = h1
         dump?("attn_res", h)   // P071: residual stream after the attention inject
-        let (y, inj2) = mlpHC(h, normed: n1)
+        var (y, inj2) = mlpHC(h, normed: n1)
+        if dupOK, dupS.contains("hc") { let (yd, jd) = mlpHC(h + 0, normed: nil); y = y + yd * 0; inj2 = inj2! + jd! * 0 }
+        if dupOK, dupS.contains("router") { y = y + mlp.routerLogits(y + 0)[.ellipsis, 0 ..< 1] * 0 }
+        if dupOK, dupS.contains("shared") { y = y + mlp.sharedExpert(y + 0) * 0 }
         Q4Prof.mark("hc_mlp", [h, y, inj2!])
         dump?("mlp_in", y)     // P071: the MoE input (mlp hyper-connection mix)
         if dump != nil { dump?("router", mlp.routerLogits(y)) }   // P071: router logits (S, E), dump mode only
@@ -2863,7 +3297,9 @@ final class Qwen4ExpDecoderLayer: Module {
 public final class Qwen4ExpModelInner: Module {
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
     @ModuleInfo(key: "layers") var layers: [Qwen4ExpDecoderLayer]
-    @ModuleInfo(key: "hyper_connection_mixer") var mixer: Qwen4ExpGatedResidual
+    @ModuleInfo(key: "hyper_connection_mixer") var mixer: Qwen4ExpGatedResidual!
+    /// T-0076 plain Qwen3.5: the final RMSNorm in place of the hyper-connection mixer
+    @ModuleInfo(key: "norm") var norm: Qwen4ExpRMSNorm?
     let rope: Qwen4ExpRotary
     let hc: Int
     let ngramContext: Int
@@ -2876,7 +3312,8 @@ public final class Qwen4ExpModelInner: Module {
         mropeSection = a.mropeSection
         _embedTokens.wrappedValue = Embedding(embeddingCount: a.vocabularySize, dimensions: a.hiddenSize)
         _layers.wrappedValue = (0 ..< a.hiddenLayers).map { Qwen4ExpDecoderLayer(a, layerIdx: $0) }
-        _mixer.wrappedValue = Qwen4ExpGatedResidual(a, useCombine: false)
+        if a.plain { _norm.wrappedValue = Qwen4ExpRMSNorm(dimensions: a.hiddenSize, eps: a.rmsNormEps) }
+        else { _mixer.wrappedValue = Qwen4ExpGatedResidual(a, useCombine: false) }
         rope = Qwen4ExpRotary(dim: Int(Float(a.headDim) * a.partialRotaryFactor), base: a.ropeTheta * Qwen4ExpVariants.ropeThetaMult)   // P072 arm
         hc = a.hcCount
         ngramContext = a.ngramSize - 1
@@ -2933,10 +3370,10 @@ public final class Qwen4ExpModelInner: Module {
         // and the compiled path -- so a dump that sets it is no longer measuring the champion. The
         // control that found this: with the sink set, the dumped run's logits sit maxdiff 23.5 from
         // the champion's; with it off they must be 0.0, and the gate below is that number.
-        if dumpDir != nil, Qwen4ExpEnv.dumpHC0 {
+        if dumpDir != nil, Qwen4ExpEnv.dumpHC0, norm == nil {
             layers[0].attnHC.debugSink = { name, a in dump(name + "_0", a) }
         }
-        h = tiled(h, repetitions: [1, 1, hc])
+        if norm == nil { h = tiled(h, repetitions: [1, 1, hc]) }
         var normedNext: MLXArray? = nil
         // MTP verify blocks (2..16 rows): dispatch the graph in slices so the GPU starts the early layers while the host is still
         // building the rest (the GPU ledger showed ~2.7 ms idle per round = verify build minus draft GPU time, OBS-ENG-025)
@@ -2957,15 +3394,34 @@ public final class Qwen4ExpModelInner: Module {
                                              dump: (dumpDir == nil || !(dumpLayers?.contains(i) ?? true)) ? nil : { name, a in dump(name + "_\(i)", a) },
                                              pos3: pos3, mropeSection: mropeSection)
             h = hh; normedNext = nn
+            // T-0158: a DFlash drafter's target features -- the completed layer-i residual stream averaged over the hc
+            // streams (as the drafter was trained on), kept as graph outputs; reading them does not change the forward
+            if let cl = Self.captureLayers, cl.contains(i) {
+                let s = h.shape
+                Self.captured[i] = h.reshaped([s[0], s[1], hc, s[2] / hc]).asType(.float32).mean(axis: -2)
+            }
         }
-        layers[0].attnHC.debugSink = nil
+        layers[0].attnHC?.debugSink = nil
         lastHidden = h   // before the profiler's early return: the MTP head reads it (forwardHidden trapped under ENGINE_PREFILL_PROFILE)
+        if let norm {    // T-0076 plain Qwen3.5
+            let r = norm(h)
+            if Q4Prof.active { Q4Prof.mark("final_norm", [r]); Q4Prof.end() }
+            if Self.mtpPostNormHidden { lastHidden = r }
+            return r
+        }
         if Q4Prof.active { let r = mixer(h, normed: normedNext).0; Q4Prof.mark("final_mixer", [r]); Q4Prof.end(); return r }
         return mixer(h, normed: normedNext).0
     }
 
     /// the (B,S,hc*d) residual stream of the last forward, before the final mixer (MTP input)
     private(set) var lastHidden: MLXArray? = nil
+    /// T-0158 (`engine nll --capture-layers`): layers whose hc-mean output each forward stores in `captured`; nil = off
+    nonisolated(unsafe) public static var captureLayers: Set<Int>? = nil
+    nonisolated(unsafe) public static var captured: [Int: MLXArray] = [:]
+    /// T-0076: which trunk state feeds a plain Qwen3.5 MTP head -- the last layer's output before the final norm (default,
+    /// as the vendored omlx port does) or after it (ENGINE_MTP_POSTNORM=1, as vLLM's Qwen3-Next MTP does). Drafts are
+    /// verified, so this moves acceptance only.
+    static let mtpPostNormHidden: Bool = ProcessInfo.processInfo.environment["ENGINE_MTP_POSTNORM"] == "1"
     /// P070: forward-call index for ENGINE_DUMP_CALLS
     nonisolated(unsafe) static var dumpCallCounter: Int = 0
     /// ENGINE_KV_STEP: KV cache growth step in tokens (mlx-swift-lm default 256)
@@ -2990,7 +3446,9 @@ public final class Qwen4ExpMTP: Module {
     @ModuleInfo(key: "fc_embedding") var fcEmbedding: Linear
     @ModuleInfo(key: "fc_hidden") var fcHidden: Linear
     @ModuleInfo(key: "layers") var layers: [Qwen4ExpDecoderLayer]
-    @ModuleInfo(key: "hyper_connection_mixer") var mixer: Qwen4ExpGatedResidual
+    @ModuleInfo(key: "hyper_connection_mixer") var mixer: Qwen4ExpGatedResidual!
+    /// T-0076 plain Qwen3.5 head: its final RMSNorm (`mtp.norm`) in place of the mixer
+    @ModuleInfo(key: "norm") var norm: Qwen4ExpRMSNorm?
     let rope: Qwen4ExpRotary
 
     init(_ a: Qwen4ExpTextConfiguration) {
@@ -3001,7 +3459,7 @@ public final class Qwen4ExpMTP: Module {
         // stream of hidden_size; this one was ported flat. ENGINE_MTP_HNORM_GROUP=1 selects the grouped reading.
         // Decided by MTP acceptance, the only instrument that can see it.
         _preNormHidden.wrappedValue = Qwen4ExpRMSNorm(dimensions: hc * d,
-                                                      groupSize: Qwen4ExpMTP.hiddenNormGrouped ? d : nil,
+                                                      groupSize: Qwen4ExpMTP.hiddenNormGrouped && !a.plain ? d : nil,
                                                       eps: a.rmsNormEps)
         _fcEmbedding.wrappedValue = Linear(d, d, bias: false)
         _fcHidden.wrappedValue = Linear(d, d, bias: false)
@@ -3024,9 +3482,10 @@ public final class Qwen4ExpMTP: Module {
         _layers.wrappedValue = [Qwen4ExpDecoderLayer(la, layerIdx: 0)]
         // P032: the reuse period is a property of THIS indexer, the draft head's, and of no other.
         if let n = Int(ProcessInfo.processInfo.environment["ENGINE_MTP_IDX_REUSE"] ?? ""), n > 1 {
-            _layers.wrappedValue[0].selfAttn?.indexer.reusePeriod = n
+            _layers.wrappedValue[0].selfAttn?.indexer?.reusePeriod = n
         }
-        _mixer.wrappedValue = Qwen4ExpGatedResidual(a, useCombine: false)
+        if a.plain { _norm.wrappedValue = Qwen4ExpRMSNorm(dimensions: d, eps: a.rmsNormEps) }
+        else { _mixer.wrappedValue = Qwen4ExpGatedResidual(a, useCombine: false) }
         rope = Qwen4ExpRotary(dim: Int(Float(a.headDim) * a.partialRotaryFactor), base: a.ropeTheta * Qwen4ExpVariants.ropeThetaMult)   // P072 arm
         super.init()
     }
@@ -3036,6 +3495,15 @@ public final class Qwen4ExpMTP: Module {
     /// hidden (B,S,hc*d) trunk stream at positions p, tokens (B,S) = the tokens at p+1
     /// -> (mixed (B,S,d) for lm_head, stream (B,S,hc*d) for the next depth)
     public func callAsFunction(hidden: MLXArray, tokens: MLXArray, embed: Embedding, cache: KVCache?) -> (MLXArray, MLXArray) {
+        if let norm {
+            // T-0076 plain Qwen3.5: fc([norm_e(emb) | norm_h(hidden)]) = fc_embedding(.) + fc_hidden(.), one layer, mtp.norm
+            var h = fcEmbedding(preNormEmbedding(embed(tokens))) + fcHidden(preNormHidden(hidden))
+            let attn = (cache as? CacheList)?[0]
+            let mask = createAttentionMask(h: h, cache: attn.map { [$0] })
+            h = layers[0](h, rope: rope, mask: mask, cache: cache, ids: tokens.asType(.int32),
+                          prev: MLXArray.zeros([hidden.dim(0), 2], dtype: .int32))
+            return (norm(h), h)
+        }
         let lead = Array(hidden.shape.dropLast())
         let e = fcEmbedding(preNormEmbedding(embed(tokens)))                       // (B,S,d)
         let hs = fcHidden(preNormHidden(hidden).reshaped(lead + [hc, d]))          // (B,S,hc,d)
@@ -3044,6 +3512,14 @@ public final class Qwen4ExpMTP: Module {
         let mask = createAttentionMask(h: h, cache: attn.map { [$0] })
         let dummyIds = tokens.asType(.int32)
         let dummyPrev = MLXArray.zeros([hidden.dim(0), 2], dtype: .int32)
+        // T-0216 cost probe (ENGINE_DUP=mtphead, exact output): the head layer and mixer run a second time on the same rows
+        // without a cache (no history attention, no cache write) and are added times 0 -- a lower bound of the head's cost
+        if Qwen4ExpQSAIndexer.dup.contains("mtphead"), lead.reduce(1, *) >= Qwen4ExpQSAIndexer.dupMinRows {
+            let h2 = layers[0](h + 0, rope: rope, mask: createAttentionMask(h: h, cache: nil), cache: nil, ids: dummyIds, prev: dummyPrev)
+            h = layers[0](h, rope: rope, mask: mask, cache: cache, ids: dummyIds, prev: dummyPrev)
+            let m = mixer(h).0
+            return (m + mixer(h2).0 * 0, h)
+        }
         h = layers[0](h, rope: rope, mask: mask, cache: cache, ids: dummyIds, prev: dummyPrev)
         return (mixer(h).0, h)
     }
@@ -3064,7 +3540,8 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     /// fails if the tower is built and gets no weights, or if vision weights arrive with no tower.
     public let hasVision: Bool
     public static let noVision: Bool = ProcessInfo.processInfo.environment["ENGINE_NO_VISION"] != nil
-    public static let wantMTP: Bool = ProcessInfo.processInfo.environment["ENGINE_MTP"] != nil
+    /// T-0190: "1" turns it on; before, merely setting ENGINE_MTP (even to 0) built the head
+    public static let wantMTP: Bool = ["1", "true", "yes"].contains(ProcessInfo.processInfo.environment["ENGINE_MTP"] ?? "")
     /// true when the indexer's pooled block cache (slot 1) is a capacity buffer -- callers must NOT slice it (P020 unit 8)
     public static var indexerPooledBuffer: Bool { Qwen4ExpQSAIndexer.pooledBuffer }
 
@@ -3104,8 +3581,8 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
             return "\(qq.bits)b g\(qq.groupSize)"
         }
         let l0 = model.layers.first
-        let mixUp = l0?.attnHC.mixUp
-        let body = l0.map { $0.attnHC.fusedChainActive(rows: 1) ? ((mixUp is QuantizedLinear) ? "ACTIVE (8-bit body)" : "ACTIVE (dense bf16 body)") : "OFF" } ?? "OFF"
+        let mixUp = l0?.attnHC?.mixUp
+        let body = l0.flatMap { l in l.attnHC.map { $0.fusedChainActive(rows: 1) ? ((mixUp is QuantizedLinear) ? "ACTIVE (8-bit body)" : "ACTIVE (dense bf16 body)") : "OFF" } } ?? "OFF (plain Qwen3.5: no hyper-connections)"
         let moe = model.layers.compactMap { $0.mlp as? Qwen4ExpSparseMoeBlock }.first
         let expert = moe.map { $0.expertPathWitness() } ?? "no MoE block"
         return "qwen4_exp: fusion witness -- hc mixUp \(q(mixUp)) -> fused chain "
@@ -3145,6 +3622,7 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public init(_ c: Qwen4ExpConfiguration) {
         configuration = c
+        q4InstallMoERuns()   // T-0110
         let a = c.text
         vocabularySize = a.vocabularySize
         kvHeads = a.layerTypes.map { $0 == "full_attention" ? a.kvHeads : 0 }
@@ -3170,11 +3648,26 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     /// P095 U3-B: ENGINE_HEAD_QMM_MIN=m (0 = off) -- at m <= rows < 12 the head's 0.675 GB is read ONCE
     /// through the tiled qmm instead of once per row through qmv (see q8ProjPadded).
     static let headQmmMin: Int = Int(ProcessInfo.processInfo.environment["ENGINE_HEAD_QMM_MIN"] ?? "0") ?? 0
+    /// T-0120: the LM head at verify widths through q4VerifyProj (with ENGINE_VERIFY_PROJ=1); ENGINE_VERIFY_PROJ_HEAD=0 keeps MLX qmm
+    static let verifyProjHead: Bool = ProcessInfo.processInfo.environment["ENGINE_VERIFY_PROJ_HEAD"] != "0"
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = model(inputs, cache: cache)
         if Self.lastLogitsOnly && out.dim(1) > 16 { out = out[0..., (out.dim(1) - 1)..., 0...] }
+        return headLogits(out)
+    }
+
+    /// The text path's LM head over the final mixer output (T-0142: shared with the mixed step, so both run one code).
+    func headLogits(_ out: MLXArray) -> MLXArray {
         if Self.ablHead, let lmHead { return broadcast(out[.ellipsis, 0 ..< 1], to: [out.dim(0), out.dim(1), lmHead.weight.dim(0)]) }
-        if let lmHead { return q8ProjPadded(lmHead, out, minRows: Self.headQmmMin) }
+        if let lmHead {
+            // T-0120: verify-width rows through the padding-free projection kernel (lab: x1.22..1.61 at 40..68 rows)
+            if Self.verifyProjHead, out.size / out.dim(-1) > 16, let y = q4VerifyProjChecked(lmHead, out) { return y }
+            let r = q8ProjPadded(lmHead, out, minRows: Self.headQmmMin)
+            if out.size / out.dim(-1) >= Qwen4ExpQSAIndexer.dupMinRows, Qwen4ExpQSAIndexer.dup.contains("head") {
+                return r + q8ProjPadded(lmHead, out + 0, minRows: Self.headQmmMin)[.ellipsis, 0 ..< 1] * 0
+            }
+            return r
+        }
         return model.embedTokens.asLinear(out)
     }
 
@@ -3195,8 +3688,16 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     /// P037: pixels -> (N, hidden) visual tokens, N = product(grid) / merge^2. Throws if no tower.
     public func visionFeatures(pixels: MLXArray, gridTHW: [THW]) -> MLXArray? {
         guard let visionTower else { return nil }
-        return visionTower(pixels, gridTHW: gridTHW).0
+        // T-0189: the preprocessor hands float32 pixels; with bf16 tower weights MLX promotes every op to float32, so the
+        // whole tower ran in fp32. ENGINE_VISION_BF16=1 casts the pixels to the tower's own dtype first, as the HF
+        // reference does (pixel_values.type(self.visual.dtype)); default off until measured.
+        let px = Self.visionInputBF16 && pixels.dtype == .float32 ? pixels.asType(.bfloat16) : pixels
+        EngineWitness.hit(px.dtype == .float32 ? "vision_tower_fp32" : "vision_tower_bf16")
+        EngineWitness.hit("vision_rotary_" + Qwen3VLVision.rotaryMode)     // T-0191: which rotary body ran (ENGINE_VISION_ROTARY)
+        if Qwen3VLVision.sdpa72 { EngineWitness.hit("vision_sdpa72") }       // T-0191: native head_dim-72 attention (MLX_SDPA_FULL_D72)
+        return visionTower(px, gridTHW: gridTHW).0
     }
+    nonisolated(unsafe) public static var visionInputBF16: Bool = ProcessInfo.processInfo.environment["ENGINE_VISION_BF16"] == "1"
 
     public func logitsFromMixed(_ mixed: MLXArray) -> MLXArray {
         if let lmHead { return lmHead(mixed) }
@@ -3218,7 +3719,11 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
             draftProbSink?(softmax(logits.asType(.float32), axis: -1).max(axis: -1))
             return logits.argMax(axis: -1).asType(.int32)
         }
-        let logits = quantizedMatmul(mixed, d.w, scales: d.s, biases: d.b, transpose: true, groupSize: d.gs, bits: d.bits)
+        var logits = quantizedMatmul(mixed, d.w, scales: d.s, biases: d.b, transpose: true, groupSize: d.gs, bits: d.bits)
+        // T-0216 cost probe (ENGINE_DUP=drafthead, exact output): the draft-vocabulary head runs twice, the copy added times 0
+        if Qwen4ExpQSAIndexer.dup.contains("drafthead"), mixed.size / mixed.dim(-1) >= Qwen4ExpQSAIndexer.dupMinRows {
+            logits = logits + quantizedMatmul(mixed + 0, d.w, scales: d.s, biases: d.b, transpose: true, groupSize: d.gs, bits: d.bits) * 0
+        }
         draftProbSink?(softmax(logits.asType(.float32), axis: -1).max(axis: -1))
         return d.ids[logits.argMax(axis: -1)]
     }
@@ -3290,7 +3795,7 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
                 // slot 0 (raw keys) is a capacity buffer whose logical length follows the KV offset (P018); only the pooled blocks
                 // built from the dropped rows must go
                 let newLen = kv.offset
-                if !Qwen4ExpQSAIndexer.pooledBuffer, let p = idx[1], let r = layer.selfAttn?.indexer.ratio, p.dim(1) > newLen / r { idx[1] = p[0..., 0 ..< (newLen / r), 0...] }
+                if !Qwen4ExpQSAIndexer.pooledBuffer, let p = idx[1], let r = layer.selfAttn?.indexer?.ratio, p.dim(1) > newLen / r { idx[1] = p[0..., 0 ..< (newLen / r), 0...] }
             } else if let a = c as? ArraysCache, let gdn = layer.linearAttn {
                 gdn.replayPrefix(cache: a, rows: n)
                 // ArraysCache.offset is not advanced by this fork; leave it
@@ -3324,8 +3829,21 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
             } else if let a = c as? ArraysCache, let gdn = layer.linearAttn {
                 if keep.contains(where: { $0 < S }) { gdn.replayPrefixRows(cache: a, keep: keep) } else { a.prefixReplayTape = nil }
                 if let ple = layer.ple {
-                    if let full = a[4] { a[2] = concatenated((0 ..< B).map { b in full[b ..< (b + 1), keep[b] ..< (keep[b] + ple.stateLen), 0...] }, axis: 0) }
-                    if let hist = a[5] { a[3] = concatenated((0 ..< B).map { b in hist[b ..< (b + 1), keep[b] ..< (keep[b] + model.ngramContext)] }, axis: 0) }
+                    if Qwen4ExpGatedDeltaNet.rowReplay || B == 1 {
+                        if let full = a[4] { a[2] = concatenated((0 ..< B).map { b in full[b ..< (b + 1), keep[b] ..< (keep[b] + ple.stateLen), 0...] }, axis: 0) }
+                        if let hist = a[5] { a[3] = concatenated((0 ..< B).map { b in hist[b ..< (b + 1), keep[b] ..< (keep[b] + model.ngramContext)] }, axis: 0) }
+                    } else {
+                        // T-0110: one gather per slot for all rows (row b's window keep[b] ..< keep[b] + n), the same values
+                        if let full = a[4] {
+                            let ix = MLXArray((0 ..< B).flatMap { b in (0 ..< ple.stateLen).map { Int32(keep[b] + $0) } }).reshaped(B, ple.stateLen, 1)
+                            a[2] = takeAlong(full, ix, axis: 1)
+                        }
+                        if let hist = a[5] {
+                            let n = model.ngramContext
+                            let ix = MLXArray((0 ..< B).flatMap { b in (0 ..< n).map { Int32(keep[b] + $0) } }).reshaped(B, n)
+                            a[3] = takeAlong(hist, ix, axis: 1)
+                        }
+                    }
                 }
             }
         }
@@ -3370,13 +3888,13 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     }
     /// P106 H60: the head's per-row pooled watermark, read and restored around a draft chain queued ahead of its round.
     public var headRaggedPooled: [Int] {
-        get { mtp?.layers[0].selfAttn?.indexer.raggedPooled ?? [] }
-        set { mtp?.layers[0].selfAttn?.indexer.raggedPooled = newValue }
+        get { mtp?.layers[0].selfAttn?.indexer?.raggedPooled ?? [] }
+        set { mtp?.layers[0].selfAttn?.indexer?.raggedPooled = newValue }
     }
     public func resetHeadRaggedState() {
-        mtp?.layers[0].selfAttn?.indexer.raggedPooled = []
-        mtp?.layers[0].selfAttn?.indexer.lastTopRagged = nil
-        mtp?.layers[0].selfAttn?.indexer.lastTop = nil
+        mtp?.layers[0].selfAttn?.indexer?.raggedPooled = []
+        mtp?.layers[0].selfAttn?.indexer?.lastTopRagged = nil
+        mtp?.layers[0].selfAttn?.indexer?.lastTop = nil
     }
 
     public struct CacheSnapshot { public var arrays: [[MLXArray]]; public var offsets: [Int] }
@@ -3467,10 +3985,17 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     /// scores stale rows and the answer degenerates. Must be called on every (re)stack.
     public func resetRaggedState() {
         for layer in model.layers {
-            layer.selfAttn?.indexer.raggedPooled = []
-            layer.selfAttn?.indexer.lastTopRagged = nil
-            layer.selfAttn?.indexer.lastTop = nil
+            layer.selfAttn?.indexer?.raggedPooled = []
+            layer.selfAttn?.indexer?.lastTopRagged = nil
+            layer.selfAttn?.indexer?.lastTop = nil
         }
+    }
+
+    /// T-0142 (lab): the trunk indexers' per-row pooled watermarks, so a probe that alternates two pools of the SAME rows
+    /// can keep each pool's own (a watermark from the other pool would mark blocks as pooled that this pool never got).
+    public var trunkRaggedPooled: [[Int]] {
+        get { model.layers.map { $0.selfAttn?.indexer?.raggedPooled ?? [] } }
+        set { for (layer, v) in zip(model.layers, newValue) { layer.selfAttn?.indexer?.raggedPooled = v } }
     }
 
     public func makeCache() -> [KVCache] { newCache(parameters: nil) }
@@ -3599,9 +4124,9 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
         let L = per[0].count
         return (0 ..< L).map { i -> KVCache in
             if per[0][i] is CacheList {
-                let lists = per.map { $0[i] as! CacheList }
-                precondition(lists.allSatisfy { ($0[1] as! ArraysCache)[2] == nil }, "P080 M1 is text-only (no mRoPE position history)")
-                return rowResidentMarker(lists)
+                // T-0098: a row may carry slot 2 (an image row's mRoPE positions): the ragged indexer reads and extends it
+                // in the row's own cache, so nothing is stacked for it
+                return rowResidentMarker(per.map { $0[i] as! CacheList })
             }
             return stackFixedState(per.map { $0[i] as! ArraysCache })
         }
@@ -3617,6 +4142,10 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     static func stackFixedState(_ acs: [ArraysCache]) -> ArraysCache {
         let out = ArraysCache(size: 6)
         for slot in 0 ..< 4 where acs[0][slot] != nil {
+            if !acs.allSatisfy({ $0[slot] != nil }) {
+                let shapes = acs.map { a in (0 ..< 4).map { a[$0].map { "\($0.shape)" } ?? "nil" }.joined(separator: ",") }
+                FileHandle.standardError.write("qwen4_exp: stackFixedState slot \(slot) present in some rows only: \(shapes)\n".data(using: .utf8)!)
+            }
             precondition(acs.allSatisfy { $0[slot] != nil }, "stackCaches: slot \(slot) present in some rows only")
             out[slot] = concatenated(acs.map { $0[slot]! }, axis: 0)
         }
@@ -3671,9 +4200,7 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     }
     /// The MTP head's pool, row-resident (one attention layer).
     public func stackHeadCachesRowResident(_ caches: [KVCache]) -> KVCache {
-        let lists = caches.map { $0 as! CacheList }
-        precondition(lists.allSatisfy { ($0[1] as! ArraysCache)[2] == nil }, "P099 head pool is text-only")
-        return Self.rowResidentMarker(lists)
+        return Self.rowResidentMarker(caches.map { $0 as! CacheList })   // T-0098: image rows' slot 2 is the row's own
     }
     public func unstackHeadCacheRowResident(_ stacked: KVCache, slot: Int, length: Int) -> KVCache {
         let list = Self.rowResidentRows(stacked)![slot]
@@ -3700,7 +4227,11 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
         } else { nkv.offset = kv.offset }
         let nidx = ArraysCache(size: 3)
         for s in 0 ..< 2 { if let x = idx[s] { nidx[s] = copied(x, axis: 1) } }
-        precondition(idx[2] == nil, "row-resident copies are text-only")
+        if let x = idx[2] {                                        // T-0098: an image row's (3, 1, cap) positions
+            let z = MLXArray.zeros([3, x.dim(1), x.dim(2) + 1], dtype: x.dtype)
+            z[0..., 0..., 0 ..< x.dim(2)] = x
+            nidx[2] = z
+        }
         nidx.offset = idx.offset
         let out = CacheList(nkv, nidx)
         out.offset = list.offset
@@ -3795,8 +4326,38 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
             }
             out[k] = v
         }
+        if configuration.text.plain { Self.plainQwen35(&out) }
         Self.mergeProjections(&out)
         return out
+    }
+
+    /// T-0076: a plain Qwen3.5 checkpoint in the MLX convention (zero-centred norms stored as 1 + w, the MTP `fc` over
+    /// [embedding | hidden]) -> this port's modules. Every zero-centred RMSNorm weight goes back to w in float32, so
+    /// `onePlusWeight` rebuilds the stored value exactly; the gated GDN norm (`linear_attn.norm`) is a plain weight and is
+    /// left alone. `mtp.fc` splits on its input axis into `fc_embedding` (first half) and `fc_hidden` -- for a quantised fc
+    /// the split falls on a group boundary, so both halves are the same numbers.
+    static func plainQwen35(_ w: inout [String: MLXArray]) {
+        let zeroCentred = [".input_layernorm.weight", ".post_attention_layernorm.weight", ".q_norm.weight", ".k_norm.weight"]
+        for k in Array(w.keys) {
+            let shifted = zeroCentred.contains { k.hasSuffix($0) } || k == "model.norm.weight"
+                || k == "mtp.norm.weight" || k == "mtp.pre_fc_norm_embedding.weight" || k == "mtp.pre_fc_norm_hidden.weight"
+            if shifted, let v = w[k] { w[k] = v.asType(.float32) - 1 }
+        }
+        if let fw = w["mtp.fc.weight"] {
+            let half = { (a: MLXArray) -> (MLXArray, MLXArray) in
+                let n = a.dim(-1) / 2
+                return (a[0..., 0 ..< n], a[0..., n...])
+            }
+            for suffix in ["weight", "scales", "biases"] {
+                guard let a = suffix == "weight" ? fw : w["mtp.fc." + suffix] else { continue }
+                let (e, h) = half(a)
+                w["mtp.fc_embedding." + suffix] = e
+                w["mtp.fc_hidden." + suffix] = h
+                w["mtp.fc." + suffix] = nil
+            }
+            quantizationAliases["mtp.fc_embedding"] = "mtp.fc"
+            quantizationAliases["mtp.fc_hidden"] = "mtp.fc"
+        }
     }
 
     /// Concatenate sibling projections that share an input into one module (one qmv/gemv instead of
@@ -3812,10 +4373,12 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
             ("mlp.gate_sg", ["mlp.gate", "mlp.shared_expert_gate"]),
         ]
         var merged = 0
-        for (m, parts) in groups {
-            let anchors = w.keys.filter { $0.hasSuffix("." + parts[0] + ".weight") }
+        for (m, allParts) in groups {
+            let anchors = w.keys.filter { $0.hasSuffix("." + allParts[0] + ".weight") }
             for anchor in anchors {
-                let prefix = String(anchor.dropLast((parts[0] + ".weight").count))   // "model.layers.3." / "mtp.layers.0."
+                let prefix = String(anchor.dropLast((allParts[0] + ".weight").count))   // "model.layers.3." / "mtp.layers.0."
+                // T-0076: a plain Qwen3.5 attention layer has no indexer projection -- q | k | v only
+                let parts = m == "self_attn.qkvi_proj" && w[prefix + allParts[3] + ".weight"] == nil ? Array(allParts.prefix(3)) : allParts
                 // P063: siblings stored unalike (Vontra 4-bit g32 keeps `mlp.gate` bf16 and quantises
                 // `shared_expert_gate`) are brought to the unquantised sibling's dtype first: the
                 // quantised part is dequantised in place (bits and group inferred from its packing),
@@ -3977,7 +4540,8 @@ extension Qwen4ExpModel {
     /// stream (one add + tile per block), as the layer's combine would.
     public func hcProbe(rows: [Int], reps: Int = 32) -> [String] {
         var out: [String] = []
-        let blocks = model.layers.flatMap { [$0.attnHC, $0.mlpHC] }
+        let blocks: [Qwen4ExpGatedResidual] = model.layers.flatMap { [$0.attnHC, $0.mlpHC] }.compactMap { $0 }
+        guard !blocks.isEmpty else { return ["hc probe: no hyper-connections (plain Qwen3.5)"] }
         let hc = blocks[0].hc, d = blocks[0].d
         for S in rows {
             let h0 = (MLXRandom.normal([1, S, hc * d]) * 0.1).asType(.bfloat16); eval(h0)

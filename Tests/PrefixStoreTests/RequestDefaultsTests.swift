@@ -41,4 +41,25 @@ final class RequestDefaultsTests: XCTestCase {
         XCTAssertEqual(ReasoningEffortPolicy.resolve("minimal", serverDefault: "xhigh"), "low")
         XCTAssertEqual(ReasoningEffortPolicy.resolve("banana", serverDefault: "xhigh"), "xhigh")
     }
+
+    // T-0294 (Q-0001): programming requests are recognised conservatively
+    func testProgrammingDetectorCodeToolsAndFences() {
+        XCTAssertTrue(ProgrammingRequestDetector.isProgramming(texts: ["Fix this:\n```swift\nlet x = 1\n```"], hasTools: false))
+        XCTAssertTrue(ProgrammingRequestDetector.isProgramming(texts: ["any text"], hasTools: true))
+        let py = "def load(path):\n    with open(path) as f:\n        return json.load(f)\nclass Store:\n    pass\nimport os\n"
+        XCTAssertTrue(ProgrammingRequestDetector.isProgramming(texts: ["Why does this fail?\n" + py], hasTools: false))
+        let swift = "func run() {\n    let a = compute()\n    if (a > 0) {\n        print(a);\n    }\n}"
+        XCTAssertTrue(ProgrammingRequestDetector.isProgramming(texts: [swift], hasTools: false))
+    }
+    func testProgrammingDetectorLeavesProseAndOCRTextAlone() {
+        let ocr = "Import zboża z Rosji wzrósł w tym roku.\nWokulski wrócił do sklepu (jak zwykle) i zastał tam Rzeckiego.\n" +
+                  "Pieniędzmi tymi obracają inni, a zyski ciągną dla siebie.\nKlasa robotnicza i klasa średnia; nikt nie wiedział.\n" +
+                  "Jeżeli (co nieprawdopodobne) przyjdzie jutro, to dobrze.\nDla każdego coś miłego."
+        XCTAssertFalse(ProgrammingRequestDetector.isProgramming(texts: [ocr], hasTools: false))
+        XCTAssertFalse(ProgrammingRequestDetector.isProgramming(texts: ["Jesteś korektorem tekstów po OCR. Przepisz poniższy fragment.", ocr], hasTools: false))
+        XCTAssertFalse(ProgrammingRequestDetector.isProgramming(texts: ["What is the capital of France?"], hasTools: false))
+        XCTAssertFalse(ProgrammingRequestDetector.isProgramming(texts: [], hasTools: false))
+        // two code-like lines are not enough
+        XCTAssertFalse(ProgrammingRequestDetector.isProgramming(texts: ["Run import os and then\nfunction foo() {\nok"], hasTools: false))
+    }
 }

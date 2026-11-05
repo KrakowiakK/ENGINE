@@ -652,6 +652,7 @@ void pad_and_slice_conv_3D_gpu(
     array x_copy(xshape, x.dtype(), nullptr, {});
     array zero(0, x.dtype());
     pad_gpu(x, zero, x_copy, {0, -1}, {0, 0}, s);
+    metal::get_command_encoder(s).add_temporary(zero);  // upstream #4660: keep the fill value alive
     metal::get_command_encoder(s).add_temporary(x_copy);
 
     return x_copy;

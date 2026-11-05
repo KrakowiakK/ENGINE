@@ -320,6 +320,16 @@ for (int i = 0; i < VEC; ++i) {
 }
 
 """#
+    /// T-0156: gdn_conv_prefill plus the next conv state written by the same threads (output `tail` [CK-1, CONVD]: the
+    /// mixed q|k|v of the chunk's last CK-1 rows, copied from qkvz as read), so no separate strided-slice copy op exists.
+    static let gdn_conv_prefill_tail = gdn_conv_prefill + #"""
+if (int(row) >= ROWS - (CK - 1)) {
+    const device T* xr = qkvz + (ulong)row * QKVZ + c;
+    device T* t = tail + (ulong)(int(row) - (ROWS - (CK - 1))) * CONVD + c;
+    for (int i = 0; i < VEC; ++i) t[i] = xr[i];
+}
+
+"""#
     static let gdn_gate = #"""
 // GDN per-token gate: from the merged b|a projection output ba [rows, 2*NV] (T) and aLog, dtBias [NV] (T):
 //   beta = sigmoid(b)                               (rounded to T like the op chain, then float)
@@ -1249,14 +1259,14 @@ uint row = tile * TGS + tid;
 if (row >= uint(D)) return;
 ulong rowbase = (ulong)e * D + row;
 const device uint4* wp = (const device uint4*)(dw + rowbase * (I / 4));
-const device T* sp = ds + rowbase * (I / 64);
-const device T* bp = db + rowbase * (I / 64);
+const device T* sp = ds + rowbase * (I / GS);
+const device T* bp = db + rowbase * (I / GS);
 float acc = 0.0f;
-for (uint g = 0; g < uint(I / 64); ++g) {          // one 64-element group = 4 uint4 (16 words x 4 bytes)
-    const threadgroup float* x = hs + g * 64;
+for (uint g = 0; g < uint(I / GS); ++g) {          // one 64-element group = 4 uint4 (16 words x 4 bytes)
+    const threadgroup float* x = hs + g * GS;
     float d = 0.0f, xs = 0.0f;
-    for (uint q = 0; q < 4; ++q) {
-        uint4 w0 = wp[g * 4 + q];
+    for (uint q = 0; q < GS / 16; ++q) {
+        uint4 w0 = wp[g * (GS / 16) + q];
         uint32_t ws[4] = {w0.x, w0.y, w0.z, w0.w};
         for (uint p = 0; p < 4; ++p) {
             uint32_t w = ws[p];
@@ -1316,25 +1326,25 @@ uint row = tile * TGS + tid;
 if (row >= uint(D)) return;
 ulong rowbase = (ulong)e * D + row;
 const device uint4* wp = (const device uint4*)(dw + rowbase * (I / 4));
-const device T* sp = ds + rowbase * (I / 64);
-const device T* bp = db + rowbase * (I / 64);
+const device T* sp = ds + rowbase * (I / GS);
+const device T* bp = db + rowbase * (I / GS);
 float acc[MR];
 for (uint r = 0; r < uint(MR); ++r) acc[r] = 0.0f;
-for (uint g = 0; g < uint(I / 64); ++g) {          // one 64-element group = 4 uint4 (16 words x 4 bytes)
+for (uint g = 0; g < uint(I / GS); ++g) {          // one 64-element group = 4 uint4 (16 words x 4 bytes)
     // d and xs accumulate across the WHOLE group and the scale is applied ONCE, which is what the
     // per-pair body does. Applying it per four-byte word would give the same value in exact
     // arithmetic and a different one in float32 -- and the acceptance of an MTP round is a function
     // of the exact logits (OBS-ENG-078 (8)), so "equivalent" is not good enough here.
     float d[MR], xs[MR];
     for (uint r = 0; r < uint(MR); ++r) { d[r] = 0.0f; xs[r] = 0.0f; }
-    for (uint q = 0; q < 4; ++q) {
-        uint4 w0 = wp[g * 4 + q];
+    for (uint q = 0; q < GS / 16; ++q) {
+        uint4 w0 = wp[g * (GS / 16) + q];
         uint32_t ws[4] = {w0.x, w0.y, w0.z, w0.w};
         for (uint pp = 0; pp < 4; ++pp) {
             uint32_t w = ws[pp];
             for (uint j = 0; j < 4; ++j) {
                 float wv = float((w >> (8 * j)) & 0xFF);
-                uint xi = g * 64 + q * 16 + pp * 4 + j;
+                uint xi = g * GS + q * 16 + pp * 4 + j;
                 for (uint r = 0; r < uint(MR); ++r) {
                     if (slot[r] < 0) continue;
                     float xj = hs[r][xi];
@@ -1419,24 +1429,24 @@ const device T* bp[ROWS];
 for (uint rr = 0; rr < uint(ROWS); ++rr) {
     ulong rb = (ulong)e * D + row0 + (live[rr] ? rr : 0);
     wp[rr] = (const device uint4*)(dw + rb * (I / 4));
-    sp[rr] = ds + rb * (I / 64);
-    bp[rr] = db + rb * (I / 64);
+    sp[rr] = ds + rb * (I / GS);
+    bp[rr] = db + rb * (I / GS);
 }
 float acc[ROWS][MR];
 for (uint rr = 0; rr < uint(ROWS); ++rr) for (uint r = 0; r < uint(MR); ++r) acc[rr][r] = 0.0f;
-for (uint g = 0; g < uint(I / 64); ++g) {
+for (uint g = 0; g < uint(I / GS); ++g) {
     float d[ROWS][MR], xs[MR];
     for (uint rr = 0; rr < uint(ROWS); ++rr) for (uint r = 0; r < uint(MR); ++r) d[rr][r] = 0.0f;
     for (uint r = 0; r < uint(MR); ++r) xs[r] = 0.0f;
-    for (uint q = 0; q < 4; ++q) {
+    for (uint q = 0; q < GS / 16; ++q) {
         uint32_t ws[ROWS][4];
         for (uint rr = 0; rr < uint(ROWS); ++rr) {
-            uint4 w0 = wp[rr][g * 4 + q];
+            uint4 w0 = wp[rr][g * (GS / 16) + q];
             ws[rr][0] = w0.x; ws[rr][1] = w0.y; ws[rr][2] = w0.z; ws[rr][3] = w0.w;
         }
         for (uint pp = 0; pp < 4; ++pp) {
             for (uint j = 0; j < 4; ++j) {
-                uint xi = g * 64 + q * 16 + pp * 4 + j;
+                uint xi = g * GS + q * 16 + pp * 4 + j;
                 float wv[ROWS];
                 for (uint rr = 0; rr < uint(ROWS); ++rr) wv[rr] = float((ws[rr][pp] >> (8 * j)) & 0xFF);
                 // ONE threadgroup load of x, ROWS weight bytes consumed. This is the whole point.

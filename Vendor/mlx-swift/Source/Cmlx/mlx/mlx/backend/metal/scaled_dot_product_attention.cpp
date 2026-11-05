@@ -197,6 +197,14 @@ void sdpa_full_self_attention_metal(
   int bd = q.shape(-1);
   int bq = 32;
   int bk = bd < 128 ? 32 : 16;
+  if (bd == 256) {
+    // ENGINE T-0082: tile for head_dim 256 (MLX_SDPA_FULL_D256); MLX_SDPA_D256_BQ / _BK sweep it
+    bq = 16;
+    bk = 16;
+    if (const char* e = std::getenv("MLX_SDPA_D256_BQ")) { bq = atoi(e); }
+    if (const char* e = std::getenv("MLX_SDPA_D256_BK")) { bk = atoi(e); }
+    wm = bq / 8;
+  }
 
   int B = q.shape(0);
   int H = q.shape(1);
@@ -622,8 +630,22 @@ bool ScaledDotProductAttention::use_fallback(
       query_head_dim == value_head_dim &&
       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
        query_head_dim == 256);
+  // ENGINE T-0082: MLX_SDPA_FULL_D256=1 admits head_dim 256 (Qwen3.5) to the fused full-attention kernel
+  // (JIT-instantiated with a smaller tile, see sdpa_full_self_attention_metal) instead of the unfused
+  // scores-matmul + softmax + matmul fallback.
+  static const bool full_d256 = [] {
+    const char* e = std::getenv("MLX_SDPA_FULL_D256");
+    return e && e[0] == '1';
+  }();
+  // ENGINE T-0191: head_dim 72 (the E9 vision tower: 1152 / 16 heads), opt-in with MLX_SDPA_FULL_D72=1, so the tower stops
+  // padding q/k/v to 80 (10 % of its attention FLOPs). The padded lanes only ever added exact zeros, so it is the same math.
+  static const bool full_d72 = [] {
+    const char* e = std::getenv("MLX_SDPA_FULL_D72");
+    return e && e[0] == '1';
+  }();
   const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
-      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
+      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
+       (full_d72 && query_head_dim == 72) || (full_d256 && query_head_dim == 256));
 
   const bool sdpa_full_supported_mask = !has_mask || has_arr_mask ||
       (query_sequence_length <= key_sequence_length && do_causal);

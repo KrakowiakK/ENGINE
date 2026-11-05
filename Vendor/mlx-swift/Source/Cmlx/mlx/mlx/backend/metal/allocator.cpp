@@ -1,3 +1,6 @@
+#include <cstdio>
+#include <chrono>
+#include <atomic>
 // Copyright © 2023-2024 Apple Inc.
 #include "mlx/backend/metal/allocator.h"
 #include "mlx/backend/gpu/device_info.h"
@@ -131,6 +134,29 @@ size_t MetalAllocator::set_wired_limit(size_t limit) {
   return limit;
 };
 
+
+// ENGINE T-0168: ENGINE_ALLOC_STATS=1 counts cache hits / misses (new buffers), the wall time spent in newBuffer, frees
+// that release a buffer (cache over its limit), count-driven cache clears, and logs them every 10 s
+namespace {
+struct EngineAllocStats {
+  bool on = std::getenv("ENGINE_ALLOC_STATS") != nullptr;
+  std::atomic<long> hits{0}, misses{0}, releases{0}, clears{0}, bytes_missed{0};
+  std::atomic<long> new_ns{0}, new_max_ns{0};
+  std::atomic<long> last_log_ns{0};
+  void maybe_log(size_t active, size_t cache, size_t nres) {
+    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    long last = last_log_ns.load();
+    if (last == 0) { last_log_ns.compare_exchange_strong(last, now); return; }
+    if (now - last < 10000000000L || !last_log_ns.compare_exchange_strong(last, now)) return;
+    double span = (now - last) / 1e9;
+    fprintf(stderr, "engine alloc stats over %.1f s: hits %ld misses %ld (%.1f MB) newBuffer %.1f ms (max %.2f ms) releases %ld clears %ld active %.1f GB cache %.1f GB resources %zu\n",
+            span, hits.exchange(0), misses.exchange(0), bytes_missed.exchange(0) / 1e6, new_ns.exchange(0) / 1e6,
+            new_max_ns.exchange(0) / 1e6, releases.exchange(0), clears.exchange(0), active / 1e9, cache / 1e9, nres);
+  }
+};
+EngineAllocStats& engine_alloc_stats() { static EngineAllocStats s; return s; }
+}
+
 Buffer MetalAllocator::malloc(size_t size) {
   // Metal doesn't like empty buffers
   if (size == 0) {
@@ -155,6 +181,8 @@ Buffer MetalAllocator::malloc(size_t size) {
   // Try the cache
   std::unique_lock lk(mutex_);
   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
+  auto& est = engine_alloc_stats();
+  if (est.on) { if (buf) est.hits++; else { est.misses++; est.bytes_missed += size; } }
   if (!buf) {
     size_t mem_required = get_active_memory() + get_cache_memory() + size;
 
@@ -186,6 +214,7 @@ Buffer MetalAllocator::malloc(size_t size) {
         num_resources_ >= (resource_limit_ * resource_high_water_num_) /
                               resource_high_water_den_) {
       num_resources_ -= buffer_cache_.clear();
+      if (est.on) est.clears++;
     }
 
     // Allocate new buffer if needed
@@ -196,11 +225,23 @@ Buffer MetalAllocator::malloc(size_t size) {
       throw std::runtime_error(msg.str());
     }
     lk.unlock();
+    const auto est_t0 = std::chrono::steady_clock::now();
     if (size < small_size_ && heap_) {
       buf = heap_->newBuffer(size, resource_options);
     }
     if (!buf) {
       buf = device_->newBuffer(size, resource_options);
+    }
+    if (est.on) {
+      long ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - est_t0).count();
+      est.new_ns += ns;
+      // T-0206: a single newBuffer of 5 ms or more is logged with its size and the cache state (the long lock waits)
+      if (ns >= 5000000) {
+        fprintf(stderr, "engine alloc slow newBuffer %.2f ms size %.1f MB active %.1f GB cache %.1f GB resources %zu\n",
+                ns / 1e6, size / 1e6, get_active_memory() / 1e9, get_cache_memory() / 1e9, num_resources_);
+      }
+      long mx = est.new_max_ns.load();
+      while (ns > mx && !est.new_max_ns.compare_exchange_weak(mx, ns)) {}
     }
     if (!buf) {
       std::ostringstream msg;
@@ -223,6 +264,7 @@ Buffer MetalAllocator::malloc(size_t size) {
         get_cache_memory() - max_pool_size_);
   }
 
+  if (est.on) est.maybe_log(active_memory_, get_cache_memory(), num_resources_);
   return Buffer{static_cast<void*>(buf)};
 }
 
@@ -242,6 +284,7 @@ void MetalAllocator::free(Buffer buffer) {
     buffer_cache_.recycle_to_cache(buf);
   } else {
     num_resources_--;
+    if (engine_alloc_stats().on) engine_alloc_stats().releases++;
     if (!buf->heap()) {
       residency_set_.erase(buf);
     }

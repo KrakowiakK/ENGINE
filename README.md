@@ -8,7 +8,8 @@ machine, a Mac Studio with M3 Ultra and 512 GB of unified memory, where it serve
 
 What it does:
 
-- **Continuous batching** of up to 16 concurrent sessions: requests join and leave a running batch; decode and
+- **Continuous batching** of up to 16 concurrent sessions with `tools/serve.sh` (`ENGINE_SEATS`, 1-64), or 32 with the
+  throughput profile `tools/serve_e9_docs.sh`: requests join and leave a running batch; decode and
   prefill are scheduled in phases, compatible prefills are batched natively, and while a long prompt prefills the
   decoding rows keep getting up to half of its time (`ENGINE_DECODE_SHARE=0.5`, `ENGINE_DECODE_AFFINITY_MS=5`).
 - **MTP speculative decoding** in the production launcher's profile (`engine serve` itself defaults to `--mtp 0`,
@@ -109,6 +110,14 @@ kernels with CMake (build tree in `.build-worker/`). A fresh build of this expor
 macOS 27.2) took about 5 minutes for the release build, including fetching the dependencies, and about 70 seconds
 for the metallib.
 
+If the metallib build stops in CMake's compiler check with `ld: tapi error ... unknown architecture arm64e.x1-macos`
+(Command Line Tools whose default SDK is newer than your Xcode's linker, seen with MacOSX27.2.sdk and Xcode 26.4), point
+it at Xcode's own SDK:
+
+```sh
+SDKROOT=$(xcrun --sdk macosx --show-sdk-path) tools/build-mlx-metallib.sh
+```
+
 ## Get the weights
 
 The model is **not** in this repository. Download E9 from Hugging Face into `weights/e9` (the default path of the
@@ -142,6 +151,14 @@ policy or the request queue's `--queue-max` / `--queue-timeout-s`) are passed th
 Run `.build/release/engine serve ...` directly for anything else. It also refuses to start while another `engine`
 process is running: run one engine per machine.
 
+**Many concurrent sessions: `tools/serve_e9_docs.sh`.** This profile runs `tools/serve.sh` with 32 decode seats and
+the switches that pay at high concurrency: arrival-order prefill with mixed prefill/decode rounds, a fixed batched draft
+depth of 2, batched copy (n-gram) drafts verified in one packed forward, the fused verify-width kernels, graceful stop
+(SIGTERM drains admitted requests) and programming requests defaulting to `reasoning_effort` `low`. On a closed loop of
+32 sessions it delivers 53% more tokens per second than the 2026-10-12 release and 32% more than `tools/serve.sh` with
+32 seats (see Performance). Each switch is an environment variable the script sets only when unset, so any of them can
+be overridden or rolled back; the comments in the script say what each one measured.
+
 Loading ~195 GB can take from seconds (warm page cache) to several minutes (cold disk). The server answers
 `GET /v1/models` once it is ready.
 
@@ -154,6 +171,8 @@ Useful environment variables for the launcher:
 | `ENGINE_API_KEY` | unset | when set, every request needs `Authorization: Bearer <key>` |
 | `ENGINE_DISK_CACHE` | `0` | `1` adds the persistent prefix cache (`ENGINE_STATE_CACHE_DIR`, default `~/.cache/engine-prefix`; `ENGINE_STATE_CACHE_MAX_GB`, default 192) |
 | `ENGINE_BINARY` | `.build/release/engine` | binary to run (its `mlx.metallib` must sit beside it) |
+| `ENGINE_SEATS` | `16` (`32` in `tools/serve_e9_docs.sh`) | concurrent decode seats (1-64): `--max-concurrent` and `--batch-max-rows` together |
+| `MLX_GATHER_RHS_MIN_RATIO` | `0.5` | routed-expert gathers use MLX's expert-grouped GEMM from 26 rows (0.5 x 512 experts / top-10) instead of 205 (MLX's 4); `4` restores stock |
 
 `tools/lan_proxy.py --listen <LAN_IP>:8099` relays the loopback server to private-range LAN peers without
 restarting it, and without authentication.
@@ -228,6 +247,55 @@ derived limits, active and recent requests, scheduler counters, the process's fl
 sessions payload. See [apps/engine-studio/README.md](apps/engine-studio/README.md).
 
 ## Performance
+
+### This release (2026-11-05) against the previous one (2026-10-12)
+
+Measured on 2026-11-05 on the same Mac Studio (M3 Ultra, 80-core GPU, 512 GB, macOS 27.2), each version built from its
+own source and started through its own launcher on a fresh server: the 2026-10-12 release with its `tools/serve.sh` (16
+seats), this release with `tools/serve.sh` (`ENGINE_SEATS=32`) and with `tools/serve_e9_docs.sh` (32 seats).
+
+**32 concurrent sessions, closed loop.** 32 clients each send a ~3,000-character OCR-correction prompt (re-type a
+passage of a Polish novel with OCR errors fixed, greedy, up to 1,300 tokens; ~1,030 tokens come back) and send the next
+one as soon as the answer arrives, for 300 s. Throughput is all completion tokens the clients received per second.
+
+![32 concurrent sessions, closed loop](docs/images/release-2026-11-05-closed-loop.png)
+
+| 32 sessions, closed loop | 2026-10-12 | 2026-11-05 `tools/serve.sh` | 2026-11-05 `tools/serve_e9_docs.sh` |
+|---|---|---|---|
+| Throughput, tok/s | 186.8 | 216.5 (+16%) | **286.5 (+53%)** |
+| Median request time, s | 171.5 | 148.5 | **109.7** |
+| Rows decoding together (mean) | 12.7 | 19.8 | 28.3 |
+
+The 2026-10-12 release admits 16 sessions; the rest wait in its queue. Most of the gain comes from 32 seats, MLX's
+expert-grouped GEMM for the routed experts at batched-verify widths (each MTP round 4-15% faster at 12-32 rows),
+scheduling that keeps every round full, and, in `tools/serve_e9_docs.sh`, batched copy drafts and the fused verify
+kernels (see CHANGELOG.md).
+
+**32 parallel sessions with `llm_context_benchmarks`** (its prose files, all 32 requests released together, a unique
+cache-busting prefix per request, 512 tokens, **greedy**; `tools/serve.sh` with `ENGINE_SEATS=32` against the
+2026-10-12 release). Generation here is all completion tokens divided by the time until the last session finished.
+
+![32 parallel sessions](docs/images/release-2026-11-05-32-sessions.png)
+
+| Context per session | 0.5k | 2k | 8k |
+|---|---|---|---|
+| Time until all 32 finish, s | 62.4 -> **56.2** | 114.8 -> **102.8** | 297.9 -> **279.0** |
+| Generation, tok/s | 139.2 -> **151.1** | 78.6 -> **84.0** | 43.6 -> **49.4** |
+| Aggregate prefill, tok/s | 358 -> **762** | 716 -> **939** | 949 -> **1,136** |
+| Longest wait for a first token, s | 49.3 -> **23.2** | 97.0 -> **74.0** | 279.2 -> **233.2** |
+
+**One request at a time** the two releases are the same speed: prefill 895-1,265 tok/s at 0.5k-128k in both, and
+generation within the run-to-run spread of sampling at temperature 1.0 (76-78 tok/s at 0.5k, 56-60 at 128k).
+
+![One request at a time](docs/images/release-2026-11-05-single.png)
+
+**A correction that costs speed at temperature > 0.** Until this release, a sampled request without `top_k` (the
+server's default `top_k` is 0) was decoded **greedily** whenever it shared a batched round with other requests. It is
+now sampled, as asked. Sampling accepts fewer draft tokens than greedy decoding, so with 16 sessions at temperature 1.0
+on `llm_context_benchmarks` the aggregate decode rate at 0.5k reads 206 tok/s against 249 for the old release, which
+was not sampling. That is why the comparisons above are greedy or single-stream. All requests in every run succeeded.
+
+### Earlier measurements (2026-10-03)
 
 Measured on 2026-10-03 on one Mac Studio with M3 Ultra (80-core GPU) and 512 GB, macOS 27.2,
 `iogpu.disable_wired_collector=1`, behind `tools/serve.sh`, with the prose files of the `llm_context_benchmarks`

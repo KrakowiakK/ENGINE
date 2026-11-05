@@ -133,7 +133,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "mlx-server",
-            dependencies: ["MLXLMServer"],
+            dependencies: ["MLXLMServer", "MLXLLM"],
             path: "Executables/mlx-server"
         ),
         .target(

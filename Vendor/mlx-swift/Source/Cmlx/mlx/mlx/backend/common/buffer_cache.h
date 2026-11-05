@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
 #pragma once
+#include <cstdlib>
 
 #include <algorithm>
 #include <cassert>
@@ -30,8 +31,18 @@ class BufferCache {
   T* reuse_from_cache(size_t size) {
     // Find the closest buffer in pool.
     auto it = buffer_pool_.lower_bound(size);
-    if (it == buffer_pool_.end() ||
-        it->first >= std::min(2 * size, size + 2 * page_size_)) {
+    // ENGINE T-0168: ENGINE_CACHE_REUSE_TOL=f lets a request of >= 1 MB reuse a cached buffer up to (1 + f) x its size
+    // (default 0: MLX's rule, at most 2 pages larger). Sizes that follow context lengths otherwise never match, so every
+    // such request allocated a new MTLBuffer and pushed another one out of the cache (W53: 10-25k misses per 10 s).
+    static const double reuse_tol = [] {
+      const char* e = std::getenv("ENGINE_CACHE_REUSE_TOL");
+      return e ? std::atof(e) : 0.0;
+    }();
+    size_t limit = std::min(2 * size, size + 2 * page_size_);
+    if (reuse_tol > 0 && size >= (size_t(1) << 20)) {
+      limit = std::max(limit, size + size_t(double(size) * reuse_tol) + 1);
+    }
+    if (it == buffer_pool_.end() || it->first >= limit) {
       return nullptr;
     }
 

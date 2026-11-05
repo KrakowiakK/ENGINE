@@ -110,7 +110,7 @@ class MLX_API CommandEncoder {
   }
 
   void barrier();
-  void end_encoding();
+  void end_encoding(bool wait_in_flight = false);
   void wait_event(std::shared_ptr<EventImpl> event, uint64_t value);
   void signal_event(std::shared_ptr<EventImpl> event, uint64_t value);
   bool needs_commit() const;

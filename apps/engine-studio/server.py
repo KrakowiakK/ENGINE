@@ -17,11 +17,13 @@ import http.client
 import http.server
 import ipaddress
 import json
+import math
 import os
 import platform
 import re
 import secrets
 import shlex
+import signal
 import shutil
 import socket
 import socketserver
@@ -628,6 +630,242 @@ def _engine_sessions_raw():
     d = json.loads(body)
     d["available"] = True
     return d
+
+
+# ------------------------------------------------------------------------ engine history (/engine "Over time")
+#
+# A background thread samples the engine's sessions view every HISTORY_EVERY_S whether or not a page is open, keeps the
+# last HISTORY_KEEP_S in memory and writes it to data/engine_history.json once a minute (so a Studio restart keeps it).
+# Per sample: t, dec (aggregate decode tok/s), pre (prompt tokens actually computed per second, from each request's
+# prefilled_to progress since the previous sample: a new request counts from its cached tokens, one that finished in
+# between up to its prompt length -- cache hits excluded), act / decn / pren (active / decoding / prefilling), ctx (sum
+# of prompt + generated tokens over active requests) and ctxMax (the largest one). {"t", "gap": true} marks a sample
+# where the engine did not answer. Read-only towards the engine: one GET /v1/engine/sessions per sample.
+
+HISTORY_EVERY_S = 1.5
+HISTORY_KEEP_S = 3 * 3600
+HISTORY_PATH = DATA / "engine_history.json"
+RECORDS_PATH = DATA / "engine_records.json"
+RECORD_KEYS = ("dec", "pre", "act", "ctx", "ctxMax")    # the best value of each sample field, with when it was reached
+# The engine advances a request's prefilled_to only when a whole prefill chunk (4096-8192 tokens, often > 1.5 s) completes,
+# so the per-interval rate alternates between a chunk and nothing: `pre` is the work of the last PREFILL_WINDOW_S divided by
+# that span (a sawtooth of 0 / 2x became a steady rate; the peak is no longer one chunk landing in one interval).
+PREFILL_WINDOW_S = 6.0
+# Next to each best value, the median of the same field over the busy samples (value > 0: idle zeros would make every
+# median 0) since the records started. Kept as a histogram of log-spaced bins MEDIAN_BIN_REL wide, so it costs a few kB
+# for any number of samples and the median is within half a bin (0.5%) of the exact one. Records kept before this
+# existed start their histograms from the history still held ("median_since").
+MEDIAN_BIN_REL = 0.01
+_LOG_BIN = math.log1p(MEDIAN_BIN_REL)
+
+
+def _median_bin(v):
+    return str(round(math.log(v) / _LOG_BIN))
+
+
+def _hist_median(h):
+    """the median of a {bin: count} histogram (the lower middle bin for an even count), as the bin's value"""
+    n = sum(h.values())
+    if not n:
+        return None
+    acc = 0
+    for b in sorted(h, key=int):
+        acc += h[b]
+        if 2 * acc >= n:
+            return math.exp(int(b) * _LOG_BIN)
+    return None
+
+
+def _smooth_prefill(samples):
+    """recompute `pre` of a stored history with the window (work = rate x interval, rebuilt from the samples)"""
+    win, prev_t = [], None
+    for x in samples:
+        if x.get("gap"):
+            win, prev_t = [], None
+            continue
+        if prev_t is not None and isinstance(x.get("work"), (int, float)):
+            win.append((prev_t, x["t"], x["work"]))
+        elif prev_t is not None and isinstance(x.get("pre"), (int, float)):
+            win.append((prev_t, x["t"], x["pre"] * (x["t"] - prev_t)))
+        win = [w for w in win if w[1] > x["t"] - PREFILL_WINDOW_S]
+        if win:
+            x["pre"] = round(sum(w[2] for w in win) / (x["t"] - win[0][0]), 1)
+        prev_t = x["t"]
+    return samples
+
+
+class EngineHistory:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.samples = []
+        self.pf = None
+        self.last_save = 0.0
+        try:
+            d = json.loads(HISTORY_PATH.read_text())
+            cut = time.time() - HISTORY_KEEP_S
+            self.samples = _smooth_prefill([x for x in d.get("samples", []) if isinstance(x, dict) and x.get("t", 0) >= cut])
+        except (OSError, ValueError):
+            pass
+        self.records = None
+        try:
+            r = json.loads(RECORDS_PATH.read_text())
+            if isinstance(r.get("best"), dict):
+                self.records = r
+        except (OSError, ValueError):
+            pass
+        if self.records is not None and not self.records.get("pre_windowed"):
+            # records kept before the prefill window: the prefill peak was one chunk in one interval; rebuild it from history
+            self.records["best"].pop("pre", None)
+            since = self.records.get("since") or 0
+            best = max((x for x in self.samples if isinstance(x.get("pre"), (int, float)) and x["t"] >= since),
+                       key=lambda x: x["pre"], default=None)
+            if best and best["pre"] > 0:
+                self.records["best"]["pre"] = {"v": best["pre"], "t": best["t"]}
+            self.records["pre_windowed"] = True
+            self._save_records()
+        if self.records is None:        # first start with records: seed them from the history kept so far
+            self.records = {"since": self.samples[0]["t"] if self.samples else time.time(), "best": {}, "pre_windowed": True}
+            for x in self.samples:
+                for k in RECORD_KEYS:
+                    v = x.get(k)
+                    if isinstance(v, (int, float)) and v > 0 and v > (self.records["best"].get(k) or {}).get("v", 0):
+                        self.records["best"][k] = {"v": v, "t": x["t"]}
+        if not isinstance(self.records.get("hist"), dict):      # medians start from the samples still held
+            since = max(self.records.get("since") or 0, self.samples[0]["t"] if self.samples else 0)
+            self.records["hist"] = {k: {} for k in RECORD_KEYS}
+            self.records["median_since"] = since if self.samples else time.time()
+            for x in self.samples:
+                if x["t"] >= since:
+                    self._hist_add(x)
+        self._publish_medians()
+        self.records_dirty = False
+
+    def _hist_add(self, row):
+        for k in RECORD_KEYS:
+            v = row.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                h = self.records["hist"].setdefault(k, {})
+                b = _median_bin(v)
+                h[b] = h.get(b, 0) + 1
+
+    def _publish_medians(self):
+        """records["median"]: {field: {"v": median, "n": busy samples}} from the histograms"""
+        self.records["median"] = {k: {"v": _hist_median(h), "n": sum(h.values())}
+                                  for k, h in self.records["hist"].items() if h}
+
+    def _save_records(self):
+        try:
+            tmp = RECORDS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.records))
+            tmp.replace(RECORDS_PATH)
+        except OSError:
+            pass
+
+    def reset_records(self):
+        with self.lock:
+            now = time.time()
+            self.records = {"since": now, "best": {}, "pre_windowed": True, "hist": {k: {} for k in RECORD_KEYS},
+                            "median_since": now, "median": {}}
+            self._save_records()
+            return self.records_view()
+
+    def records_view(self):
+        """the records without the histograms (the page needs only best, median and since)"""
+        return {k: v for k, v in self.records.items() if k != "hist"}
+
+    def sample_once(self):
+        t = time.time()
+        d = _engine_sessions_raw()
+        if not d.get("available"):
+            row = {"t": round(t, 2), "gap": True}
+            self.pf = None
+        else:
+            a = d.get("aggregate") or {}
+            active, recent = d.get("active") or [], d.get("recent") or []
+            pre = None
+            row_work = None
+            pf = self.pf
+            if pf is None:
+                self.pfwin = []
+            if pf and t > pf["t"] and t - pf["t"] <= 4 * HISTORY_EVERY_S:
+                work = 0
+                for r in active:
+                    base = pf["prev"].get(r.get("id"), r.get("cached_tokens") or 0)
+                    work += max(0, (r.get("prefilled_to") or 0) - base)
+                for r in recent:
+                    if r.get("id") in pf["seen"]:
+                        continue
+                    base = pf["prev"].get(r.get("id"), r.get("cached_tokens") or 0)
+                    work += max(0, (r.get("prompt_tokens") or 0) - base)
+                self.pfwin = [w for w in getattr(self, "pfwin", []) if w[1] > t - PREFILL_WINDOW_S] + [(pf["t"], t, work)]
+                pre = round(sum(w[2] for w in self.pfwin) / (t - self.pfwin[0][0]), 1)
+                row_work = work
+            seen = pf["seen"] if pf else set()
+            seen.update(r.get("id") for r in recent)
+            if len(seen) > 5000:
+                seen = {r.get("id") for r in recent}
+            self.pf = {"t": t, "seen": seen,
+                       "prev": {r.get("id"): (r.get("prefilled_to") or r.get("cached_tokens") or 0) for r in active}}
+            ctx = [(r.get("prompt_tokens") or 0) + (r.get("generated") or 0) for r in active]
+            dec = a.get("decode_tokens_per_second")
+            row = {"t": round(t, 2), "dec": round(dec, 1) if isinstance(dec, (int, float)) else None, "pre": pre,
+                   "act": a.get("active"), "decn": a.get("decoding"), "pren": a.get("prefilling"),
+                   "ctx": sum(ctx), "ctxMax": max(ctx, default=0), "work": row_work}
+        with self.lock:
+            self.samples.append(row)
+            improved = False
+            for k in RECORD_KEYS:
+                v = row.get(k)
+                if isinstance(v, (int, float)) and v > 0 and v > (self.records["best"].get(k) or {}).get("v", 0):
+                    self.records["best"][k] = {"v": v, "t": row["t"]}
+                    improved = True
+            if not row.get("gap"):
+                self._hist_add(row)
+                self._publish_medians()
+                self.records_dirty = True
+            if improved:
+                self._save_records()
+                self.records_dirty = False
+            cut = t - HISTORY_KEEP_S
+            while self.samples and self.samples[0]["t"] < cut:
+                self.samples.pop(0)
+            if t - self.last_save >= 60:
+                self.last_save = t
+                snap = list(self.samples)
+                if self.records_dirty:      # the histograms change every sample: saved with the history, once a minute
+                    self._save_records()
+                    self.records_dirty = False
+            else:
+                snap = None
+        if snap is not None:
+            self.save(snap)
+
+    def save(self, snap=None):
+        if snap is None:
+            with self.lock:
+                snap = list(self.samples)
+        try:
+            tmp = HISTORY_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"samples": snap}, separators=(",", ":")))
+            tmp.replace(HISTORY_PATH)
+        except OSError:
+            pass
+
+    def run(self):
+        while True:
+            t0 = time.time()
+            try:
+                self.sample_once()
+            except Exception as e:      # never let one bad payload stop the history
+                print(f"engine history: sample failed: {e}", flush=True)
+            time.sleep(max(0.2, HISTORY_EVERY_S - (time.time() - t0)))
+
+    def since(self, t):
+        with self.lock:
+            return [x for x in self.samples if x["t"] > t]
+
+
+HISTORY = EngineHistory()
 
 
 # ------------------------------------------------------------------------ engine overview (/engine)
@@ -1368,7 +1606,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             source, via_tunnel = self._traffic_source()
             # the sessions panel and /engine poll these every second; logging them would bury real traffic
-            polled = self.path in ("/api/engine/sessions", "/api/engine/overview") and (self._status_code or 0) == 200
+            polled = (self.path in ("/api/engine/sessions", "/api/engine/overview") or self.path.startswith("/api/engine/history")) and (self._status_code or 0) == 200
             if not polled:
                 TRAFFIC.record(method, self.path, self._status_code or 0, (time.time() - t0) * 1000, source, via_tunnel)
 
@@ -1426,6 +1664,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(engine_sessions())
         if self.path == "/api/engine/overview":
             return self._json(engine_overview())
+        if self.path.split("?", 1)[0] == "/api/engine/history":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                since = float(q.get("since", ["0"])[0])
+            except ValueError:
+                since = 0.0
+            return self._json({"every_s": HISTORY_EVERY_S, "keep_s": HISTORY_KEEP_S, "samples": HISTORY.since(since),
+                               "records": HISTORY.records_view()})
         if self.path.split("?", 1)[0] in ("/engine", "/engine/"):
             return self._serve_static("/engine.html")      # the full engine dashboard (web/engine.html)
         if self.path == "/api/conversations":
@@ -1463,6 +1709,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except RuntimeError as e:      # P103: an engine the Studio did not start is not the Studio's to stop
                 return self._error(409, str(e))
             return self._json(ENGINE.status())
+        if self.path == "/api/engine/records/reset":
+            return self._json(HISTORY.reset_records())
         if self.path == "/api/stats/reset":
             try:
                 return self._json(reset_engine_sessions())
@@ -1724,6 +1972,12 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
+    threading.Thread(target=HISTORY.run, name="engine-history", daemon=True).start()
+    def _on_term(signum, frame):        # a restart keeps the history up to this second (otherwise saved once a minute);
+        HISTORY.save()                  # then exit at once, as a plain SIGTERM did (no finally: an attached engine is not ours)
+        HISTORY._save_records()         # and the median histograms of the last minute
+        os._exit(0)
+    signal.signal(signal.SIGTERM, _on_term)
     host = "0.0.0.0" if CFG.get("external") else "127.0.0.1"
     port = CFG.get("studio_port", 7860)
     httpd = ThreadingHTTPServer((host, port), Handler)

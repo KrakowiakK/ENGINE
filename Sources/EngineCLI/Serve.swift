@@ -105,6 +105,16 @@ private final class ServeMemoryWitness: @unchecked Sendable {
         if let layout { cacheLayout = layout }
         lock.unlock()
     }
+    /// T-0205: the serial speculative round publishes after every round (~3 tokens); ENGINE_PUBLISH_MIN_MS=n skips that
+    /// hot-path publish when the last one is under n ms old (default 0: every round). The request's end still publishes.
+    private var lastPublish: UInt64 = 0
+    static let minIntervalNs: UInt64 = UInt64(max(0, Double(ProcessInfo.processInfo.environment["ENGINE_PUBLISH_MIN_MS"] ?? "") ?? 0) * 1e6)
+    func publishThrottled() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if Self.minIntervalNs > 0, now &- lastPublish < Self.minIntervalNs { return }
+        lastPublish = now
+        publish()
+    }
     func snapshot() -> [String: Double] { lock.lock(); defer { lock.unlock() }; return value }
     func prefillSnapshot() -> [String: Int] { lock.lock(); defer { lock.unlock() }; return prefill }
     func indexerSnapshot() -> [String: Int] { lock.lock(); defer { lock.unlock() }; return indexer }
@@ -150,6 +160,9 @@ private let sharedPrefixRung = ProcessInfo.processInfo.environment["ENGINE_SHARE
 /// P119: at most this many distinct shared-prefix rungs (LRU among them; ENGINE_SHARED_PREFIX_RUNG_MAX, default 4, at most
 /// 8: with the protected share -- 1/8 of the hot store's budget -- they can never crowd out the conversations, review F2).
 private let sharedPrefixRungMax = ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG_MAX"].map { Int($0) ?? -1 } ?? 4
+/// T-0092: ENGINE_ADMISSION_PER_ROW=1 prices each row at its own prompt + max_tokens (its prefill block bounded by its
+/// prompt) and sums the rows, instead of pricing every row at the longest one; only with row-resident KV (no padded history).
+private let admissionPerRow = ProcessInfo.processInfo.environment["ENGINE_ADMISSION_PER_ROW"] == "1"
 /// P120: the hot store's share of the shared RAM budget is computed from each row's COMMITTED length -- its prompt plus
 /// this many tokens, raised again (`AdmissionBudget.grow`, a control job on the owner that shrinks the hot store first)
 /// whenever the row comes within half a window of it -- instead of its admitted prompt + max_tokens. Admission still
@@ -162,6 +175,29 @@ private let admissionGrowthWindow = ProcessInfo.processInfo.environment["ENGINE_
 /// MLX's row-count kernel thresholds (PrefillChunkPlan.sharedPrefixMargin says which).
 private let sharedPrefixRungMargin = PrefillChunkPlan.sharedPrefixMargin
 nonisolated(unsafe) private var sharedPrefixSplits = 0, sharedPrefixNativeSkips = 0   // owner only
+/// T-0095: ENGINE_SHARED_PREFIX_RUNG_WIDE=1 admits the shared-prefix rung on a model with no QSA indexer (plain Qwen3.5,
+/// the 397B) whose chunk widths exceed the H50b-certified 2048. The split at 1024 then changes the chunking of a prompt's
+/// first chunk, so a resumed prompt is NOT bit-identical to its cold prefill (as a cold prompt already differs between the
+/// alone width 8192 and the shared width 4096): numerically equivalent, checked on answers rather than certified.
+private let sharedPrefixRungWide = ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG_WIDE"] == "1"
+/// T-0156: ENGINE_SHARED_PREFIX_RUNG_SHORT=1 admits a shared-prefix rung of 64...budget-1 tokens on a model WITH a QSA
+/// indexer (E9), whose client prompts share only a ~192-255-token head (C-0449). Below the QSA budget (2048) nothing is
+/// pooled (the rung holds raw keys and the GDN state only), so the resume is exact in what it stores; but the head's own
+/// short chunk takes other MLX kernels than a cold first chunk (gather_qmv below 205 rows, split-K at <= 192 rows) and the
+/// 1024-row canonical blocks no longer line up, so a resumed prompt is NOT bit-identical to its cold prefill: numerically
+/// equivalent, checked on answers (as T-0095's WIDE rung). For an MTP hit the token AT the rung must be shared too
+/// (HotPrefixStore sharedMTPNextToken), so a 192-token head wants rung 191. Text prompts only split (as WIDE).
+private let sharedPrefixRungShort = ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG_SHORT"] == "1"
+/// T-0095: the shared-prefix entries' protected share of the hot store's budget, 1/divisor (ENGINE_SHARED_PREFIX_SHARE_DIVISOR,
+/// default 8 as P119; 1 lets them use the whole budget, still at most ENGINE_SHARED_PREFIX_RUNG_MAX entries).
+private let sharedPrefixShareDivisor = ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_SHARE_DIVISOR"].map { Int($0) ?? -1 } ?? 8
+/// T-0095: ENGINE_HOT_FLOOR_GB keeps this much of the shared RAM budget out of admission, so the hot store keeps room for
+/// shared-prefix rungs under full load (0 = off). Requires ENGINE_SHARED_RAM_BUDGET=1.
+private let hotFloorGB = ProcessInfo.processInfo.environment["ENGINE_HOT_FLOOR_GB"].map { Double($0) ?? -1 } ?? 0
+/// T-0095: hash-only record of how much of each prompt an earlier prompt began with (GET /v1/engine/sessions `prefix_share`).
+/// Its rung-eligibility counters follow ENGINE_SHARED_PREFIX_RUNG when it is on (T-0097), else 1024.
+let servePrefixShareLedger = PrefixShareLedger(rung: sharedPrefixRung > 0 ? sharedPrefixRung : 1024,
+                                               rungMargin: PrefillChunkPlan.sharedPrefixMargin)
 
 func serve(_ o: Options) async throws {
     // A client that disconnects mid-request (a timeout, a cancelled stream) makes the eventual
@@ -304,6 +340,8 @@ func serve(_ o: Options) async throws {
     await LLMTypeRegistry.shared.registerModelType("qwen4_exp") { data in
         Qwen4ExpModel(try JSONDecoder().decode(Qwen4ExpConfiguration.self, from: data))
     }
+
+    await registerPlainQwen35()
     let wiredConfiguration = applyWiredLimit()
     let dir = URL(fileURLWithPath: modelPath).resolvingSymlinksInPath()
     engineStopIdSet = engineStopIds(dir.path)
@@ -316,6 +354,8 @@ func serve(_ o: Options) async throws {
     // the fly, so nothing in the model caps the length; past the trained range the long-context quality is the
     // measured question (knowledge base: needle tests), so the extension is never implicit.
     let contextExtension = ProcessInfo.processInfo.environment["ENGINE_CONTEXT_EXTENSION"] == "1"
+    serveNativeContext = nativeContext
+    installGracefulStop()
     let contextCeiling = nativeContext == 0 ? Int.max : (contextExtension ? 4 * nativeContext : nativeContext)
     guard contextLimit > 0, contextLimit <= contextCeiling else {
         throw EngineError.invalid("--max-context must be positive and no larger than the checkpoint context"
@@ -365,11 +405,17 @@ func serve(_ o: Options) async throws {
                     "max_context": contextLimit, "model_loaded_bytes": loadedModelBytes,
                     "kv_bytes_per_token": bytesPerToken, "wired_configuration": wiredConfiguration,
                     "hot_cache_gb": hotCacheGB, "prefill_chunk": prefillChunk,
-                    "prefill_chunk_shared": sharedChunk, "prefill_chunk_alone": aloneChunk, "prefill_budget_cut": h57BudgetCut, "batch_min": batchMinRows,
+                    "prefill_chunk_shared": sharedChunk, "prefill_chunk_alone": aloneChunk, "hot_reserve": hotReserveTokens, "prefill_merge_tail": prefillMergeTail, "prefill_decode_token_budget": prefillDecodeTokenBudgetEnv, "prefill_budget_cut": h57BudgetCut, "batch_min": batchMinRows,
                     "batch_mtp_policy": batchMTPPolicy,
                     "scheduler": ProcessInfo.processInfo.environment["ENGINE_SCHEDULER"] == "fifo" ? "fifo" : "phase",
                     "scheduler_decode_burst": serveDecodeBurst, "scheduler_decode_affinity_ms": serveDecodeAffinityMs,
                     "scheduler_decode_share": serveDecodeShare, "scheduler_decode_share_min_s": serveDecodeShareMinS,
+                    "scheduler_prefill_order": servePrefillOrderArrival ? "arrival" : "fifo",
+                    "vision_arrival_stamp": serveVisionArrivalStamp, "vision_bf16": Qwen4ExpModel.visionInputBF16,
+                    "scheduler_prefill_continue_ms": servePrefillContinueMs, "scheduler_prefill_quantum_s": servePrefillQuantumS,
+                    "scheduler_control_passes_prefill": serveControlPassesPrefill,
+                    "scheduler_mixed_round": serveMixedRound, "scheduler_mixed_wait_ms": serveMixedWaitMs,
+                    "scheduler_mixed_decode_share_keep": serveMixedDecodeShareKeep, "scheduler_mixed_serial": serveMixedSerialOn,
                     "admin_flush": serveAdminFlush]
     let modelId = dir.lastPathComponent
     // P089 U10: from this line on, EVERY MLX call in this process happens on the model thread, and
@@ -414,16 +460,29 @@ func serve(_ o: Options) async throws {
             : (Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CHUNK"] ?? "") ?? 0)
         let widths = configuredChunk > 0 ? [configuredChunk] : [aloneChunk, sharedChunk]
         let budget = qwenConfig?.indexerBudget ?? 0
-        guard sharedPrefixRung == h25CanonicalWidth, (1 ... 8).contains(sharedPrefixRungMax), qwenConfig != nil,
+        // T-0097: under the WIDE admission on a plain model (no pooled indexer rows, so any length slices) the rung may be
+        // any length in 64...1024 -- the client's shared heads are 192-319 tokens (C-0280), and an MTP hit also needs the
+        // token AT the rung to be shared, so 191 for a 192-token head; elsewhere only the width-canonical 1024 is certified.
+        let widePlain = sharedPrefixRungWide && qwenConfig?.plain == true
+        let shortIndexed = sharedPrefixRungShort && qwenConfig?.plain != true && budget > 64
+        guard sharedPrefixRung == h25CanonicalWidth || (widePlain && (64 ... 1024).contains(sharedPrefixRung))
+                || (shortIndexed && (64 ..< min(budget, h25CanonicalWidth)).contains(sharedPrefixRung)),
+              (1 ... 8).contains(sharedPrefixRungMax), qwenConfig != nil,
               hotCacheGB > 0, serveSharedRAMBudget, ProcessInfo.processInfo.environment["ENGINE_ROUTER_FP32"] == nil,
               h50WidthCanonical, widths.allSatisfy({ $0 % h25CanonicalWidth == 0 }),
-              widths.allSatisfy({ $0 <= h50MaxCanonicalChunk }) || (h57BudgetCut && budget == h50MaxCanonicalChunk),
+              widths.allSatisfy({ $0 <= h50MaxCanonicalChunk }) || (h57BudgetCut && budget == h50MaxCanonicalChunk)
+                || widePlain,
               !h25CanonicalPrefix, !h25Metadata, !h8BoundarySplit,
-              stateCacheDir == nil || h25CanonicalWidth % stateCacheStep == 0 else {
-            throw EngineError.invalid("ENGINE_SHARED_PREFIX_RUNG=\(ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG"] ?? "") requires 1024, ENGINE_SHARED_PREFIX_RUNG_MAX 1...8, a Qwen model, --hot-cache-gb > 0, ENGINE_SHARED_RAM_BUDGET=1, no ENGINE_ROUTER_FP32, ENGINE_PREFILL_WIDTH_CANONICAL=1024, chunk widths multiples of 1024 and <= 2048 or cut at a 2048 QSA budget (ENGINE_PREFILL_BUDGET_CUT on), no H25/H8/H26 diagnostic, and a disk rung step dividing 1024")
+              stateCacheDir == nil || sharedPrefixRung % stateCacheStep == 0 else {
+            throw EngineError.invalid("ENGINE_SHARED_PREFIX_RUNG=\(ProcessInfo.processInfo.environment["ENGINE_SHARED_PREFIX_RUNG"] ?? "") requires 1024 (or 64...1024 with ENGINE_SHARED_PREFIX_RUNG_WIDE=1 on a plain model, or 64..<1024 with ENGINE_SHARED_PREFIX_RUNG_SHORT=1 on an indexed model), ENGINE_SHARED_PREFIX_RUNG_MAX 1...8, a Qwen model, --hot-cache-gb > 0, ENGINE_SHARED_RAM_BUDGET=1, no ENGINE_ROUTER_FP32, ENGINE_PREFILL_WIDTH_CANONICAL=1024, chunk widths multiples of 1024 and <= 2048 or cut at a 2048 QSA budget (ENGINE_PREFILL_BUDGET_CUT on) or ENGINE_SHARED_PREFIX_RUNG_WIDE=1 on a plain model, no H25/H8/H26 diagnostic, and a disk rung step dividing the rung")
         }
     }
     serveRuntime["shared_prefix_rung"] = sharedPrefixRung
+    serveRuntime["shared_prefix_rung_short"] = sharedPrefixRungShort
+    serveRuntime["shared_prefix_rung_wide"] = sharedPrefixRungWide
+    guard (1 ... 64).contains(sharedPrefixShareDivisor) else {
+        throw EngineError.invalid("ENGINE_SHARED_PREFIX_SHARE_DIVISOR must be 1...64")
+    }
     guard admissionGrowthWindow == 0 || (serveSharedRAMBudget && admissionGrowthWindow % 1024 == 0
                                          && (4096 ... 262_144).contains(admissionGrowthWindow)) else {
         throw EngineError.invalid("ENGINE_ADMISSION_GROWTH_WINDOW=\(ProcessInfo.processInfo.environment["ENGINE_ADMISSION_GROWTH_WINDOW"] ?? "") requires 0, or a multiple of 1024 in 4096...262144 with ENGINE_SHARED_RAM_BUDGET=1")
@@ -441,6 +500,12 @@ func serve(_ o: Options) async throws {
     serveRuntime["h25_canonical_prefix"] = h25CanonicalPrefix
     serveRuntime["h25_canonical_width"] = h25CanonicalWidth
     serveRuntime["prefill_width_canonical_rows"] = Qwen4ExpPrefillWidth.canonicalRows
+    // T-0190 (QC-2): the environment this server actually started with -- every ENGINE_/MLX_/MLXFAST_ variable, so a stray
+    // diagnostic or ablation knob left in a shell is visible, and tools/qc/env_check.py can compare it with the production
+    // manifest (C-0606)
+    serveRuntime["env"] = ProcessInfo.processInfo.environment.filter { k, _ in
+        k.hasPrefix("ENGINE_") || k.hasPrefix("MLX_") || k.hasPrefix("MLXFAST_")
+    }
     serveRuntime["h26_prefill_metadata"] = h26PrefillMetadata
     serveRuntime["h26_prefill_interval_capacity"] = h26PrefillIntervalCapacity
     serveRuntime["batch_prefill"] = batchPrefill
@@ -484,8 +549,34 @@ func serve(_ o: Options) async throws {
                                     maxBatch: batchMaxRows, phaseScheduling: ProcessInfo.processInfo.environment["ENGINE_SCHEDULER"] != "fifo",
                                     maxConsecutiveDecodeDispatches: serveDecodeBurst,
                                     prefillMaxBatch: batchPrefill ? 4 : 1, prefillTokenBudget: 4096,
+                                    prefillDecodeTokenBudget: prefillDecodeTokenBudgetEnv,
                                     decodeAffinity: serveDecodeAffinityMs / 1000, decodeShare: serveDecodeShare,
-                                    decodeShareMinWork: serveDecodeShareMinS, snapshot: { req, token in
+                                    decodeShareMinWork: serveDecodeShareMinS,
+                                    prefillOrderArrival: servePrefillOrderArrival, prefillContinue: servePrefillContinueMs / 1000,
+                                    prefillQuantum: servePrefillQuantumS, controlPassesPrefill: serveControlPassesPrefill, controlPassesDecode: serveControlPassesDecode, decodeClosurePasses: serveDecodeClosurePasses,
+                                    mixedWait: serveMixedWaitMs / 1000,
+                                    mixedAfterContinue: serveMixedAfterContinue, mixedAll: serveMixedAll,
+                                    mixedDecodeShareKeep: serveMixedDecodeShareKeep,
+                                    packRows: serveMixedRound ? servePackRows : 0, packMax: servePackMax,
+                                    mixedUnblock: serveMixedUnblock,
+                                    towerLookahead: serveTowerLookahead,
+                                    setupResetsShare: ProcessInfo.processInfo.environment["ENGINE_SETUP_RESETS_SHARE"] == "1",
+                                    packedStep: serveMixedRound && servePackRows > 0 ? { mixes, reqs in
+        defer { serveMemoryWitness.publish() }
+        guard let qm = mtModel as? Qwen4ExpModel else { return reqs.map { _ in -1 } }
+        return servePackedStep(mixes, reqs, model: mtModel, qm: qm, ratio: mtRatio)
+    } : nil,
+                                    mixedStep: serveMixedRound ? { mix, reqs in
+        defer { serveMemoryWitness.publish() }
+        guard let qm = mtModel as? Qwen4ExpModel else { return reqs.map { _ in -1 } }
+        return serveMixedStep(mix, reqs, model: mtModel, qm: qm, ratio: mtRatio)
+    } : nil,
+                                    mixedSerial: serveMixedSerialOn ? { mix, round in
+        defer { serveMemoryWitness.publish() }
+        guard let qm = mtModel as? Qwen4ExpModel else { round(); return }
+        serveMixedSerial(mix, qm: qm, round)
+    } : nil,
+                                    snapshot: { req, token in
         let row = seqRegistry[req.key].row
         let pooledSpec = batchPoolShared.specPool != nil && batchPoolShared.memberIds.contains(ObjectIdentifier(row))
         return StepResult(token: token, queued: row.takeQueued(), hasSpec: row.spec != nil || pooledSpec)
@@ -509,6 +600,7 @@ func serve(_ o: Options) async throws {
         hotStoreShared.sharedPrefixLength = sharedPrefixRung
         hotStoreShared.sharedPrefixCapacity = sharedPrefixRungMax
         hotStoreShared.sharedPrefixMinPrompt = sharedPrefixRung + sharedPrefixRungMargin   // = PrefillChunkPlan's eligibility
+        hotStoreShared.sharedPrefixShareDivisor = sharedPrefixShareDivisor
     }
     // the store's P119 policy constants, read back (0 with the knob off; every key starts `shared_prefix_rung`)
     serveRuntime["shared_prefix_rung_share_divisor"] = sharedPrefixRung > 0 ? hotStoreShared.sharedPrefixShareDivisor : 0
@@ -545,7 +637,9 @@ func serve(_ o: Options) async throws {
         }
     }
     guard bindOk == 0 else { throw EngineError.invalid("serve: bind() failed on port \(port) (errno \(errno))") }
-    guard listen(serverFD, 16) == 0 else { throw EngineError.invalid("serve: listen() failed (errno \(errno))") }
+    // T-0177 (C-0572): a backlog of 16 reset 13-15 of 32 connections opened at the same moment (the client starts up to
+    // ~32 at once); the kernel caps the value at kern.ipc.somaxconn (128 on this Mac)
+    guard listen(serverFD, 512) == 0 else { throw EngineError.invalid("serve: listen() failed (errno \(errno))") }
     // P067: warm the kernels this server will dispatch BEFORE the first client arrives. The first
     // use of every kernel shape pays MLX's JIT compile (cross-process cached by Metal; OBS-ENG-140/141:
     // a cold verify width ran 4x slower than warm on its first block). One short throwaway prefill,
@@ -571,8 +665,10 @@ func serve(_ o: Options) async throws {
     let allocatorGB = Double(ProcessInfo.processInfo.environment["ENGINE_CACHE_LIMIT_GB"] ?? "32") ?? 32
     // Keep physical, allocator and workspace margins identical. Shared mode leases
     // the remainder between the SAME active bound and reclaimable cache storage.
-    serveRAMLiveLimitBytes = Double(ProcessInfo.processInfo.physicalMemory) * 0.90
-        - (max(32, allocatorGB) + 48) * 1e9
+    // T-0076: ENGINE_RAM_RESERVE_GB overrides the allocator + workspace margin (default max(32, cache limit) + 48 GB). A
+    // 438 GB model (Qwen3.5-397B) leaves no KV budget under the E9-sized 80 GB margin; its launcher sets a smaller one.
+    let reserveGB = Double(ProcessInfo.processInfo.environment["ENGINE_RAM_RESERVE_GB"] ?? "") ?? (max(32, allocatorGB) + 48)
+    serveRAMLiveLimitBytes = Double(ProcessInfo.processInfo.physicalMemory) * 0.90 - reserveGB * 1e9
     // P125: never plan for more than the machine had free at launch (less a margin for everything else): the physical formula
     // above assumes the engine owns the Mac.
     let physicalLiveLimit = serveRAMLiveLimitBytes
@@ -590,6 +686,7 @@ func serve(_ o: Options) async throws {
         throw EngineError.invalid("KV budget exceeds memory remaining after resident model/cache/workspace reserves")
     }
     var historyCapacity: (@Sendable (Int) -> Double)? = nil
+    var rowHistoryCapacity: (@Sendable (Int, Int) -> Double)? = nil
     var fixedBytesPerSequence = 384e6
     if let a = qwenConfig {
         let kvStep = Qwen4ExpCacheCapacity.kvStep, indexerStep = Qwen4ExpCacheCapacity.indexerStep
@@ -610,6 +707,17 @@ func serve(_ o: Options) async throws {
                 kvStep: kvStep, indexerStep: indexerStep, maxForwardRows: forwardRows, capacityGrowthLimit: contextLimit)
                 + (spineStep > 0 ? Double(length / spineStep) * rungBytes : 0)
         }
+        // T-0092: the same envelope for one row, its forward block bounded by its own prompt (a prefill chunk never
+        // exceeds the prompt; decode writes K + 1 rows), and no indexer keys on a plain Qwen3.5 (it has no indexer)
+        rowHistoryCapacity = { length, prompt in
+            AdmissionBudget.historyCapacityBytes(length: length,
+                attentionLayers: fullLayers + (mtpDepth > 0 ? 1 : 0), kvHeads: kvHeads, headDim: headDim,
+                indexerHeadDim: a.plain ? 0 : a.indexerHeadDim, indexerCompressRatio: a.indexerCompressRatio,
+                kvStep: kvStep, indexerStep: indexerStep,
+                maxForwardRows: max(1, min(forwardRows, max(prompt, max(mtpDepth, batchMTPDepth) + 1))),
+                capacityGrowthLimit: contextLimit)
+                + (spineStep > 0 ? Double(length / spineStep) * rungBytes : 0)
+        }
         serveRuntime["hot_spine_step"] = spineStep
         let liveRungReserve = hotStoreShared.enabled ? Double(hotStoreShared.retainedRungLimit + 1) * rungBytes : 0
         fixedBytesPerSequence = max(fixedBytesPerSequence, 3 * stableState + liveRungReserve)
@@ -627,10 +735,20 @@ func serve(_ o: Options) async throws {
     // copy, no history restack); the fixed state, which still restacks, keeps its 3x inside fixedBytesPerSequence.
     let historyFactor = rowResidentKV && Qwen4ExpModel.rowResidentEligible ? min(3, max(1, Double(ProcessInfo.processInfo.environment["ENGINE_ADMISSION_HISTORY_FACTOR"] ?? "") ?? 3)) : 3
     serveRuntime["admission_history_factor"] = historyFactor
+    guard !admissionPerRow || (rowResidentKV && Qwen4ExpModel.rowResidentEligible && rowHistoryCapacity != nil) else {
+        throw EngineError.invalid("ENGINE_ADMISSION_PER_ROW=1 requires a Qwen model with row-resident KV (ENGINE_ROW_RESIDENT_KV on, no stacked-pool diagnostic)")
+    }
+    guard hotFloorGB == 0 || (serveSharedRAMBudget && hotFloorGB > 0 && hotFloorGB * 1e9 < requestedBudget / 2) else {
+        throw EngineError.invalid("ENGINE_HOT_FLOOR_GB=\(ProcessInfo.processInfo.environment["ENGINE_HOT_FLOOR_GB"] ?? "") requires ENGINE_SHARED_RAM_BUDGET=1 and a value below half the KV budget (\(Int(requestedBudget / 1e9)) GB)")
+    }
     serveAdmission = AdmissionBudget(maxContext: contextLimit, capacityBytes: requestedBudget,
         bytesPerToken: bytesPerToken, fixedBytesPerSequence: fixedBytesPerSequence,
         historyCapacityBytes: historyCapacity, hotCacheCeilingBytes: serveSharedRAMBudget ? hotCacheGB * 1e9 : nil,
-        growthWindow: admissionGrowthWindow, historyFactor: historyFactor)
+        growthWindow: admissionGrowthWindow, historyFactor: historyFactor,
+        perRow: admissionPerRow, historyCapacityBytesForRow: admissionPerRow ? rowHistoryCapacity : nil,
+        hotFloorBytes: max(0, hotFloorGB) * 1e9)
+    serveRuntime["admission_per_row"] = admissionPerRow
+    serveRuntime["hot_floor_bytes"] = max(0, hotFloorGB) * 1e9
     serveRuntime["shared_ram_budget"] = serveSharedRAMBudget
     serveRuntime["ram_live_limit_bytes"] = serveRAMLiveLimitBytes
     modelThreadShared.exclusive {
@@ -831,6 +949,9 @@ nonisolated(unsafe) var serveRuntime: [String: Any] = [:]
 nonisolated(unsafe) var serveMaxTokensClamp = false
 let serveMaxTokensWitness = DecisionWitness()
 let serveEffortWitness = DecisionWitness()
+/// T-0294: ENGINE_REASONING_EFFORT_CODING=low|medium|xhigh -- the default effort for programming requests (unset: none)
+let serveEffortCodingDefault: String? = ProcessInfo.processInfo.environment["ENGINE_REASONING_EFFORT_CODING"]
+    .flatMap { ReasoningEffortPolicy.levels.contains($0.lowercased()) ? $0.lowercased() : nil }
 
 // MARK: - HTTP plumbing
 
@@ -902,6 +1023,11 @@ private struct ChatRequest {
     /// and `thinking_budget` keeps capping the reasoning, so the answer's room no longer depends on how long the
     /// reasoning ran.
     var maxAnswerTokens: Int? = nil
+    /// T-0274 (C-0769): "engine_return_token_ids": true returns the committed output token ids (message-level
+    /// choice field engine_token_ids, non-streaming only) so the teacher-forced fidelity scan scores what was committed
+    var returnTokenIds = false
+    /// T-0294: the effort came from the programming-request default (witness label "(default:code)")
+    var effortFromCodingDefault = false
     /// T-0053: the image sources of every image part, in document order (each part rendered as the template's placeholder),
     /// and a malformed part's refusal.
     var images: [String] = []
@@ -974,6 +1100,7 @@ private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defau
     let requestedMaxTokens = (obj["max_tokens"] as? Int) ?? (obj["max_completion_tokens"] as? Int)
     let maxTokens = requestedMaxTokens ?? defaultMaxTokens   // serve replaces it after tokenising (MaxTokensPolicy)
     let temp = (obj["temperature"] as? Double).map(Float.init) ?? 0
+    if temp > 0 { EngineWitness.hit("sampled_request") }      // T-0191: does real traffic sample at all?
     let topP = (obj["top_p"] as? Double).map(Float.init) ?? 1
     let topK = max(0, (obj["top_k"] as? Int) ?? 0)   // P068: the checkpoint asks for top_k 20 with sampling
     let (logitParams, samplingError) = ServeSamplingParams.parse(obj, vocabularySize: serveVocabularySize)   // P124
@@ -991,7 +1118,20 @@ private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defau
     // without closing </think> -- is what the P078 soft stop (--think-bias-*) closes, so since P114 production
     // defaults to xhigh (operator 2026-09-25: every default at its maximum). Other spellings map to the nearest
     // level (ReasoningEffortPolicy); a client's explicit level always wins.
-    let reasoningEffort = ReasoningEffortPolicy.resolve(obj["reasoning_effort"] as? String, serverDefault: defaultEffort)
+    // T-0294 (Q-0001, C-0794): with ENGINE_REASONING_EFFORT_CODING set, a programming request that names no effort gets that
+    // default instead of the server's; an explicit reasoning_effort / enable_thinking always wins
+    let codingDefault: String? = {
+        guard let level = serveEffortCodingDefault, obj["reasoning_effort"] == nil, obj["enable_thinking"] == nil,
+              (obj["chat_template_kwargs"] as? [String: Any])?["enable_thinking"] == nil else { return nil }
+        let msgs = (obj["messages"] as? [[String: Any]]) ?? []
+        let texts: [String] = msgs.flatMap { m -> [String] in
+            if let c = m["content"] as? String { return [c] }
+            return ((m["content"] as? [[String: Any]]) ?? []).compactMap { $0["text"] as? String }
+        }
+        let hasTools = !((obj["tools"] as? [Any]) ?? []).isEmpty
+        return ProgrammingRequestDetector.isProgramming(texts: texts, hasTools: hasTools) ? level : nil
+    }()
+    let reasoningEffort = ReasoningEffortPolicy.resolve(obj["reasoning_effort"] as? String, serverDefault: codingDefault ?? defaultEffort)
     let preserveThinking = obj["preserve_thinking"] as? Bool
     let logprobsRequested = (obj["logprobs"] as? Bool) ?? false
     let topLogprobsCount = (obj["top_logprobs"] as? Int) ?? 0
@@ -1042,6 +1182,8 @@ private func parseChatRequest(_ obj: [String: Any], defaultMaxTokens: Int, defau
         logitParams: logitParams, samplingError: samplingError)
     request.thinkingOff = thinkingOff
     request.maxAnswerTokens = maxAnswerTokens
+    request.returnTokenIds = (obj["engine_return_token_ids"] as? Bool) ?? false
+    request.effortFromCodingDefault = codingDefault != nil
     request.images = images
     request.visionError = visionError
     return request
@@ -1183,6 +1325,8 @@ final class BatchRow {
     var caches: [KVCache]           // the request's own cache; the pool holds the rows while grouped
     var pending: Int = 0            // the token to forward next
     var length: Int = 0             // committed context length, i.e. this row's offset
+    /// an image request's mRoPE shift (its text positions are `length + ropeDelta`); 0 for text
+    var ropeDelta: Int = 0
     var nextToken: Int = -1         // what the batched forward sampled for this row
     /// Supplied by the request: apply its own soft-stop bias to its own logits row and sample with
     /// its own sampler. It runs on the MODEL thread while the request's own thread is blocked in
@@ -1203,6 +1347,12 @@ final class BatchRow {
     var drawKey: (() -> MLXArray?)? = nil
     // P099: the row's draft state while batched, and the round's extra committed tokens for the connection thread
     var spec: BatchRowSpec? = nil
+    /// T-0247: the row's copy-lookup state while batched (ENGINE_BATCH_COPY) and how to rebuild it: the request's prompt +
+    /// emitted tokens (set by the request thread; read on the model thread while the request thread is blocked in step)
+    var copyLookup: BatchCopyLookup? = nil
+    var copyContext: (() -> [Int])? = nil
+    /// T-0271: this request's batched row-rounds for the copy census (model thread writes; read via mt.exclusive at the end)
+    var statRounds = 0, statDrafted = 0, statAccepted = 0, statCopyRows = 0, statCopyDrafted = 0, statCopyAccepted = 0
     var queued: [Int] = []
     var stopIds: Set<Int> = []
     var thinkOpenNow: (() -> Bool)? = nil
@@ -1236,7 +1386,9 @@ final class SeqState {
     func visionRestorePositions(upTo m: Int) {
         guard let p = visionPos3, m > 0 else { return }
         let rows = p[0..., 0..., 0 ..< m].asType(.int32)
-        for c in cache { if let l = c as? CacheList, let idx = l[1] as? ArraysCache { idx[2] = rows } }
+        // Only a layer whose indexer holds keys (slot 0) reads slot 2; a model without an indexer (the 397B port) must
+        // not get one, or the row can no longer join a batched round (stackRowResident is text-only on slot 2).
+        for c in cache { if let l = c as? CacheList, let idx = l[1] as? ArraysCache, idx[0] != nil { idx[2] = rows } }
     }
     /// The (3, 1, 1) position of the token about to be forwarded: its cache offset plus the delta, on all three axes.
     func visionDecodePos3() -> MLXArray {
@@ -1405,6 +1557,10 @@ final class SeqState {
     // scratch carried between prefill chunks of the MTP prime, so a long prefill can still yield
     // the model thread between chunks instead of owning it for minutes
     var primeMTPCache: KVCache? = nil
+    /// T-0163: the DFlash2 drafter context built from this request's own prefill rows (nil: DFlash off or a prefill chunk
+    /// ran without feature capture, e.g. in a native batch or a mixed forward -- the request then drafts with MTP)
+    var dfCtx: DFlashContext? = nil
+    var dfBroken = false
     var primeMixed = MLXArray(0)
     var primeS = MLXArray(0)
     // P093: the hot store's rungs for this sequence (prefill end, then every rung step of decode),
@@ -1644,11 +1800,49 @@ nonisolated(unsafe) private let serveOwnerOrderTrace = ServeOwnerOrderTrace()
 /// finishes or a new one joins, which is thousands of steps apart.
 nonisolated(unsafe) var batchMTPDepthShared = 0
 nonisolated(unsafe) var batchMTPPolicy: String = ProcessInfo.processInfo.environment["ENGINE_BATCH_MTP_POLICY"] ?? "auto"
+/// T-0118: ENGINE_ROW_ACCEPT_TRACE=FILE appends "row K accepted batch length" per row per batched MTP round (diagnostic)
+nonisolated(unsafe) let rowAcceptTrace: FileHandle? = {
+    guard let path = ProcessInfo.processInfo.environment["ENGINE_ROW_ACCEPT_TRACE"] else { return nil }
+    FileManager.default.createFile(atPath: path, contents: nil)
+    return FileHandle(forWritingAtPath: path)
+}()
 nonisolated(unsafe) var batchMTPRounds = 0, batchMTPDrafted = 0, batchMTPAccepted = 0, batchMTPPlainSteps = 0
+/// T-0247 (D-0088, C-0723): ENGINE_BATCH_COPY=1 (default off) -- copy-mode lookup drafts inside batched MTP rounds. Per row a
+/// lookup over its prompt + output (MIN ENGINE_BATCH_COPY_MIN, start ENGINE_BATCH_COPY_L0, doubling up to ENGINE_BATCH_COPY_MAX,
+/// cap 7 so the tiled QSA verify stays in use, C-0724); a round takes lookups only when they pay at the verify's cost
+/// (planCopyBlock, pads priced at a full position: the uniform block). Greedy groups only, never in a mixed step.
+let serveBatchCopy: Bool = ProcessInfo.processInfo.environment["ENGINE_BATCH_COPY"] == "1"
+let serveBatchCopyMin: Int = max(2, Int(ProcessInfo.processInfo.environment["ENGINE_BATCH_COPY_MIN"] ?? "") ?? 6)
+let serveBatchCopyL0: Int = max(1, Int(ProcessInfo.processInfo.environment["ENGINE_BATCH_COPY_L0"] ?? "") ?? 2)
+let serveBatchCopyMax: Int = min(7, max(1, Int(ProcessInfo.processInfo.environment["ENGINE_BATCH_COPY_MAX"] ?? "") ?? 7))
+/// T-0247 (C-0720): ENGINE_BATCH_COPY_PACKED=1 -- copy rounds verify through the packed per-row-depth forward (pads ~0.4 ms,
+/// C-0443) and the gate prices pads at that cost; otherwise the uniform [B, K+1] block (pads at a full position).
+let serveBatchCopyPacked: Bool = ProcessInfo.processInfo.environment["ENGINE_BATCH_COPY_PACKED"] == "1"
+nonisolated(unsafe) var batchCopyPackedRounds = 0
+/// T-0275: ENGINE_BATCH_COPY_COST_TABLE=<file> -- the copy gate prices rounds from a measured packed-verify cost curve
+/// (CopyCostTable) instead of C-0684's linear fit; unset (default) or unreadable keeps the fit (and says so on stderr).
+/// T-0290: several tables (one per measured batch size) separated by ':'; a round uses the table nearest its batch size
+let serveBatchCopyCostTables: [CopyCostTable] = {
+    guard let spec = ProcessInfo.processInfo.environment["ENGINE_BATCH_COPY_COST_TABLE"], !spec.isEmpty else { return [] }
+    var out: [CopyCostTable] = []
+    for path in spec.split(separator: ":").map(String.init) where !path.isEmpty {
+        if let text = try? String(contentsOfFile: path, encoding: .utf8), let t = CopyCostTable(text: text) { out.append(t) }
+        else { FileHandle.standardError.write("engine: ENGINE_BATCH_COPY_COST_TABLE \(path) unreadable -- skipped\n".data(using: .utf8)!) }
+    }
+    if out.isEmpty { FileHandle.standardError.write("engine: no readable copy cost table -- copy gate keeps the linear fit\n".data(using: .utf8)!) }
+    return out
+}()
+/// T-0267: ENGINE_BATCH_COPY_ALWAYS=1 takes every lookup proposal (no cost gate) -- a calibration switch, default off
+let serveBatchCopyAlways: Bool = ProcessInfo.processInfo.environment["ENGINE_BATCH_COPY_ALWAYS"] == "1"
+/// T-0266: the gate's acceptance estimate (prior 0.8, decays on refused rounds so it cannot lock, C-0753)
+nonisolated(unsafe) var batchCopyRate = CopyRateEstimate()
+nonisolated(unsafe) var batchCopyRounds = 0, batchCopyRows = 0, batchCopyDrafted = 0, batchCopyAccepted = 0
+nonisolated(unsafe) var batchCopyProposed = 0, batchCopyRefusedByGate = 0, batchCopyResyncs = 0
 nonisolated(unsafe) var batchGroupsWithoutSpec = 0, batchSpecDropped = 0, batchRoundsSkipped = 0
 /// What the batch draft policy sampled (owner thread writes, the sessions endpoint reads): round / plain-step cost
 /// sums, the slowest round, and each pool's FIRST round cost (the sample a fresh policy starts from).
 nonisolated(unsafe) var batchPolicyRoundMsSum = 0.0, batchPolicyRounds = 0, batchPolicyRoundMsMax = 0.0
+nonisolated(unsafe) var batchPolicyMixedRounds = 0, batchPolicyMixedRoundMsSum = 0.0, batchPolicyMixedRoundMsMax = 0.0
 nonisolated(unsafe) var batchPolicyPlainMsSum = 0.0, batchPolicyPlains = 0
 nonisolated(unsafe) var batchPolicyFirstRounds = 0, batchPolicyFirstRoundMsSum = 0.0, batchPolicyFirstRoundMsMax = 0.0
 
@@ -1668,7 +1862,12 @@ final class BatchPool {
     }
     func noteRound(K: Int, ms: Double, acc: Double) {
         if policy.roundMs.isEmpty { batchPolicyFirstRounds += 1; batchPolicyFirstRoundMsSum += ms; batchPolicyFirstRoundMsMax = max(batchPolicyFirstRoundMsMax, ms) }
-        batchPolicyRoundMsSum += ms; batchPolicyRounds += 1; batchPolicyRoundMsMax = max(batchPolicyRoundMsMax, ms)
+        // T-0191: a round that rode in a mixed/packed forward timed the prefill too -- reported apart (the policy feed is unchanged)
+        if roundForwardOverrideWasSet {
+            batchPolicyMixedRounds += 1; batchPolicyMixedRoundMsSum += ms; batchPolicyMixedRoundMsMax = max(batchPolicyMixedRoundMsMax, ms)
+        } else {
+            batchPolicyRoundMsSum += ms; batchPolicyRounds += 1; batchPolicyRoundMsMax = max(batchPolicyRoundMsMax, ms)
+        }
         policy.noteRound(k: K, ms: ms, acceptance: acc)
     }
     func notePlain(ms: Double) { batchPolicyPlainMsSum += ms; batchPolicyPlains += 1; policy.notePlain(ms: ms) }
@@ -1772,11 +1971,120 @@ let serveDecodeBurst: Int = max(1, Int(ProcessInfo.processInfo.environment["ENGI
 let serveDecodeShare: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_DECODE_SHARE"] ?? "") ?? 0)
 /// ENGINE_DECODE_SHARE_MIN_S (default 0.5): the share applies only after a prefill dispatch at least this long.
 let serveDecodeShareMinS: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_DECODE_SHARE_MIN_S"] ?? "") ?? 0.5)
+/// T-0141 (C-0407): ENGINE_PREFILL_ORDER=arrival serves the prefill-phase owner jobs of the oldest request first
+/// (run-to-completion) instead of FIFO round-robin, which gave every prompt of a burst the burst's whole prefill as TTFT.
+/// ENGINE_PREFILL_CONTINUE_MS (default 2): how long the owner holds for the oldest request's next job.
+let servePrefillOrderArrival: Bool = ProcessInfo.processInfo.environment["ENGINE_PREFILL_ORDER"] == "arrival"
+/// T-0178: an image request takes its arrival stamp before its vision tower (see the tower job in the request handler)
+let serveVisionArrivalStamp: Bool = ProcessInfo.processInfo.environment["ENGINE_VISION_ARRIVAL_STAMP"] == "1"
+let servePrefillContinueMs: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CONTINUE_MS"] ?? "") ?? 2)
+/// ENGINE_PREFILL_ORDER_QUANTUM_S (default 15, 0 = none): a request whose prefill used this much owner time goes behind
+/// the others in prefill, so one huge prompt does not hold a burst for minutes (a ~9k-token prompt takes ~7 s)
+/// ENGINE_CONTROL_PASSES_PREFILL (default: on with ENGINE_PREFILL_ORDER=arrival, off otherwise; C-0419): short control
+/// (exclusive) jobs pass queued prefill chunks instead of being a barrier behind them
+let serveControlPassesPrefill: Bool = (ProcessInfo.processInfo.environment["ENGINE_CONTROL_PASSES_PREFILL"] ?? (servePrefillOrderArrival ? "1" : "0")) == "1"
+/// T-0200 ENGINE_CONTROL_PASSES_DECODE=1 (default off): control jobs also pass queued batched decode steps, so one landing
+/// while a round's steps arrive no longer splits the decode pool into two rounds (ModelThread.controlPassesDecode)
+let serveControlPassesDecode: Bool = ProcessInfo.processInfo.environment["ENGINE_CONTROL_PASSES_DECODE"] == "1"
+/// T-0207: decode closures (a new row's serial round, a rung capture, a rearm) pass queued batched steps during the gathering
+let serveDecodeClosurePasses: Bool = ProcessInfo.processInfo.environment["ENGINE_DECODE_CLOSURE_PASSES"] == "1"
+/// T-0217 (C-0684): ENGINE_COPY_CENSUS=1 -- after every finished text response, count on a background queue how much of its
+/// output a copy-mode lookup would have drafted (counts only, no ids kept), for /v1/engine/sessions "copy_census": decides
+/// whether batched rounds should get copy drafts. Configs: the census's best batched rule (MIN 4 / 6, start 2, up to 8) and
+/// the serial production rule (MIN 10, L 12). T-0221: totals are kept per client label too, and with
+/// ENGINE_COPY_CENSUS_FILE=<path> (only read when the census is on) they are restored at start and rewritten after every
+/// record, so a restart keeps them (counts and labels only).
+let serveCopyCensus: CopyCensusTotals? = ProcessInfo.processInfo.environment["ENGINE_COPY_CENSUS"] == "1"
+    ? CopyCensusTotals(configs: [CopyCensusConfig(minMatch: 4, startLen: 2, maxLen: 8), CopyCensusConfig(minMatch: 6, startLen: 2, maxLen: 8),
+                                 CopyCensusConfig(minMatch: 10, startLen: 2, maxLen: 8), CopyCensusConfig(minMatch: 10, startLen: 12, maxLen: 12),
+                                 // T-0254 (C-0724): the policy a batched copy round can run without leaving the tiled QSA
+                                 // verify (S <= 8): lookups capped at 7 drafts
+                                 CopyCensusConfig(minMatch: 4, startLen: 2, maxLen: 7), CopyCensusConfig(minMatch: 6, startLen: 2, maxLen: 7)],
+                       file: ProcessInfo.processInfo.environment["ENGINE_COPY_CENSUS_FILE"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) })
+    : nil
+let serveCopyCensusQueue = DispatchQueue(label: "engine.copy-census", qos: .utility)
+/// T-0237 (QC backlog of T-0190): the checkpoint's trained context (max_position_embeddings), set once at start, so requests
+/// that run past it under ENGINE_CONTEXT_EXTENSION=1 are counted (witness context_beyond_native_*; outside the trained range)
+nonisolated(unsafe) var serveNativeContext = 0
+/// T-0259 (C-0729): ENGINE_GRACEFUL_STOP=1 (default off) -- SIGTERM stops admitting requests (503 + Retry-After) and the
+/// process exits (status 143, as a plain SIGTERM death, so the supervisor's rules are unchanged) once every admitted request
+/// has finished or ENGINE_DRAIN_SECONDS (120) have passed; off, SIGTERM kills at once as before and cuts requests in flight
+let serveGracefulStop: Bool = ProcessInfo.processInfo.environment["ENGINE_GRACEFUL_STOP"] == "1"
+let serveDrain = DrainState(graceSeconds: Double(ProcessInfo.processInfo.environment["ENGINE_DRAIN_SECONDS"] ?? "") ?? 120)
+nonisolated(unsafe) var serveDrainSources: [DispatchSourceProtocol] = []
+func installGracefulStop() {
+    guard serveGracefulStop else { return }
+    signal(SIGTERM, SIG_IGN)                                   // the dispatch source takes it from here
+    let sig = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global(qos: .userInitiated))
+    sig.setEventHandler {
+        serveDrain.begin(now: Date().timeIntervalSince1970)
+        FileHandle.standardError.write("engine: SIGTERM -- draining \(serveDrain.inFlight) request(s), new ones get 503\n".data(using: .utf8)!)
+    }
+    let tick = DispatchSource.makeTimerSource(queue: .global(qos: .userInitiated))
+    tick.schedule(deadline: .now() + 0.5, repeating: 0.5)
+    tick.setEventHandler {
+        if serveDrain.shouldExit(now: Date().timeIntervalSince1970) {
+            FileHandle.standardError.write("engine: drained (\(serveDrain.inFlight) still in flight) -- exiting\n".data(using: .utf8)!)
+            _exit(143)                                             // T-0260 review: no atexit / static teardown under MLX
+        }
+    }
+    sig.resume(); tick.resume()
+    serveDrainSources = [sig, tick]
+    EngineWitness.hit("graceful_stop_armed")
+}
+/// T-0144 (D-0043, C-0420/C-0423): ENGINE_MIXED_ROUND=1 dispatches an MTP prefill chunk together with the queued batched
+/// verify steps in ONE forward (Qwen4ExpModel.forwardMixed): the steps' round takes its verify logits from it and the chunk's
+/// body takes its forward from it. ENGINE_MIXED_WAIT_MS (25, the gather window): how long the owner holds for the full set of batched steps;
+/// ENGINE_MIXED_DECODE_SHARE_KEEP (0): the fraction of the separate decode share left after a mixed dispatch.
+let serveMixedRound: Bool = ProcessInfo.processInfo.environment["ENGINE_MIXED_ROUND"] == "1"
+let serveMixedWaitMs: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_MIXED_WAIT_MS"] ?? "") ?? 25)
+/// T-0185 (C-0587): the mixed step may still wait for the decoders' steps after an arrival-order continuation wait
+let serveMixedAfterContinue: Bool = ProcessInfo.processInfo.environment["ENGINE_MIXED_AFTER_CONTINUE"] == "1"
+/// T-0185 (C-0585/C-0586): a queued mixable chunk is taken (with every queued step) before any separate decode round
+let serveMixedAll: Bool = ProcessInfo.processInfo.environment["ENGINE_MIXED_ALL"] == "1"
+let serveMixedDecodeShareKeep: Double = min(1, max(0, Double(ProcessInfo.processInfo.environment["ENGINE_MIXED_DECODE_SHARE_KEEP"] ?? "") ?? 0))
+nonisolated(unsafe) var serveMixedForwards = 0, serveMixedFallbacks = 0
+/// T-0191: the fallbacks split -- a chunk that could not be prepared vs an override the round never consumed (a plain
+/// step, a lone group); and the verify ROWS that rode in mixed/packed forwards (requests x positions)
+nonisolated(unsafe) var serveMixedUnprepared = 0, serveMixedOverrideUnused = 0, serveMixedVerifyRows = 0, servePackedWithStepsForwards = 0
+/// T-0185: ENGINE_MIXED_MTP_K (0 = off): a batched MTP round that rides in a mixed forward drafts max(policy K, this) --
+/// a verify row there costs ~1.25 ms against ~2 ms in a separate round (C-0585), and deeper separate rounds lose (C-0348).
+/// The policy keeps seeing its own depth: the acceptance it is fed is truncated at the policy K.
+let serveMixedMTPK: Int = max(0, min(8, Int(ProcessInfo.processInfo.environment["ENGINE_MIXED_MTP_K"] ?? "") ?? 0))
+/// T-0186: packed prefill -- the owner takes other requests' queued mixable chunks with the one it picked, up to
+/// ENGINE_PREFILL_PACK_ROWS rows (0 = off) and ENGINE_PREFILL_PACK_MAX chunks, and one forward computes them all (with the
+/// batched steps' round when steps ride): Qwen4ExpModel.forwardPackedGroups, canonical blocking per segment (C-0582).
+let servePackRows: Int = max(0, Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_PACK_ROWS"] ?? "") ?? 0)
+/// T-0190 (QC audit D1): the mixed wait stops for a decode closure the steps are stuck behind (ModelThread.mixedUnblock)
+let serveMixedUnblock: Bool = ProcessInfo.processInfo.environment["ENGINE_MIXED_UNBLOCK"] == "1"
+/// T-0192: ENGINE_PACK_TOWER_LOOKAHEAD (0 off): younger image requests' towers the owner runs before an older chunk, to pack pages
+let serveTowerLookahead: Int = max(0, Int(ProcessInfo.processInfo.environment["ENGINE_PACK_TOWER_LOOKAHEAD"] ?? "") ?? 0)
+let servePackMax: Int = max(2, Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_PACK_MAX"] ?? "") ?? 8)
+nonisolated(unsafe) var servePackedForwards = 0, servePackedSkipped = 0, servePackedRows = 0
+nonisolated(unsafe) var serveMixedMTPRounds = 0, serveMixedMTPDrafted = 0, serveMixedMTPAccepted = 0, serveMixedMTPExtra = 0
+/// T-0148 (D-0046): ENGINE_MIXED_SERIAL=1 (needs ENGINE_MIXED_ROUND=1) lets a LONE decoding row ride too: below the batch
+/// minimum a row runs serial MTP rounds (decode closures), so the mixed step had nothing to carry -- under the arrival order
+/// that is the first finished request of every wave. Its round's verify forward is replaced once by forwardMixed with the
+/// row's own caches (the serial program: no batch row globals).
+let serveMixedSerialOn: Bool = serveMixedRound && ProcessInfo.processInfo.environment["ENGINE_MIXED_SERIAL"] == "1"
+nonisolated(unsafe) var serveMixedSerialForwards = 0, serveMixedSerialFallbacks = 0
+/// set by serveMixedSerial for exactly one serial round (model thread only): (block [1, K+1], the row's caches, verify pos3)
+/// -> (logits, pre-mixer stream); consumed by serveSpecRound
+nonisolated(unsafe) var serialRoundForwardOverride: ((MLXArray, [KVCache], MLXArray?) -> (MLXArray, MLXArray))? = nil
+let servePrefillQuantumS: Double = max(0, Double(ProcessInfo.processInfo.environment["ENGINE_PREFILL_ORDER_QUANTUM_S"] ?? "") ?? 15)
 /// ENGINE_ADMIN_FLUSH=1 (diagnostic, off by default): POST /v1/engine/flush evicts the whole hot store and returns MLX's
 /// cached buffers on an idle server, so a leak check can compare the memory floor after hours of traffic with a fresh one.
 let serveAdminFlush = ProcessInfo.processInfo.environment["ENGINE_ADMIN_FLUSH"] == "1"
 /// P102: ENGINE_PREFILL_CHUNK_SHARED (default 1024) -- the prefill chunk width while other requests are in flight.
 let sharedChunk: Int = Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_CHUNK_SHARED"] ?? "") ?? 1024
+/// T-0111: the native batched prefill's token budget while a row decodes (ModelThread default 1024: two 1024-wide chunks
+/// never group under decode). ENGINE_PREFILL_DECODE_TOKEN_BUDGET=4096 lets up to four rung-resumed [1024, 2048) chunks group.
+let prefillDecodeTokenBudgetEnv: Int = Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_DECODE_TOKEN_BUDGET"] ?? "1024") ?? 1024
+/// T-0111: ENGINE_PREFILL_MERGE_TAIL=N finishes a prompt in one chunk across the QSA budget cut when at most N tokens remain
+/// (0 = off, the H57 schedule). Not bit-identical to the cut schedule; lossless (the cut's rows see all their blocks).
+let prefillMergeTail: Int = max(0, Int(ProcessInfo.processInfo.environment["ENGINE_PREFILL_MERGE_TAIL"] ?? "0") ?? 0)
+/// T-0111: tokens the last prefill chunk leaves for a separate forward so a hot rung lands before the prompt end (P093).
+let hotReserveTokens: Int = max(0, min(1, Int(ProcessInfo.processInfo.environment["ENGINE_HOT_RESERVE"] ?? "1") ?? 1))
 /// P106 H50b: the adaptive width while a request prefills alone (P093: 4096). With 1024-row width-canonical
 /// projections a 2048 chunk leaves the state bit-identical to 1024 chunks (probe at 16384 and 131072); 3072 and
 /// 4096 still differ from layer 4 on (a width-dependent op in the first attention layer, not yet identified).
@@ -1795,7 +2103,7 @@ let hotCoalesce: Bool = ProcessInfo.processInfo.environment["ENGINE_HOT_COALESCE
 let toolChoiceNoneDropsTools: Bool = ProcessInfo.processInfo.environment["ENGINE_TOOLCHOICE_NONE_DROPS_TOOLS"] != nil
 
 func batchStatsLine() -> String {
-    "\(modelThreadShared.statsLine()), restacks \(batchRestacks) (\(String(format: "%.0f", batchRestackMs)) ms), length mismatches \(batchLengthMismatches), rung mismatches \(hotRungMismatches), live sequences \(seqRegistry.count); batched MTP rounds \(batchMTPRounds) drafted \(batchMTPDrafted) accepted \(batchMTPAccepted) plain-with-head \(batchMTPPlainSteps) skipped-by-policy \(batchRoundsSkipped) groups-without-spec \(batchGroupsWithoutSpec) specs-dropped \(batchSpecDropped); \(hotStoreShared.statsLine())"
+    "\(modelThreadShared.statsLine()), restacks \(batchRestacks) (\(String(format: "%.0f", batchRestackMs)) ms), length mismatches \(batchLengthMismatches), rung mismatches \(hotRungMismatches), live sequences \(seqRegistry.count); batched MTP rounds \(batchMTPRounds) drafted \(batchMTPDrafted) accepted \(batchMTPAccepted) copy rounds \(batchCopyRounds) rows \(batchCopyRows) drafted \(batchCopyDrafted) accepted \(batchCopyAccepted) proposed \(batchCopyProposed) refused \(batchCopyRefusedByGate) resyncs \(batchCopyResyncs) plain-with-head \(batchMTPPlainSteps) skipped-by-policy \(batchRoundsSkipped) groups-without-spec \(batchGroupsWithoutSpec) specs-dropped \(batchSpecDropped); \(hotStoreShared.statsLine())"
 }
 
 /// One decode step for a whole group, run BY the model thread. `reqs` is what the requests queued;
@@ -1806,8 +2114,101 @@ func batchStatsLine() -> String {
 let batchSyncProbe: Bool = ProcessInfo.processInfo.environment["ENGINE_BATCH_SYNC_PROBE"] != nil
 /// P095 U3-A: ENGINE_BATCH_SAMPLE=rows restores the per-row sampling loop (B host round-trips).
 let batchedSampling: Bool = (ProcessInfo.processInfo.environment["ENGINE_BATCH_SAMPLE"] ?? "block") != "rows"
+/// T-0082: image requests join batched decode (their rows rope at length + their mRoPE shift). ENGINE_BATCH_VISION=0 keeps
+/// them serial, as before.
+let batchVision: Bool = ProcessInfo.processInfo.environment["ENGINE_BATCH_VISION"] != "0"
 nonisolated(unsafe) var batchSyncEvalMs = 0.0, batchSyncLoopMs = 0.0
 nonisolated(unsafe) var batchSyncSteps = 0
+/// T-0144: one batched step whose MTP round forward also computes the prefill chunk `mix` (forwardMixed). The chunk's
+/// result is left in its SeqState.prefillForward, which the chunk's own body (run right after by the owner) consumes
+/// exactly like a native-batch result. If the step runs no MTP round (plain step, policy off), the override is never
+/// consumed and the chunk's body computes its own forward: the shipped path.
+func serveMixedStep(_ mix: PrefillMix, _ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4ExpModel, ratio: Int) -> [Int] {
+    let st = seqRegistry[mix.key]
+    guard st.prefillForward == nil, mix.to > mix.from, st.xs.dim(1) >= mix.to else {
+        serveMixedFallbacks += 1; serveMixedUnprepared += 1
+        return runBatchedStep(reqs, model: model, qm: qm, ratio: ratio)
+    }
+    roundForwardOverride = { block, caches, lengths, deltas in
+        serveMixedVerifyRows += block.dim(0) * block.dim(1)
+        let r = qm.forwardMixed(chunk: st.xs[0..., mix.from ..< mix.to], chunkCache: st.cache,
+                                chunkEmbeds: st.visionEmbeds?[0..., mix.from ..< mix.to, 0...],
+                                chunkPos3: st.visionPos3?[0..., 0..., mix.from ..< mix.to],
+                                verify: block, verifyCache: caches, rows: lengths, deltas: deltas)
+        st.prefillForward = (r.chunkLogits, r.chunkHidden)
+        st.prefillForwardBatchSize = 1
+        serveMixedForwards += 1
+        return (r.verifyLogits, r.verifyHidden)
+    }
+    defer {
+        if roundForwardOverride != nil { roundForwardOverride = nil; serveMixedFallbacks += 1; serveMixedOverrideUnused += 1 }
+    }
+    return runBatchedStep(reqs, model: model, qm: qm, ratio: ratio)
+}
+
+/// T-0186: the chunks `mixes` (other requests' prompts) in one forward -- with the steps' round when `reqs` is not empty
+/// (its verify forward replaced once, as serveMixedStep). Each chunk's result is left in its SeqState.prefillForward for
+/// its body; a chunk that cannot be prepared (already prepared, empty, short) is skipped and its body computes it alone.
+func servePackedStep(_ mixes: [PrefillMix], _ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4ExpModel, ratio: Int) -> [Int] {
+    var chunks: [Qwen4ExpPackedChunk] = []
+    var states: [SeqState] = []
+    for m in mixes {
+        let st = seqRegistry[m.key]
+        guard st.prefillForward == nil, m.to > m.from, st.xs.dim(1) >= m.to, !states.contains(where: { $0 === st }) else {
+            servePackedSkipped += 1; continue
+        }
+        chunks.append(Qwen4ExpPackedChunk(tokens: st.xs[0..., m.from ..< m.to], cache: st.cache,
+                                          embeds: st.visionEmbeds?[0..., m.from ..< m.to, 0...],
+                                          pos3: st.visionPos3?[0..., 0..., m.from ..< m.to]))
+        states.append(st)
+    }
+    func stash(_ r: [(logits: MLXArray, hidden: MLXArray)]) {
+        for (st, o) in zip(states, r) { st.prefillForward = (o.logits, o.hidden); st.prefillForwardBatchSize = 1 }
+        servePackedForwards += 1; servePackedRows += chunks.reduce(0) { $0 + $1.tokens.dim(1) }
+    }
+    if reqs.isEmpty {
+        if chunks.count >= 2 { stash(qm.forwardPackedGroups(chunks: chunks).chunks) }    // one chunk: its body runs it as before
+        return []
+    }
+    guard !chunks.isEmpty else { serveMixedFallbacks += 1; serveMixedUnprepared += 1; return runBatchedStep(reqs, model: model, qm: qm, ratio: ratio) }
+    roundForwardOverride = { block, caches, lengths, deltas in
+        serveMixedVerifyRows += block.dim(0) * block.dim(1); servePackedWithStepsForwards += 1
+        let r = qm.forwardPackedGroups(chunks: chunks, verify: Qwen4ExpPackedVerify(tokens: block, cache: caches, rows: lengths, deltas: deltas))
+        stash(r.chunks)
+        serveMixedForwards += 1
+        return (r.verify!.logits, r.verify!.hidden)
+    }
+    defer {
+        if roundForwardOverride != nil { roundForwardOverride = nil; serveMixedFallbacks += 1; serveMixedOverrideUnused += 1 }
+    }
+    return runBatchedStep(reqs, model: model, qm: qm, ratio: ratio)
+}
+
+/// T-0148: one lone row's serial MTP round (`round`, its decode closure) whose verify forward also computes the prefill
+/// chunk `mix`; the chunk's result is left for its body exactly as in serveMixedStep. A round that runs no verify forward
+/// (cancelled, no draft state) leaves the override unused: the chunk then computes itself.
+func serveMixedSerial(_ mix: PrefillMix, qm: Qwen4ExpModel, _ round: () -> Void) {
+    let st = seqRegistry[mix.key]
+    guard st.prefillForward == nil, mix.to > mix.from, st.xs.dim(1) >= mix.to else {
+        serveMixedSerialFallbacks += 1
+        round(); return
+    }
+    serialRoundForwardOverride = { block, caches, pos3 in
+        let r = qm.forwardMixed(chunk: st.xs[0..., mix.from ..< mix.to], chunkCache: st.cache,
+                                chunkEmbeds: st.visionEmbeds?[0..., mix.from ..< mix.to, 0...],
+                                chunkPos3: st.visionPos3?[0..., 0..., mix.from ..< mix.to],
+                                verify: block, verifyCache: caches, rows: nil, verifyPos3: pos3)
+        st.prefillForward = (r.chunkLogits, r.chunkHidden)
+        st.prefillForwardBatchSize = 1
+        serveMixedSerialForwards += 1
+        return (r.verifyLogits, r.verifyHidden)
+    }
+    defer {
+        if serialRoundForwardOverride != nil { serialRoundForwardOverride = nil; serveMixedSerialFallbacks += 1 }
+    }
+    round()
+}
+
 func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4ExpModel, ratio: Int) -> [Int] {
     if roundTraceShared.enabled {
         roundTraceShared.stamp("s_entry"); roundTraceShared.set("rows", reqs.count)
@@ -1883,6 +2284,12 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
                 }
             }
             let rowResidentPool = rowResidentKV && Qwen4ExpModel.rowResidentEligible
+            if nanWitnessOn {   // T-0156: every member's own state as it (re)enters the pool
+                for m in group {
+                    nanWitnessPoint(qm, prevMembers.contains(ObjectIdentifier(m)) ? "REJOIN" : "JOIN", caches: m.caches, length: m.length,
+                                    note: "B\(group.count)")
+                }
+            }
             batchPoolShared.cache = rowResidentPool ? qm.stackCachesRowResident(group.map { $0.caches })
                                                     : qm.stackCaches(group.map { $0.caches })
             batchPoolShared.rowResident = rowResidentPool
@@ -1917,6 +2324,7 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
                 } else {
                     batchPoolShared.specPool = stackSpecPool(qm, batchPoolShared.specRows.map { group[$0].spec! })
                 }
+                batchPoolShared.specPool?.ropeDeltas = batchPoolShared.specRows.map { group[$0].ropeDelta }
             } else {
                 batchPoolShared.specPool = nil
             }
@@ -1957,7 +2365,9 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
             && group.allSatisfy { !$0.greedy && $0.samplerParams == p0 }
         let allGreedy = group.allSatisfy { $0.greedy }
         let fullSpec = batchPoolShared.specPool != nil && batchPoolShared.specRows.count == group.count
-        let K = (fullSpec && (allGreedy || sameSampled)) ? batchPoolShared.draftDepth(maxK: batchMTPDepthShared) : 0
+        let policyK = (fullSpec && (allGreedy || sameSampled)) ? batchPoolShared.draftDepth(maxK: batchMTPDepthShared) : 0
+        let mixedDeep = policyK > 0 && serveMixedMTPK > policyK && roundForwardOverride != nil
+        let K = mixedDeep ? serveMixedMTPK : policyK
         if serveOwnerOrderTrace.enabled {
             traceK = K
             serveOwnerOrderTrace.record("batch_policy", ["keys": serveOwnerOrderTrace.keys(group), "K": K,
@@ -1967,22 +2377,88 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
         if K > 0, let sp = batchPoolShared.specPool {
             // P099: one batched MTP round -- K drafts per row, one [B, K+1] verify block, per-row acceptance and roll-back
             let r0 = Date()
-            let rowsIn = group.map { m in BatchRoundRow(greedy: m.greedy, bias: m.biasNow?() ?? 0, biasGated: m.biasGated?() ?? false, thinkOpen: m.thinkOpenNow?() ?? false, stopIds: m.stopIds, drawKey: m.drawKey) }
-            let out = runBatchedMTPRound(qm, caches: pool, spec: sp, pending: group.map { $0.pending }, lengths: lengths, K: K, rows: rowsIn,
-                                         samplerParams: sameSampled ? (p0.temp, p0.topK, p0.topP) : nil)
-            var acc = 0
+            let rowsIn = group.map { m in BatchRoundRow(ropeDelta: m.ropeDelta, greedy: m.greedy, bias: m.biasNow?() ?? 0, biasGated: m.biasGated?() ?? false, thinkOpen: m.thinkOpenNow?() ?? false, stopIds: m.stopIds, drawKey: m.drawKey) }
+            // T-0247: copy-mode lookups for greedy groups outside a mixed step (D-0088); the plan's gate keeps MTP-only
+            // rounds where lookups would not pay at the uniform block's cost
+            var copyRound: BatchCopyRound? = nil
+            var proposals: [[Int]?] = Array(repeating: nil, count: group.count)
+            if serveBatchCopy, allGreedy, !mixedDeep, roundForwardOverride == nil {
+                for (i, m) in group.enumerated() {
+                    guard m.length + 1 <= 65536 else { m.copyLookup = nil; continue }    // the index window; longer rows do not copy
+                    // the index holds prompt + committed output + the pending token: length + 1 tokens; rebuild on any mismatch
+                    if m.copyLookup?.contextCount != m.length + 1 {
+                        m.copyLookup = nil
+                        if var c = m.copyContext?() {
+                            if c.count == m.length { c.append(m.pending) }              // the pending token is not emitted yet
+                            if c.count == m.length + 1, c.last == m.pending {
+                                m.copyLookup = BatchCopyLookup(context: c, minMatch: serveBatchCopyMin, startLen: serveBatchCopyL0,
+                                                               maxLen: serveBatchCopyMax)
+                                batchCopyResyncs += 1
+                            }
+                        }
+                    }
+                    proposals[i] = m.copyLookup?.propose()
+                }
+                let nProp = proposals.reduce(0) { $0 + ($1 == nil ? 0 : 1) }
+                if nProp > 0 {
+                    batchCopyProposed += nProp
+                    let mtpTok = batchMTPDrafted > 0 ? 1 + Double(batchMTPAccepted) * Double(K) / Double(batchMTPDrafted) : 2.21
+                    let rate = batchCopyRate.rate
+                    // the packed forward runs only for rows without a think-close bias (runBatchedMTPRound); price pads by
+                    // the forward the round will take
+                    let packed = serveBatchCopyPacked && !rowsIn.contains(where: { $0.bias > 0 })
+                    let plan = serveBatchCopyAlways ? planCopyBlockAll(mtpK: K, lookups: proposals, maxK: serveBatchCopyMax)
+                        : planCopyBlock(mtpK: K, lookups: proposals, maxK: serveBatchCopyMax, lookupAcceptRate: rate,
+                                        mtpTokensPerRow: mtpTok, padMs: packed ? 0.397 : 1.472,
+                                        costTable: packed ? nearestCopyCostTable(serveBatchCopyCostTables, batch: group.count) : nil)
+                    if plan.lookupRows.isEmpty { batchCopyRefusedByGate += 1; batchCopyRate.refused() } else {
+                        copyRound = BatchCopyRound(K: plan.K, realK: plan.realK, lookups: (0 ..< group.count).map {
+                            plan.lookupRows.contains($0) ? Array(proposals[$0]!.prefix(serveBatchCopyMax)) : nil }, packed: packed)
+                    }
+                }
+            }
+            // T-0265: with ENGINE_BATCH_MTP_DEPTH_CUM the round drafts 3 and verifies 2 or 3 per row by the head's confidence
+            let depthK = batchDepthCum != nil && K == 2 && copyRound == nil && allGreedy && !mixedDeep && roundForwardOverride == nil
+                && !rowsIn.contains(where: { $0.bias > 0 }) ? 3 : K
+            let out = runBatchedMTPRound(qm, caches: pool, spec: sp, pending: group.map { $0.pending }, lengths: lengths, K: depthK, rows: rowsIn,
+                                         samplerParams: sameSampled ? (p0.temp, p0.topK, p0.topP) : nil, copy: copyRound)
+            var acc = 0, accPolicy = 0, mtpRows = 0
             for (i, m) in group.enumerated() {
+                let usedLookup = copyRound?.lookups[i]
+                if let usedLookup {                                     // copy rows: their own counters, not the K policy's
+                    batchCopyRows += 1; batchCopyDrafted += usedLookup.count; batchCopyAccepted += out[i].accepted
+                    batchCopyRate.observe(drafted: usedLookup.count, accepted: out[i].accepted)
+                    m.statCopyRows += 1; m.statCopyDrafted += usedLookup.count; m.statCopyAccepted += out[i].accepted
+                } else {
+                    mtpRows += 1; accPolicy += min(out[i].accepted, policyK)
+                    m.statRounds += 1; m.statDrafted += K; m.statAccepted += out[i].accepted
+                }
+                m.copyLookup?.commit(tokens: out[i].tokens, lookup: usedLookup, accepted: usedLookup == nil ? 0 : out[i].accepted)
                 let toks = out[i].tokens
                 m.nextToken = toks[0]; m.queued = Array(toks.dropFirst())
                 for t in toks { m.commit?(t) }
                 batchPoolShared.lengths[i] = m.length + out[i].accepted + 1
                 m.note("round K\(K) a\(out[i].accepted) len \(m.length)")
-                acc += out[i].accepted
+                if let tf = rowAcceptTrace {   // T-0118: one line per row per round -> per-row draft-depth simulations
+                    // T-0279 (C-0765): field 2 is the row's real draft count (a copy row's lookup length, else K); field 6
+                    // says which; readers keyed on field 2 == K therefore see MTP rows only
+                    let drafted = usedLookup?.count ?? K
+                    tf.write("\(ObjectIdentifier(m).hashValue) \(drafted) \(out[i].accepted) \(group.count) \(m.length) \(usedLookup == nil ? "mtp" : "copy")\n".data(using: .utf8)!)
+                }
+                if usedLookup == nil { acc += out[i].accepted }
                 if serveOwnerOrderTrace.enabled, let key = seqRegistry.traceKey(m) { traceAccepted[key] = out[i].accepted }
             }
             let ms = Date().timeIntervalSince(r0) * 1000
-            batchPoolShared.noteRound(K: K, ms: ms, acc: Double(acc) / Double(max(1, K * group.count)))
-            batchMTPRounds += 1; batchMTPDrafted += K * group.count; batchMTPAccepted += acc
+            if mixedDeep {
+                serveMixedMTPRounds += 1; serveMixedMTPDrafted += K * group.count; serveMixedMTPAccepted += acc
+                serveMixedMTPExtra += acc - accPolicy
+            }
+            if copyRound == nil {                       // a copy round's wall time would skew the K policy's cost samples
+                batchPoolShared.noteRound(K: policyK, ms: ms, acc: Double(accPolicy) / Double(max(1, policyK * group.count)))
+            } else {
+                batchCopyRounds += 1; EngineWitness.hit("batch_copy_rounds")
+            }
+            batchMTPRounds += 1; batchMTPDrafted += K * mtpRows; batchMTPAccepted += acc
             var outTok: [Int] = []
             for r in reqs { let s = seqRegistry[r.key]; s.cache = s.row.caches; outTok.append(s.row.nextToken) }
             return outTok
@@ -1994,7 +2470,7 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
         // queuing the keep-alive -- whose d1 now stays on the device: H60 ABBA, plain batched step -5.5 % at R4 and R8)
         if let pq = batchPoolShared.specPool?.prequeued { eval(pq.drafts.last!) }
         let p0t = Date()
-        let (lgFull, vh) = Qwen4ExpBatch.with(lengths) { qm.forwardHidden(y[0..., .newAxis], cache: pool) }
+        let (lgFull, vh) = Qwen4ExpBatch.with(lengths, deltas: group.map { $0.ropeDelta }) { qm.forwardHidden(y[0..., .newAxis], cache: pool) }
         let lg = lgFull[0..., -1, 0...]
         let t1: Date?
         if sameSampled, let toksArr = sampleTopKBlock(
@@ -2011,6 +2487,7 @@ func runBatchedStep(_ reqs: [StepRequest], model: any LanguageModel, qm: Qwen4Ex
                 draw: { b in group[b].drawKey?() }) {
             // P095 U3-K: sampled rows with one parameter set -- the O(V) work once over the block,
             // each row's k-wide draw with its own key, ONE host read. Token-identical to the loop.
+            EngineWitness.hit(p0.topK > 0 && p0.topK < lg.dim(-1) ? "sampled_rows_topk" : "sampled_rows_fullvocab", group.count)   // T-0191
             let toks = toksArr.asArray(Int32.self)
             t1 = batchSyncProbe ? Date() : nil
             for (i, m) in group.enumerated() {
@@ -2154,25 +2631,75 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let ps = modelThreadShared.prefillBatchStats()
         let prefillScheduling: [String: Any] = ["gathered_groups": ps.gatheredGroups,
             "callback_batches": ps.executedBatches, "filtered_jobs": ps.filteredJobs,
-            "reordered_dispatches": ps.reorderedDispatches, "forced_oldest_dispatches": ps.forcedOldestDispatches]
+            "reordered_dispatches": ps.reorderedDispatches, "forced_oldest_dispatches": ps.forcedOldestDispatches,
+            "order": servePrefillOrderArrival ? "arrival" : "fifo", "continue_ms": servePrefillContinueMs,
+            "continue_waits": modelThreadShared.prefillOrderStats.waits, "continue_hits": modelThreadShared.prefillOrderStats.hits,
+            "arrival_reorders": modelThreadShared.prefillOrderStats.reorders,
+            "quantum_s": servePrefillQuantumS, "quantum_rotations": modelThreadShared.prefillOrderStats.rotations,
+            "control_passes_prefill": serveControlPassesPrefill, "control_passed_prefill": modelThreadShared.prefillOrderStats.controlPassed,
+            "control_passes_decode": serveControlPassesDecode, "control_passed_decode": modelThreadShared.controlPassedDecodeCount,
+            "decode_closure_passes": serveDecodeClosurePasses, "decode_closure_passed": modelThreadShared.decodeClosurePassedCount,
+            "copy_census": serveCopyCensus != nil,
+            "mixed_round": serveMixedRound, "mixed_dispatches": modelThreadShared.mixedStats.dispatches,
+            "mixed_rows": modelThreadShared.mixedStats.rows, "mixed_waits": modelThreadShared.mixedStats.waits,
+            "mixed_miss_lone": modelThreadShared.mixedMissStats.lone, "mixed_miss_barrier": modelThreadShared.mixedMissStats.barrier,
+            "mixed_miss_short": modelThreadShared.mixedMissStats.short, "mixed_all_forced": modelThreadShared.mixedAllForcedCount,
+            "mixed_after_continue": serveMixedAfterContinue, "mixed_all": serveMixedAll,
+            "mixed_wait_hits": modelThreadShared.mixedStats.hits, "mixed_holds": modelThreadShared.mixedStats.holds,
+            "mixed_hold_hits": modelThreadShared.mixedStats.holdHits, "mixed_forwards": serveMixedForwards,
+            "mixed_fallbacks": serveMixedFallbacks, "mixed_serial": serveMixedSerialOn,
+            "mixed_serial_dispatches": modelThreadShared.mixedStats.serial, "mixed_serial_forwards": serveMixedSerialForwards,
+            "mixed_serial_fallbacks": serveMixedSerialFallbacks, "mixed_mtp_k": serveMixedMTPK,
+            "mixed_mtp_rounds": serveMixedMTPRounds, "mixed_mtp_drafted": serveMixedMTPDrafted,
+            "mixed_mtp_accepted": serveMixedMTPAccepted, "mixed_mtp_extra_tokens": serveMixedMTPExtra,
+            "pack_rows": servePackRows, "pack_max": servePackMax, "packed_dispatches": modelThreadShared.packedStats.dispatches,
+            "packed_chunks": modelThreadShared.packedStats.chunks, "packed_with_steps": modelThreadShared.packedStats.withSteps,
+            "packed_sizes": Dictionary(uniqueKeysWithValues: modelThreadShared.packedStats.sizes.map { (String($0.key), $0.value) }),
+            "packed_forwards": servePackedForwards, "packed_skipped": servePackedSkipped, "packed_rows": servePackedRows,
+            "segmented_projection_calls": Qwen4ExpPrefillWidth.segmentedCalls, "setup_first": modelThreadShared.setupFirstCount, "setup_breaks": modelThreadShared.setupBreaksCount, "mixed_unblock": serveMixedUnblock, "unblock_breaks": modelThreadShared.unblockBreaksCount,
+            "tower_lookahead": serveTowerLookahead, "tower_lookaheads": modelThreadShared.lookaheadStats.towers,
+            "tower_lookahead_holds": modelThreadShared.lookaheadStats.holds, "tower_lookahead_packed": modelThreadShared.lookaheadStats.packed,
+            "mixed_unprepared": serveMixedUnprepared, "mixed_override_unused": serveMixedOverrideUnused,
+            "mixed_verify_rows": serveMixedVerifyRows, "packed_with_steps_forwards": servePackedWithStepsForwards,
+            "blocked_projection_calls": Qwen4ExpPrefillWidth.blockedCalls,
+            "continue_ended": modelThreadShared.continueEndedCount,
+            "mixed_after_continue_waits": modelThreadShared.mixedAfterContinueStats.waits,
+            "mixed_after_continue_hits": modelThreadShared.mixedAfterContinueStats.hits,
+            "setup_first_work_ms": modelThreadShared.setupFirstStats.seconds * 1000,
+            "setup_first_max_ms": modelThreadShared.setupFirstStats.maxSeconds * 1000,
+            "setup_first_long": modelThreadShared.setupFirstStats.long,
+            "setup_first_ahead_of_steps": modelThreadShared.setupFirstStats.aheadOfSteps,
+            "setup_first_work_ahead_of_steps_ms": modelThreadShared.setupFirstStats.secondsAheadOfSteps * 1000]
         let obj = liveSessions.snapshot(extra: ["model": modelId, "max_concurrent": serveMaxConcurrent, "mtp_depth": mtpDepth, "runtime": runtimeView, "reserved_sequences": serveAdmission.active,
+            "copy_census": serveCopyCensus?.snapshot() ?? [:],
             "scheduler_phases": phases, "prefill_scheduling": prefillScheduling,
             "admission_wait": serveAdmissionWaitWitness.snapshot(),
             "decode_affinity": ["ms": serveDecodeAffinityMs, "burst": serveDecodeBurst, "share": serveDecodeShare, "share_min_s": serveDecodeShareMinS,
-                                "waits": modelThreadShared.decodeAffinityStats.waits, "hits": modelThreadShared.decodeAffinityStats.hits],
+                                "waits": modelThreadShared.decodeAffinityStats.waits, "hits": modelThreadShared.decodeAffinityStats.hits,
+                                "preempted": modelThreadShared.decodeShareStats.preempted,
+                                "share_grants": modelThreadShared.decodeShareStats.grants,
+                                "share_grants_after_mixed": modelThreadShared.decodeShareStats.grantsAfterMixed],
             "queue": activeRequests.snapshot(), "max_tokens_decisions": serveMaxTokensWitness.snapshot(), "reasoning_effort_decisions": serveEffortWitness.snapshot(),
             "cache_layout": serveMemoryWitness.cacheLayoutSnapshot(),
             "pooled_private_history": serveMemoryWitness.pooledPrivateHistorySnapshot(),
             "ram_budget": serveMemoryWitness.ramBudgetSnapshot(), "hot_cache": serveMemoryWitness.hotCacheSnapshot(),
             "memory_guard": memoryGuardSnapshot(),
-            "shared_prefix_rung": serveMemoryWitness.sharedPrefixSnapshot(),
+            "shared_prefix_rung": serveMemoryWitness.sharedPrefixSnapshot(), "prefix_share": servePrefixShareLedger.snapshot(),
             "indexer_graph_construction": serveMemoryWitness.indexerSnapshot(), "restack": serveMemoryWitness.restackSnapshot(), "memory": serveMemoryWitness.snapshot(), "native_prefill_sizes": serveMemoryWitness.prefillSnapshot(),
+            "witness": EngineWitness.snapshot,      // T-0190 QC-3: how often each switchable path was really taken
+            "batch_depth": ["cum": batchDepthCum ?? -1, "rounds": batchDepthRounds, "rows": batchDepthRows, "rows_depth3": batchDepthRows3],
+            "batch_copy": ["on": serveBatchCopy, "always": serveBatchCopyAlways, "cost_table_points": serveBatchCopyCostTables.reduce(0) { $0 + $1.rows.count }, "cost_table_batches": serveBatchCopyCostTables.map { $0.batch }, "packed": serveBatchCopyPacked, "gate_rate": batchCopyRate.rate, "packed_rounds": batchCopyPackedRounds, "min": serveBatchCopyMin, "l0": serveBatchCopyL0, "max": serveBatchCopyMax,
+                           "rounds": batchCopyRounds, "rows": batchCopyRows, "drafted": batchCopyDrafted, "accepted": batchCopyAccepted,
+                           "proposed": batchCopyProposed, "refused_by_gate": batchCopyRefusedByGate, "resyncs": batchCopyResyncs],
             "batch_policy": ["rounds": batchPolicyRounds, "round_ms_mean": batchPolicyRounds > 0 ? batchPolicyRoundMsSum / Double(batchPolicyRounds) : 0,
                              "round_ms_max": batchPolicyRoundMsMax, "plain_steps": batchPolicyPlains,
                              "plain_ms_mean": batchPolicyPlains > 0 ? batchPolicyPlainMsSum / Double(batchPolicyPlains) : 0,
                              "skipped_by_policy": batchRoundsSkipped, "first_rounds": batchPolicyFirstRounds,
                              "first_round_ms_mean": batchPolicyFirstRounds > 0 ? batchPolicyFirstRoundMsSum / Double(batchPolicyFirstRounds) : 0,
-                             "first_round_ms_max": batchPolicyFirstRoundMsMax],
+                             "first_round_ms_max": batchPolicyFirstRoundMsMax,
+                             "rounds_mixed": batchPolicyMixedRounds,
+                             "mixed_round_ms_mean": batchPolicyMixedRounds > 0 ? batchPolicyMixedRoundMsSum / Double(batchPolicyMixedRounds) : 0,
+                             "mixed_round_ms_max": batchPolicyMixedRoundMsMax],
             "batch_steps": modelThreadShared.stepCount, "batch_sizes": Dictionary(uniqueKeysWithValues: modelThreadShared.sizeHistogram.map { (String($0.key), $0.value) })])
         writeHTTPResponse(fd, status: 200, statusText: "OK", contentType: "application/json",
                            body: (try? JSONSerialization.data(withJSONObject: obj)) ?? Data())
@@ -2210,6 +2737,14 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                            body: jsonErrorBody("method not allowed"))
         return
     }
+    // T-0259: while draining, refuse before any work; an admitted request counts until this handler returns
+    let drainEntered = serveGracefulStop ? serveDrain.enter() : false
+    if serveGracefulStop, !drainEntered {
+        writeHTTPResponse(fd, status: 503, statusText: "Service Unavailable", contentType: "application/json",
+                           body: jsonErrorBody("server is stopping; retry shortly", type: "server_stopping"))
+        return
+    }
+    defer { if drainEntered { serveDrain.leave() } }
     // P116: wait in a bounded FIFO queue for a free slot (--queue-max), or with no queue refuse at once. A client that
     // got an immediate 503 backed off exponentially (aider: up to 4096 s) while slots sat free. The queue stays bounded:
     // past --queue-max waiting requests, or --queue-timeout-s of waiting, the answer is still a 503.
@@ -2359,6 +2894,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
     // T-0053: what the prefix store keys this prompt by -- `ids` with each image's pad rows replaced by keys of the image's
     // content, so a stored state is resumed only for the same image at the same place. The model input stays `ids`.
     let hotIds = visionSpans.isEmpty ? ids : ServeVisionContent.keyed(ids: ids, spans: visionSpans, hashes: visionHashes)
+    servePrefixShareLedger.record(hotIds)
 
     let lookahead = max(mtpDepth, batchMTPDepthShared) + 1
     let tokensDecision = MaxTokensPolicy.effective(requested: chatReq.requestedMaxTokens, defaultTokens: defaultMaxTokens,
@@ -2366,7 +2902,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                                                    clamp: serveMaxTokensClamp)
     chatReq.maxTokens = tokensDecision.tokens
     serveMaxTokensWitness.record(tokensDecision.reason)
-    let effortAsked = (obj["reasoning_effort"] as? String).map { String($0.prefix(16)) } ?? "(default)"
+    let effortAsked = (obj["reasoning_effort"] as? String).map { String($0.prefix(16)) } ?? (chatReq.effortFromCodingDefault ? "(default:code)" : "(default)")
     serveEffortWitness.record("\(effortAsked)->\(chatReq.thinkingOff ? "thinking-off" : chatReq.reasoningEffort)")
     if h8BoundaryProbe && (ids.isEmpty || ids.count > 8192 || !(1...32).contains(chatReq.maxTokens)
             || chatReq.n != 1 || chatReq.temperature != 0 || chatReq.logprobsRequested
@@ -2415,7 +2951,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         serveAdmissionWaitWitness.begin()
         while pendingReservation == nil, Date() < deadline, !serveAdmission.admissionsPaused, !HTTPTransport.peerClosed(fd) {
             Thread.sleep(forTimeInterval: 0.25)
-            if serveAdmission.estimateFits(length: ids.count + chatReq.maxTokens + lookahead) { pendingReservation = reserveNow() }
+            if serveAdmission.estimateFits(length: ids.count + chatReq.maxTokens + lookahead, prompt: ids.count + lookahead) { pendingReservation = reserveNow() }
         }
         serveAdmissionWaitWitness.end(admitted: pendingReservation != nil, seconds: Date().timeIntervalSince(t0))
     }
@@ -2458,8 +2994,16 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
     // image -- `preprocess(images:)` stacks its list as a video's frames), features, the prompt's embeddings with each
     // image's merger rows on its own span, and the mRoPE positions. One model-thread job; the arrays stay in the box.
     let visionPrepared: ServeVisionPrepared? = visionImages.isEmpty ? nil : ServeVisionPrepared()
+    // T-0178 (C-0574, ENGINE_VISION_ARRIVAL_STAMP=1): under arrival-order prefill an UNSTAMPED owner job ranks first, so a
+    // burst's towers all ran before the first request's prompt prefill (16 pages: first TTFT 18.8 s). Taking this
+    // request's arrival stamp before its tower ranks the tower with its own request; the per-choice call below reuses the
+    // stamp (idempotent per thread). The deferred release covers every exit before the choice loop (idempotent too).
+    if serveVisionArrivalStamp, servePrefillOrderArrival, visionPrepared != nil {
+        modelThreadShared.beginRequestPrefill(); EngineWitness.hit("vision_arrival_stamp")
+    }
+    defer { if serveVisionArrivalStamp { modelThreadShared.endRequestPrefill() } }
     if let vp = visionPrepared {
-        let failure: String? = modelThreadShared.prefill {
+        let failure: String? = modelThreadShared.prefill(lookahead: serveTowerLookahead > 0) {
             guard !cancelled() else { return "cancelled" }
             guard let qm = context.model as? Qwen4ExpModel, let proc = serveVisionProcessor, let pcfg = serveVisionConfig else {
                 return "no vision tower"
@@ -2533,11 +3077,14 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
 
     // This checkpoint's generation prompt opens <think> itself (see main.swift's engineThinkOpen
     // derivation) -- the token never appears in the GENERATED ids, only the prompt's.
-    let sessionId = liveSessions.begin(client: req.headers["x-engine-client"] ?? req.headers["user-agent"] ?? "unknown",
+    // T-0260 review: an empty x-engine-client falls back to the user-agent
+    let requestClient = req.headers["x-engine-client"].flatMap { $0.isEmpty ? nil : $0 } ?? req.headers["user-agent"] ?? "unknown"
+    let sessionId = liveSessions.begin(client: requestClient,
                                        promptTokens: ids.count, maxTokens: chatReq.maxTokens, stream: chatReq.stream,
                                        // a thinking-off request applies no effort (the template drops it): say "off"
                                        reasoningEffort: chatReq.thinkingOff ? "off" : chatReq.reasoningEffort)
     endSession = { liveSessions.end(sessionId) }
+    if !visionImages.isEmpty { liveSessions.update(sessionId) { [n = visionImages.count] e in e.images = n } }
 
     let thinkOpenInitially = ids.lastIndex(of: engineThinkOpenId).map { open in
         (ids.lastIndex(of: engineThinkCloseId) ?? -1) < open
@@ -2594,6 +3141,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         guard !cancelled() else { return }
         let tReq0 = Date()
         let mt = modelThreadShared!
+        // T-0141: the owner jobs of this choice's prefill phase carry its arrival stamp (ENGINE_PREFILL_ORDER=arrival
+        // serves the oldest first); the phase ends at the first token below, or here on any early exit
+        mt.beginRequestPrefill()
+        defer { mt.endRequestPrefill() }
         let qm = model as? Qwen4ExpModel
         // T-0053: an image request takes the shared machinery with every forward passing its mRoPE positions, the prefix
         // store keyed by `hotIds` (image rows by content), and no batched round (a ragged step ropes at the cache offset,
@@ -2622,7 +3173,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         // at the exact prompt length never serves it (measured: every turn of a non-echoing client
         // fell back to the disk rung, up to 511 tokens back). One token: the split costs one
         // decode-sized forward (~20 ms); eight cost ~70 ms, the MoE touching up to 80 experts.
-        let hotReserve = useHot ? 1 : 0
+        // T-0111: ENGINE_HOT_RESERVE=0 drops the split for single-turn traffic (the document client: independent prompts
+        // sharing ~128 tokens, 0.2% exact repeats) -- the reserve forward then never serves a later prompt, and it cost 4.7%
+        // of the client's prefill work (36 ms per request, 799 fresh tokens per request). Default 1 (unchanged).
+        let hotReserve = useHot ? hotReserveTokens : 0
+        if hotReserve > 0 { EngineWitness.hit("hot_reserve_split") }       // T-0237: the reserve split is planned for this prompt
         // H50: the last interior 1024 boundary, where the canonical rung is certified (SeqState.canonicalTarget).
         let canonicalTarget = ((ids.count - 1) / h25CanonicalWidth) * h25CanonicalWidth
         // H57: the QSA indexer picks dense (no mask) or sparse (array mask) attention per CALL, from offset + S against its
@@ -2637,7 +3192,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // P119: the arithmetic lives in EngineServeSupport/PrefillChunkPlan.swift (unchanged) so it is tested.
             PrefillChunkPlan.end(from: from, width: chunkWidth(from), rungAlign: rungAlign, promptCount: ids.count,
                                  qsaBudgetCut: qsaBudgetCut, canonicalTarget: h25CanonicalPrefix && h50WidthCanonical ? canonicalTarget : nil,
-                                 hotReserve: hotReserve)
+                                 hotReserve: hotReserve, mergeTail: prefillMergeTail)
         }
         // P119: a cold prompt at least rung + margin long whose head has EARNED a shared rung (`sharedRung` below: the
         // store's admission, a second cold sighting) ends its FIRST chunk (from 0) exactly at the rung, where the rung is
@@ -2645,10 +3200,24 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         // [0, 2048)); in the shared regime [0, 1024) is the natural first chunk and nothing is cut. The rest of the
         // schedule is chunkEnd's, unchanged: from 1024 the next end is the QSA budget 2048, then width multiples.
         // Knob off (0), not eligible or not admitted: `rung` is 0 and every plan is chunkEnd's.
+        // T-0095: under the WIDE admission only text prompts split and capture (an image request may still resume a text head)
         let sharedSplit = PrefillChunkPlan.sharedSplitEligible(promptCount: ids.count, rung: sharedPrefixRung, margin: sharedPrefixRungMargin)
+            && !((sharedPrefixRungWide || sharedPrefixRungShort) && isVision)
         func chunkPlan(_ from: Int, rung: Int) -> (end: Int, split: Bool) {
-            PrefillChunkPlan.withSharedSplit(from: from, end: chunkEnd(from), promptCount: ids.count,
-                                             rung: rung, margin: sharedPrefixRungMargin)
+            let r = PrefillChunkPlan.withSharedSplit(from: from, end: chunkEnd(from), promptCount: ids.count,
+                                                     rung: rung, margin: sharedPrefixRungMargin)
+            // T-0191 (QC-3): which schedule rule shaped this chunk -- the merge tail (ENGINE_PREFILL_MERGE_TAIL), the QSA
+            // budget cut (ENGINE_PREFILL_BUDGET_CUT), the shared-prefix split, and chunks wider than the 1024-row default
+            // width (ENGINE_PREFILL_CHUNK_SHARED / _ALONE); one call per chunk in both prefill loops
+            if r.split { EngineWitness.hit("prefill_shared_split") }
+            else if qsaBudgetCut > 0, from < qsaBudgetCut, r.end > qsaBudgetCut { EngineWitness.hit("prefill_merge_tail") }
+            else if qsaBudgetCut > 0, from < qsaBudgetCut, r.end == qsaBudgetCut, ids.count > qsaBudgetCut,
+                    // only when the clamp shortened the chunk: the same plan without the cut would have ended past it
+                    PrefillChunkPlan.end(from: from, width: chunkWidth(from), rungAlign: rungAlign, promptCount: ids.count,
+                                         qsaBudgetCut: 0, canonicalTarget: h25CanonicalPrefix && h50WidthCanonical ? canonicalTarget : nil,
+                                         hotReserve: hotReserve, mergeTail: 0) > qsaBudgetCut { EngineWitness.hit("prefill_budget_cut") }
+            if r.end - from > 1024 { EngineWitness.hit("prefill_chunk_over_1024") }
+            return r
         }
         // P089 U10: the sampler, the cache and the prompt are MLX-typed, so they are built on the
         // model thread and this thread keeps only `seqId`. A seeded request is reproducible because
@@ -2668,6 +3237,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             if let vp = visionPrepared {
                 let st = seqRegistry[id]
                 st.visionEmbeds = vp.embeds; st.visionPos3 = vp.pos3; st.visionRopeDelta = vp.ropeDelta
+                st.row.ropeDelta = vp.ropeDelta
                 vp.embeds = nil; vp.pos3 = nil
             }
             return id
@@ -2742,7 +3312,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         let mtpPolicyReason = mtpEligible ? (hardThinkingGuard ? "hard_guard" : "eligible") : "ineligible"
         var sharedAdmitted = false
         if let qm, useHot {
-            let (hot, admitted): (Int, Bool) = mt.prefill {
+            let (hot, admitted): (Int, Bool) = mt.prefill(setup: servePackRows > 0) {
                 guard !cancelled() else { return (0, false) }
                 let st = seqRegistry[seqId]
                 // P119 (review F2): a request that starts cold is a sighting of its prompt's head; the head earns the split
@@ -2805,7 +3375,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // the load itself returns MLXArrays, so it happens on the model thread too. ONE load: the
             // MTP cache rides in the same entry, and loading it a second time for the arming below
             // used to double the disk read on every hit.
-            let hit: Bool = mt.prefill {
+            let hit: Bool = mt.prefill(setup: servePackRows > 0) {
                 guard !cancelled() else { return false }
                 guard let d = StateCache.load(sc, ids, M, u) else { return false }
                 let st = seqRegistry[seqId]
@@ -2848,7 +3418,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         // about to join a group (see the handover in the decode loop).
         var specActive = false
         if wantMTP, let qm {
-            let armed: Bool = mt.prefill {
+            let armed: Bool = mt.prefill(setup: servePackRows > 0) {
                 guard !cancelled() else { return false }
                 guard let mtp = qm.mtp else { return false }
                 let st = seqRegistry[seqId]
@@ -2856,13 +3426,15 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     // an entry written by a SERIAL server (or stored past a batch handover) carries
                     // no MTP cache at this length; such a request cannot resume a draft state and
                     // decodes serially
+                    // T-0191: count it -- the whole request then decodes without drafts
+                    if st.primeMTPCache == nil { EngineWitness.hit("mtp_resume_no_head_\(cacheHitSource)") }
                     return st.primeMTPCache != nil
                 }
                 st.primeMTPCache = mtp.newCache()
                 return true
             }
             specActive = armed
-            mt.prefill { seqRegistry[seqId].row.note("arm \(armed) hit \(cacheHitSource) \(cacheHitTokens) of \(ids.count)") }
+            mt.prefill(setup: servePackRows > 0) { seqRegistry[seqId].row.note("arm \(armed) hit \(cacheHitSource) \(cacheHitTokens) of \(ids.count)") }
         }
         let mtpArmed = specActive           // initial per-choice arming, before handover/invalidation
         liveSessions.update(sessionId) { [specActive] e in e.mtp = specActive }
@@ -2871,7 +3443,11 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // Other tail/resume geometries keep their validated solo path.
             // P119 (`solo`): a chunk cut by the shared-prefix split did not exist before; it runs solo (B1, the geometry
             // the shared rung needs) rather than becoming a native-batch candidate that the uncut [0, 2048) never was.
-            guard prefillBatchEnabled, !solo, !isVision, let qm, [512, 1024].contains(to - from) else { return mt.prefill(body) }
+            guard prefillBatchEnabled, !solo, !isVision, let qm, [512, 1024].contains(to - from) else {
+                // T-0144: an MTP chunk may ride in one forward with the queued verify steps (serveMixedStep)
+                if serveMixedRound, mtp { return mt.prefill(mix: PrefillMix(key: seqId, from: from, to: to, continues: to < ids.count), body) }
+                return mt.prefill(body)
+            }
             return mt.prefill(key: seqId, position: from, group: "qwen:\(from):\(to):\(mtp)", tokens: to - from, prepare: {
                 guard !cancelled() else { return false }
                 if hotCoalesce, hotStoreShared.enabled,
@@ -2917,9 +3493,23 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     let nativeGroup = st.h26ForwardGroupID, nativeSlot = st.h26ForwardSlot
                     let nativeDecoders = st.h26ForwardDecoderCount
                     let bodyDecoders = h26PrefillMetadata ? mt.decoderCount : -1
+                    // T-0163: DFlash2 needs the target features of the prompt's last `window` rows, from a solo text forward
+                    let dfCapture = serveDFlash != nil && !st.dfBroken && st.prefillForward == nil && st.visionEmbeds == nil
+                        && st.sampler.isGreedy && c1 > ids.count - serveDFlashWindow
+                    if serveDFlash != nil && !dfCapture && (st.prefillForward != nil || st.visionEmbeds != nil) { st.dfBroken = true; st.dfCtx = nil }
+                    if dfCapture { Qwen4ExpModelInner.captureLayers = Set(DFlash2Drafter.targetLayers) }
                     let (lg, h) = st.prefillForward ?? qm.forwardHidden(st.xs[0..., c0 ..< c1], cache: st.cache,   // T-0053: image rows
                                                                         embedsOverride: st.visionEmbeds?[0..., c0 ..< c1, 0...],
                                                                         pos3: st.visionPos3?[0..., 0..., c0 ..< c1])
+                    if dfCapture, let D = serveDFlash {
+                        let feats = dflashFeatures()
+                        Qwen4ExpModelInner.captureLayers = nil; Qwen4ExpModelInner.captured = [:]
+                        let from = max(c0, ids.count - serveDFlashWindow)
+                        if st.dfCtx == nil { st.dfCtx = DFlashContext() }
+                        if let ctx = st.dfCtx, ctx.ctxLen == 0 || ctx.end == from {
+                            D.drafter.appendContext(ctx, feats[(from - c0) ..< (c1 - c0)], startPos: from)
+                        } else { st.dfBroken = true; st.dfCtx = nil }
+                    }
                     st.prefillForward = nil; st.prefillForwardBatchSize = 0
                     st.h26ForwardGroupID = 0; st.h26ForwardSlot = -1; st.h26ForwardDecoderCount = -1
                     var toks = Array(ids[(c0 + 1) ..< min(c1 + 1, ids.count)])
@@ -2954,6 +3544,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     // A scheduling boundary must also bound submitted GPU work. Otherwise
                     // several lazy chunks can queue ahead of a newly ready decoder.
                     eval(S, st.cache.flatMap { $0.state }, mtpCache.state)
+                    if nanWitnessOn, isLast {   // T-0156: the request's own state right after its last prefill chunk
+                        nanWitnessPoint(qm, "PREFILL-END", caches: st.cache, length: c1,
+                                        note: "chunk \(c0)..<\(c1) batch \(actualBatch) hit \(cacheHitTokens)")
+                    }
                     // P119: the shared-prefix rung, from the certified geometry only: this request's own B1 chunk
                     // [0, rung) of a cold prefill (not a coalesced import, not a native batch), trunk AND head.
                     if PrefillChunkPlan.capturesSharedRung(from: c0, to: c1, promptCount: ids.count, rung: sharedRung, margin: sharedPrefixRungMargin) {
@@ -2989,6 +3583,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 st.spec = ServeSpecState(model: qm, mtp: mtp, embed: qm.model.embedTokens, mtpCache: mtpCache,
                                          n0: n0, d1: d1, Slast: Slast, K: mtpDepth)
                 st.spec?.ropeDelta = st.visionRopeDelta              // T-0053: nil for text
+                // T-0163: the context must end at the last prompt row (the first generated token's features come next round)
+                if !st.dfBroken, let ctx = st.dfCtx, ctx.end == ids.count { st.spec?.df = ctx }
+                dfLog("attach prompt=\(ids.count) broken=\(st.dfBroken) ctx=\(st.dfCtx.map { "\($0.ctxStart)..<\($0.end)" } ?? "nil") attached=\(st.spec?.df != nil)")
+                st.dfCtx = nil
                 st.primeMixed = MLXArray(0); st.primeS = MLXArray(0); st.primeMTPCache = nil
             }
         }
@@ -3077,6 +3675,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             if st.sampler.processor != nil { st.sampler.processor!.observe(first) }    // P124: the output history
             return first
         }
+        mt.endRequestPrefill()
         guard firstTok >= 0 else { return }
         // measured AFTER the first token is materialised: the graph is lazy, and timing it before the
         // eval reported the build, not the prefill (the serial path used to print 240k tok/s)
@@ -3216,6 +3815,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             seqRegistry[seqId].row.biasGated = { softBias.gated(out.count) }
             seqRegistry[seqId].row.greedy = seqRegistry[seqId].sampler.isGreedy
             seqRegistry[seqId].row.commit = { tok in if tok == engineThinkCloseId { closeCommitted = true } }
+            // T-0247: the batched copy lookup rebuilds its index from the prompt + emitted tokens (model thread, request blocked)
+            if serveBatchCopy, !isVision { seqRegistry[seqId].row.copyContext = { ids + out } }
             let sp = seqRegistry[seqId].sampler
             seqRegistry[seqId].row.samplerParams = (sp.temp, sp.topP, sp.topK)
             seqRegistry[seqId].row.drawKey = { seqRegistry[seqId].sampler.drawKey() }
@@ -3232,7 +3833,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // in the pool then, and the final rung is captured after the pool releases it.
             let inCache = ids.count + out.count + specQueue.count
             if useHot, let qm, inCache >= nextHotRung {
-                mt.decode(traceLabel: "hot_rung", traceKey: seqId) {
+                rtTime(0) { mt.decode(traceLabel: "hot_rung", traceKey: seqId) {
                     let st = seqRegistry[seqId]
                     guard !batchPoolShared.memberIds.contains(ObjectIdentifier(st.row)) else {
                         let slot = batchPoolShared.memberIds.firstIndex(of: ObjectIdentifier(st.row))!
@@ -3270,7 +3871,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     serveOwnerOrderTrace.rung(key: seqId, requested: inCache, threshold: nextHotRung,
                         emitted: out.count, verified: specQueue.count,
                         outcome: hotRungCaptures > traceCaptures ? "captured" : "capture_rejected", have: have)
-                }
+                } }
                 nextHotRung = inCache + hotStoreShared.rungStep
             }
             // Batchability of THIS row, recomputed every step because the context grows past the
@@ -3283,7 +3884,10 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 && !toolCallInjected && !forcedPrefixIdsTemplate.isEmpty
             let rowBatchable = batchMinRows > 0 && forceQueue.isEmpty && !toolBoundary && !chatReq.logprobsRequested
                 && !chatReq.needsLogitProcessing      // P124: the per-row history lives in the serial sampler
-                && !isVision                          // T-0053: a batched round ropes at the cache offset
+                // T-0053/T-0082: a batched round ropes at the cache offset + the row's shift. T-0098: an indexer model's image
+                // row (slot 2, its mRoPE positions) joins too, but only a row-resident pool carries it (the stacked one traps).
+                && (!isVision || (batchVision && (qm?.configuration.text.plain == true
+                                                  || (rowResidentKV && Qwen4ExpModel.rowResidentEligible))))
                 && (ids.count + out.count) > batchFloor && qm != nil
             setRegistered(rowBatchable)
             // The MTP -> batch handover, at the only safe point: with the round's verified tokens all
@@ -3291,7 +3895,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             // invariant the batched step assumes. Mid-round the cache is ahead of it, and dropping
             // the draft state there would silently replay positions.
             if rowBatchable, specActive, specQueue.isEmpty, mt.steppableCount >= batchMinRows {
-                hasRowSpec = mt.decode(traceLabel: "handover", traceKey: seqId) {
+                hasRowSpec = mt.decode(traceLabel: "handover", traceKey: seqId, setup: servePackRows > 0) {
                     let st = seqRegistry[seqId]
                     st.spec?.settle()                // H60: a queued serial chain never crosses into the batch
                     st.retiredMTPCache = st.spec?.mtpCache
@@ -3374,8 +3978,14 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 // first row -- that round was pure waste, and it left the stop and a few drafts
                 // after it in the caches, which is what kept the final state from being exact.
                 if specQueue.isEmpty, !stopIdSet.contains(pendingTok) {
-                    let r: (tokens: [Int], drafted: Int, accepted: Int) = mt.decode(traceLabel: "serial_mtp", traceKey: seqId) {
-                        defer { serveMemoryWitness.publish() }
+                    if roundTiming { rtSubmit = Anchors.now() }
+                    let r: (tokens: [Int], drafted: Int, accepted: Int) = mt.decode(traceLabel: "serial_mtp", traceKey: seqId,
+                                                                                    mixable: serveMixedSerialOn) {
+                        defer {
+                            if roundTiming { rtPubStart = Anchors.now() }
+                            serveMemoryWitness.publishThrottled()
+                            if roundTiming { rtPubEnd = Anchors.now() }
+                        }
                         guard !cancelled() else { return ([], -1, 0) }
                         let st = seqRegistry[seqId]
                         guard var sp = st.spec else { return ([], 0, 0) }
@@ -3395,6 +4005,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                         st.spec = sp
                         return rr
                     }
+                    if roundTiming { rtReturned = Anchors.now() }
                     guard r.drafted >= 0 else { return }
                     specQueue = r.tokens; specStats.rounds += 1; specStats.drafted += r.drafted; specStats.accepted += r.accepted
                     if specQueue.contains(engineThinkCloseId) { closeCommitted = true }
@@ -3411,6 +4022,8 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                     if let qm { batchPoolShared.releaseIfMember(st.row, qm, ratio: batchRatio); st.cache = st.row.caches }
                     if pendingStale { st.pending = MLXArray([Int32(pendingTok)]) }
                     st.spec?.settle()                   // H60 review: the head may alias retiredMTPCache (stored at release)
+                    // T-0191: a live head dropped without being retired leaves the stored rows past this point headless
+                    if (st.spec != nil || st.row.spec != nil) && st.retiredMTPCache == nil { EngineWitness.hit("spec_dropped_unretired") }
                     st.spec = nil                       // forced prefix or ineligible: serial from here
                     st.row.spec = nil                   // no stale pre-boundary head may rearm later
                     forwardedNow = true
@@ -3478,9 +4091,9 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
 
             // Everything below is host-side: no MLX, no model thread held.
             out.append(t)
-            liveSessions.tokenEmitted(sessionId)
-            growReservation(ids.count + out.count + lookahead)
-            let textDelta = detok.appendDelta(t)
+            rtTime(4) { liveSessions.tokenEmitted(sessionId) }
+            rtTime(3) { growReservation(ids.count + out.count + lookahead) }
+            let textDelta = rtTime(1) { detok.appendDelta(t) }
             if thinkOpenInitially, !closedThink, guardFired == nil, forceQueue.isEmpty, !guardCloseIds.isEmpty {
                 if guardBudget > 0, out.count >= guardBudget { guardFired = "budget" }
                 else if guardRepeats > 0, out.count >= 32 {
@@ -3516,7 +4129,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
                 for (channel, delta) in [("reasoning_content", reasoningDelta), ("content", plain.text)] where !delta.isEmpty {
                     var choice: [String: Any] = ["index": choiceIndex, "delta": [channel: delta], "finish_reason": NSNull()]
                     if let e = stepLogprobEntry { choice["logprobs"] = ["content": [e]] }
-                    sendSSEChunk(["id": completionId, "object": "chat.completion.chunk", "created": created, "model": modelId, "choices": [choice]])
+                    rtTime(2) { sendSSEChunk(["id": completionId, "object": "chat.completion.chunk", "created": created, "model": modelId, "choices": [choice]]) }
                 }
                 if toolSplit.matched != nil { streamToolCallProgress(plain.remainder) }
             }
@@ -3657,6 +4270,20 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
         liveSessions.update(sessionId) { [finishReason, specStats] e in
             e.finishReason = finishReason; e.mtpDrafted += specStats.drafted; e.mtpAccepted += specStats.accepted
         }
+        if serveNativeContext > 0, ids.count + out.count > serveNativeContext {   // T-0237: positions past the trained range
+            EngineWitness.hit(ids.count > serveNativeContext ? "context_beyond_native_prompt" : "context_beyond_native_request")
+        }
+        if let census = serveCopyCensus, !isVision, !out.isEmpty {
+            let prompt = ids, output = out
+            let b = mt.exclusive { () -> [Int] in
+                let r = seqRegistry[seqId].row
+                return [r.statRounds, r.statDrafted, r.statAccepted, r.statCopyRows, r.statCopyDrafted, r.statCopyAccepted]
+            }
+            let mtp = CopyCensusMTP(rounds: specStats.rounds, drafted: specStats.drafted, accepted: specStats.accepted,
+                                    batchRounds: b[0], batchDrafted: b[1], batchAccepted: b[2],
+                                    copyRows: b[3], copyDrafted: b[4], copyAccepted: b[5])
+            serveCopyCensusQueue.async { census.record(prompt: prompt, output: output, client: requestClient, mtp: mtp) }
+        }
         if chatReq.stream {
             // Tool calls were already streamed incrementally above (streamToolCallProgress) when
             // toolStreamingActive; repeating the full array here would duplicate every argument.
@@ -3673,6 +4300,7 @@ private func handleServeConnection(_ fd: Int32, context: ModelContext, modelId: 
             if !toolCalls.isEmpty { message["tool_calls"] = toolCalls }
             var choice: [String: Any] = finishPhaseChoice(["index": choiceIndex, "message": message, "finish_reason": finishReason])
             if chatReq.logprobsRequested { choice["logprobs"] = ["content": logprobsContent] }
+            if chatReq.returnTokenIds { choice["engine_token_ids"] = out }
             choicesOut.append(choice)
         }
     }
@@ -3739,6 +4367,10 @@ struct ServeSpecState {
     /// T-0053: an mRoPE sequence's position offset (an image request): the verify block of a round at committed length T
     /// sits at positions T + ropeDelta ..< T + ropeDelta + K + 1 on all three axes; nil for text.
     var ropeDelta: Int? = nil
+    /// T-0163: this sequence's DFlash2 drafter context (ENGINE_DFLASH_DIR); nil = MTP drafting
+    var df: DFlashContext? = nil
+    /// T-0163: the next round's DFlash2 proposal (drafts, confidences), queued on the GPU at the end of this round
+    var dfPre: (MLXArray, MLXArray)? = nil
     /// H60 review: a queued chain that is never consumed (the request's last round) must not have grown a head buffer,
     /// or the stored head's capacity (charged by the hot store) would differ from B44's. Queue only when the K-1 rows fit.
     func chainFitsWithoutGrowth() -> Bool {
@@ -3781,6 +4413,8 @@ struct DraftPolicyConfig { let conf: Bool; let tau: Float; let kmax: Int }
 /// model thread when a request's first round runs; MEASURED with the same code at -O (.kb/profile/copyindex): 32k tokens
 /// 7 ms / 14 MB, 64k 14 ms / 25 MB, 256k 79 ms / 93 MB, 1M 437 ms / 364 MB -- unbounded, a 1M-token request would stall
 /// every stream for ~0.4 s and hold 364 MB.
+/// ENGINE_DRAFT_COPY_MIN above 6 (T-0176, C-0567): the matched suffix must be at least that long, extended backwards past the
+/// 6-gram index; on chat text a 6-token match is often coincidental (16 of 69 suite lookups accepted nothing).
 /// ENGINE_DRAFT_COPY_MAX_CTX (65536): no copy mode for a request whose context is longer -- every row of a 13-row lookup block
 /// reads the whole context, and MEASURED on the long-context recall task copy mode decoded 89.85 vs 105.10 tok/s at 300k
 /// (-14.5%), +4.8% warm at 100k (C-0122); the edit gains (C-0107) are all on prompts of a few thousand tokens.
@@ -3817,18 +4451,107 @@ final class CopyIndex {
             ctx.append(t)
         }
     }
-    /// (match length, continuation of at most L tokens) of the longest suffix (6 down to minN) seen earlier
+    /// (match length, continuation of at most L tokens) of the longest suffix (6 down to minN) seen earlier; a 6-token match
+    /// reports its length extended backwards (<= 64)
     func lookup(_ L: Int, minN: Int = 2) -> (Int, [Int])? {
         let c = ctx.count
         for n in stride(from: 6, through: minN, by: -1) where c > n {
             guard let st = maps[n][key(c - n, n)] else { continue }
             if Array(ctx[st ..< st + n]) != Array(ctx[(c - n) ..< c]) { continue }      // hash collision
             let from = st + n, to = min(from + L, c)
-            if to > from { return (n, Array(ctx[from ..< to])) }
+            if to > from {
+                // T-0176: a full 6-gram match is extended backwards (up to 64) so ENGINE_DRAFT_COPY_MIN > 6 can demand a longer
+                // match; at the default 6 every decision is unchanged (any n >= 6 passes as before)
+                var m = n
+                if n == 6 { while m < 64, st - (m - n) - 1 >= 0, ctx[st - (m - n) - 1] == ctx[c - m - 1] { m += 1 } }
+                return (m, Array(ctx[from ..< to]))
+            }
         }
         return nil
     }
 }
+/// T-0163: DFlash2 block drafter for single-stream rounds (ENGINE_DFLASH_DIR = the public incoai/Qwen3.8-Flash-Next-DFlash2
+/// checkpoint). Greedy text rows draft with it instead of the MTP chain (copy-mode lookups keep priority); the MTP head is
+/// still re-primed every round so batch handover, the hot store and a later return to MTP see exactly MTP's state.
+/// ENGINE_DFLASH_TAU (0.35): verify the longest draft prefix whose cumulative selector confidence stays >= tau.
+nonisolated(unsafe) let serveDFlash: (drafter: DFlash2Drafter, L: Int, tau: Float)? = {
+    let e = ProcessInfo.processInfo.environment
+    guard let dir = e["ENGINE_DFLASH_DIR"], !dir.isEmpty else { return nil }
+    do {
+        let d = try DFlash2Drafter(dir: dir)
+        let L = Int(e["ENGINE_DFLASH_BLOCK"] ?? "") ?? 8, tau = Float(e["ENGINE_DFLASH_TAU"] ?? "") ?? 0.35
+        FileHandle.standardError.write("engine: DFlash2 drafter \(dir) block \(L) tau \(tau) (single-stream greedy text rounds)\n".data(using: .utf8)!)
+        return (d, L, tau)
+    } catch {
+        FileHandle.standardError.write("engine: DFlash2 drafter \(dir) failed to load (\(error)); MTP drafting only\n".data(using: .utf8)!)
+        return nil
+    }
+}()
+let serveDFlashWindow = 2040
+let dfNoReprime = ProcessInfo.processInfo.environment["ENGINE_DFLASH_NO_REPRIME"] == "1"
+let dfDebug = ProcessInfo.processInfo.environment["ENGINE_DFLASH_DEBUG"] == "1"
+/// T-0163 instrument (ENGINE_ROUND_TIMING=1): per serial speculative round, host ms for drafting (incl. the DFlash2 draft
+/// read), verify build, verify sync wait, tail (rollback/re-prime/queue build), and the gap since the previous round ended
+let roundTiming = ProcessInfo.processInfo.environment["ENGINE_ROUND_TIMING"] == "1"
+nonisolated(unsafe) var rtAcc: [Bool: [Double]] = [:]
+nonisolated(unsafe) var rtLastEnd: UInt64 = 0
+/// T-0205: the gap split into its legs, single-stream serial rounds only (one request thread at a time): the owner's
+/// witness publish after the round, the hand-off back to the request thread, the request thread's emission of the
+/// round's tokens until it submits the next round, and the owner's wake-up from that submit to the next round's start
+nonisolated(unsafe) var rtPubStart: UInt64 = 0, rtPubEnd: UInt64 = 0, rtReturned: UInt64 = 0, rtSubmit: UInt64 = 0
+/// T-0205: the emit leg split by what the request thread does: hot rung, detokenize, SSE (JSON + write), reservation
+/// growth, session bookkeeping (ns accumulated since the last round; read and cleared when the next round is recorded)
+nonisolated(unsafe) var rtEmitParts = [UInt64](repeating: 0, count: 5)
+nonisolated(unsafe) var rtEmitAcc = [Double](repeating: 0, count: 5)
+nonisolated(unsafe) var rtBoundaryGaps = 0, rtBoundaryGapNs = 0.0
+@inline(__always) func rtTime<T>(_ i: Int, _ body: () -> T) -> T {
+    guard roundTiming else { return body() }
+    let t = Anchors.now(); let r = body(); rtEmitParts[i] &+= Anchors.now() &- t; return r
+}
+func roundTimingRecord(df: Bool, t0: UInt64, d: UInt64, s1: UInt64, s2: UInt64, end: UInt64) {
+    guard d > 0, s1 > 0, s2 > 0 else { rtLastEnd = end; return }
+    // T-0205: a gap of 50 ms or more spans a request boundary (the next request's HTTP, tokenization and prefill: TTFT
+    // ~0.3 s), not the host time between two rounds of one request; W109/W110's 1 s cut let ~9 of those into the mean
+    let rawGap = rtLastEnd > 0 && t0 > rtLastEnd ? Double(t0 - rtLastEnd) : -1
+    let gap = rawGap >= 0 && rawGap < 50_000_000 ? rawGap : -1
+    if rawGap >= 50_000_000 && rawGap < 1_000_000_000 { rtBoundaryGaps += 1; rtBoundaryGapNs += rawGap }
+    // legs: valid only when every stamp of this gap lies between the previous round's end and this round's start, in order
+    let legs = gap >= 0 && rtLastEnd <= rtPubStart && rtPubStart <= rtPubEnd && rtPubEnd <= rtReturned
+        && rtReturned <= rtSubmit && rtSubmit <= t0
+    rtLastEnd = end
+    var a = rtAcc[df] ?? [Double](repeating: 0, count: 12)  // n, draft, build, wait, tail, gap sum, gap n, pub, handoff, emit, wake, legs n
+    a[0] += 1; a[1] += Double(d - t0); a[2] += Double(s1 - d); a[3] += Double(s2 - s1); a[4] += Double(end - s2)
+    if gap >= 0 { a[5] += gap; a[6] += 1 }
+    if legs {
+        a[7] += Double(rtPubEnd - rtPubStart); a[8] += Double(rtReturned - rtPubEnd)
+        a[9] += Double(rtSubmit - rtReturned); a[10] += Double(t0 - rtSubmit); a[11] += 1
+        for i in 0..<5 { rtEmitAcc[i] += Double(rtEmitParts[i]) }
+    }
+    for i in 0..<5 { rtEmitParts[i] = 0 }
+    rtAcc[df] = a
+    if Int(a[0]) % 128 == 0 {
+        let n = a[0], l = max(a[11], 1)
+        FileHandle.standardError.write(String(format: "engine round timing %@: n %d  draft %.2f  verify build %.2f  verify wait %.2f  tail %.2f  gap %.2f ms  [legs n %d: publish %.3f  handoff %.3f  emit %.3f  wake %.3f ms]\n",
+            df ? "dflash" : "mtp", Int(n), a[1] / n / 1e6, a[2] / n / 1e6, a[3] / n / 1e6, a[4] / n / 1e6, a[6] > 0 ? a[5] / a[6] / 1e6 : -1,
+            Int(a[11]), a[7] / l / 1e6, a[8] / l / 1e6, a[9] / l / 1e6, a[10] / l / 1e6).appending(
+            String(format: "  emit parts: hot_rung %.3f  detok %.3f  sse %.3f  grow %.3f  session %.3f ms  | boundary gaps (50 ms..1 s, excluded) n %d mean %.1f ms\n",
+                   rtEmitAcc[0] / l / 1e6, rtEmitAcc[1] / l / 1e6, rtEmitAcc[2] / l / 1e6, rtEmitAcc[3] / l / 1e6, rtEmitAcc[4] / l / 1e6,
+                   rtBoundaryGaps, rtBoundaryGaps > 0 ? rtBoundaryGapNs / Double(rtBoundaryGaps) / 1e6 : 0))
+            .data(using: .utf8)!)
+    }
+}
+let dfPrequeue = ProcessInfo.processInfo.environment["ENGINE_DFLASH_PREQUEUE"] != "0"
+/// T-0163: queue the next round's DFlash2 proposal behind this round's GPU work (the MTP path's H60 pre-queue, for DFlash2)
+func dfQueueNext(_ sp: inout ServeSpecState, greedy: Bool) {
+    sp.dfPre = nil
+    guard dfPrequeue, greedy, let ctx = sp.df, let D = serveDFlash, sp.nextLookup == nil, sp.ropeDelta == nil, !draftPolicy.conf else { return }
+    let p = D.drafter.propose(ctx, last: sp.n0, L: D.L, model: sp.model)
+    asyncEval(p.0, p.1)
+    sp.dfPre = p
+}
+func dfLog(_ s: String) { if dfDebug { FileHandle.standardError.write(("dflash-debug " + s + "\n").data(using: .utf8)!) } }
+nonisolated(unsafe) var serveDFlashRounds = 0, serveDFlashDrafted = 0, serveDFlashAccepted = 0
+
 let draftPolicy: DraftPolicyConfig = {
     let e = ProcessInfo.processInfo.environment
     let c = DraftPolicyConfig(conf: e["ENGINE_DRAFT_POLICY"] == "conf", tau: Float(e["ENGINE_DRAFT_TAU"] ?? "") ?? 0.7,
@@ -3857,6 +4580,9 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
                     bias: EngineThinkBias = EngineThinkBias(), generated: Int = 0, thinkOpen: Bool = false,
                     stopIds: Set<Int> = [], traceSeq: Int = -1) -> (tokens: [Int], drafted: Int, accepted: Int) {
     precondition(sampler.processor == nil, "P124: a logit-processing row reached the speculative round")
+    let rtT0 = Anchors.now()
+    var rtD: UInt64 = 0, rtS1: UInt64 = 0, rtS2: UInt64 = 0, rtIsDF = false
+    defer { if roundTiming { roundTimingRecord(df: rtIsDF, t0: rtT0, d: rtD, s1: rtS1, s2: rtS2, end: Anchors.now()) } }
     let model = sp.model, mtp = sp.mtp, embed = sp.embed
     var K = sp.K
     // diagnostic draft confidences for the token trace (T-0040): captured only while tracing, so the graph is unchanged
@@ -3866,6 +4592,7 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     var draftArrs: [MLXArray] = [sp.d1]
     let lookupRound = sp.nextLookup
     sp.nextLookup = nil
+    if lookupRound != nil { EngineWitness.hit("draft_copy_lookup_round") }
     // speculative sampling: a sampled request (top-k on, no logit processor) drafts by sampling the head under its own
     // temperature / top-k / top-p and accepts by min(1, p/q); copy-mode lookups and the confidence policy keep one-hot drafts
     // (top-k at most 1024: the residual compares every target candidate with every head candidate, and a top-k at or past the
@@ -3873,7 +4600,23 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     let sampling = specSamplingOn && !sampler.isGreedy && sampler.topK > 0 && sampler.topK <= 1024 && !tracing && !draftPolicy.conf
     let lookupThisRound = lookupRound.map { !$0.isEmpty } ?? false
     var draftDists: [SpecDraftDist?] = [sampling && !lookupThisRound ? sp.q1 : nil]
-    if let lk = lookupRound, !lk.isEmpty {
+    // T-0163: a DFlash2 row (greedy text, no lookup this round) drafts one block and verifies its confident prefix
+    let dfRound = sp.df != nil && serveDFlash != nil && sampler.isGreedy && !sampling && !tracing && !draftPolicy.conf
+        && sp.ropeDelta == nil && !lookupThisRound
+    if dfRound, let D = serveDFlash, let ctx = sp.df {
+        sp.settle()
+        let (dArr, cArr) = sp.dfPre ?? D.drafter.propose(ctx, last: sp.n0, L: D.L, model: model)
+        sp.dfPre = nil
+        let host = concatenated([dArr.asType(.float32), cArr.asType(.float32)], axis: 0).asArray(Float.self)
+        var m = 0
+        var cp: Float = 1
+        for c in host[(D.L - 1)...] { cp *= c; if cp < D.tau { break }; m += 1 }
+        m = max(1, m)
+        draftArrs = [MLXArray(host[0 ..< m].map { Int32($0) })]
+        draftDists = [nil]
+        K = m
+        serveDFlashRounds += 1; serveDFlashDrafted += m
+    } else if let lk = lookupRound, !lk.isEmpty {
         // T-0041 copy mode: verify the looked-up tokens; the head's d1 is not used this round
         sp.settle()
         draftArrs = [MLXArray(lk.map { Int32($0) })]
@@ -3923,14 +4666,26 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     sp.pre = nil
     sp.preP = nil
     sp.preQ = nil
+    rtD = Anchors.now(); rtIsDF = dfRound
     let T = (cache.first { $0 is CacheList } as! CacheList)[0].offset      // committed length before the round
     let block = concatenated([MLXArray([Int32(sp.n0)])] + draftArrs, axis: 0)[.newAxis]
     let vPos3: MLXArray? = sp.ropeDelta.map { d in
         let p = (0 ... K).map { Int32(T + d + $0) }
         return MLXArray(p + p + p).reshaped(3, 1, K + 1)
     }
-    let (vl, vh) = vPos3 == nil ? model.forwardHidden(block, cache: cache)
+    let (vl, vh): (MLXArray, MLXArray)
+    let dfCapture = sp.df != nil && serveDFlash != nil
+    if dfCapture { Qwen4ExpModelInner.captureLayers = Set(DFlash2Drafter.targetLayers) }
+    if !dfCapture, let mixed = serialRoundForwardOverride {
+        // T-0148: this round rides in a prefill chunk's forward (serveMixedSerial)
+        serialRoundForwardOverride = nil
+        (vl, vh) = mixed(block, cache, vPos3)
+    } else {
+        (vl, vh) = vPos3 == nil ? model.forwardHidden(block, cache: cache)
                                 : model.forwardHidden(block, cache: cache, embedsOverride: nil, pos3: vPos3)
+    }
+    let dfFeats: MLXArray? = dfCapture ? dflashFeatures() : nil
+    if dfCapture { Qwen4ExpModelInner.captureLayers = nil; Qwen4ExpModelInner.captured = [:] }
     // P078: the soft stop must ride the SPECULATIVE path too -- row j of the verify block continues a
     // prefix of `generated + j` tokens, so it gets the bias serial decoding would apply there. Without
     // this the server's ramp was inert whenever MTP was on, which is every agentic deployment.
@@ -3960,7 +4715,9 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     } else {
         let predsArr = (sampler.isGreedy ? vlb.argMax(axis: -1) : sampler.sample(vlb.reshaped(-1, vlb.dim(-1)))).asType(.int32)
         let both = concatenated([predsArr, concatenated(draftArrs, axis: 0)], axis: 0)
+        rtS1 = Anchors.now()
         let bothHost = both.asArray(Int32.self).map { Int($0) }
+        rtS2 = Anchors.now()
         preds = Array(bothHost.prefix(K + 1)); drafts = Array(bothHost.suffix(K))
         while a < K && preds[a] == drafts[a] { a += 1 }
     }
@@ -3978,6 +4735,17 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     if let si = (0 ..< a).first(where: { stopIds.contains(drafts[$0]) }) { a = si }
     let bonus = a < acceptedBeforeCuts ? drafts[a] : preds[a]
     let newTokens = Array(drafts.prefix(a)) + [bonus]
+    // T-0163: the committed positions T ..< T + a + 1 enter the DFlash2 context (a mismatch drops DFlash for this row)
+    if let ctx = sp.df, let D = serveDFlash, let f = dfFeats {
+        if ctx.end == T { D.drafter.appendContext(ctx, f[0 ..< (a + 1)], startPos: T) } else { dfLog("drop T=\(T) ctx.end=\(ctx.end)"); sp.df = nil }
+        dfLog("round T=\(T) df=\(dfRound) lookup=\(lookupThisRound) K=\(K) a=\(a) commit=\(newTokens.count)")
+        if dfRound {
+            serveDFlashAccepted += a
+            if serveDFlashRounds % 256 == 0 {
+                FileHandle.standardError.write("engine dflash: rounds \(serveDFlashRounds) drafted \(serveDFlashDrafted) accepted \(serveDFlashAccepted)\n".data(using: .utf8)!)
+            }
+        }
+    }
     if tracing {
         let c = concatenated(probArrs.map { $0.reshaped(-1).asType(.float32) }, axis: 0).asArray(Float.self)
         specTraceWrite(["seq": traceSeq, "gen": generated, "d": drafts, "p": preds, "a": a, "c": c.map { (Double($0) * 1e4).rounded() / 1e4 },
@@ -3987,6 +4755,21 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
     // queued FIRST and the trunk roll-back graph (36 GDN tape replays) is built while the GPU runs it -- the same
     // operations on the same inputs, only their construction order changes. ENGINE_SERIAL_REPRIME_FIRST=0 restores it.
     if !serialReprimeFirst, a < K { model.rollback(cache, blockRows: K + 1, keep: a + 1) }
+    // T-0163 DIAGNOSTIC (ENGINE_DFLASH_NO_REPRIME=1): a DFlash row skips the MTP head re-prime. The head then falls behind
+    // the trunk, so a batch handover goes NOSPEC and a stored entry is MTP-valid only to where the head stopped: an upper
+    // bound of a lazy re-prime, for single-stream measurement only.
+    if dfNoReprime, sp.df != nil, dfRound {
+        if serialReprimeFirst, a < K { model.rollback(cache, blockRows: K + 1, keep: a + 1) }
+        sp.n0 = bonus
+        if draftCopy.on, let ci = sp.copyIndex {
+            ci.append(newTokens)
+            if let (n, cont) = ci.lookup(draftCopy.startLen), n >= draftCopy.minMatch { sp.nextLookup = cont; sp.lookupLen = draftCopy.startLen }
+            else { sp.lookupLen = 0 }
+            sp.lastWasLookup = false
+        }
+        dfQueueNext(&sp, greedy: sampler.isGreedy && !tracing)
+        return (newTokens, K, a)
+    }
     let mtpKV = (sp.mtpCache as! CacheList)[0] as! KVCacheSimple
     let extra = mtpKV.offset - T
     if extra > 0 { _ = mtpKV.trim(extra) }
@@ -4016,7 +4799,7 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
         else { sp.lookupLen = 0 }
         sp.lastWasLookup = lookupRound != nil
     }
-    if sp.nextLookup == nil, !draftPolicy.conf, serialPrequeueDrafts, serialReprimeFirst, K > 1, sp.chainFitsWithoutGrowth() {
+    if sp.nextLookup == nil, sp.df == nil, !draftPolicy.conf, serialPrequeueDrafts, serialReprimeFirst, K > 1, sp.chainFitsWithoutGrowth() {
         var next: [MLXArray] = [sp.d1]
         var Sl = sp.Slast
         var queuedProbs: [MLXArray] = []
@@ -4037,6 +4820,7 @@ func serveSpecRound(_ sp: inout ServeSpecState, cache: [KVCache], sampler: inout
         sp.pre = Array(next.dropFirst())
         sp.preQ = nextQ
     }
+    if sp.df != nil { dfQueueNext(&sp, greedy: sampler.isGreedy && !tracing) }
     return (newTokens, K, a)
 }
 let serialReprimeFirst: Bool = ProcessInfo.processInfo.environment["ENGINE_SERIAL_REPRIME_FIRST"] != "0"

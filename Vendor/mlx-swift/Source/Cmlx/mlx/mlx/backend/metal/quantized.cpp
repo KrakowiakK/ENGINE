@@ -14,6 +14,7 @@
 #include "mlx/backend/metal/reduce.h"
 #include "mlx/backend/metal/unary.h"
 #include "mlx/backend/metal/utils.h"
+#include "mlx/backend/metal/jit/includes.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
@@ -1421,6 +1422,20 @@ void gather_qmm_rhs(
     if (group_size == 64 && bits == 8) {
       bm = 32;
       wm = 2;
+      // ENGINE T-0082 (Qwen3.5-397B, 512 experts x top-10, D 4096, I 1024): at a page-sized prefill chunk
+      // (2,200 rows, ~43 rows per expert) bm 16 beats 32 (571 vs 555 tok/s, engine bench) and 8 / 64 lose
+      // (517 / 502); at 4096-row chunks (80 per expert) 16 and 32 tie (565.2 / 564.9). So the narrower tile
+      // below 64 rows per expert. Opt-in (MLX_GATHER_QMM_NARROW_BELOW=<rows per expert>, set by
+      // tools/serve_q397.sh) so E9's screened default (P052) is unchanged.
+      static const int narrow_below = [] {
+        const char* e = std::getenv("MLX_GATHER_QMM_NARROW_BELOW");
+        return e ? atoi(e) : 0;
+      }();
+      int n_exp = static_cast<int>(w_.size() / w_.shape(-1) / w_.shape(-2));
+      if (narrow_below > 0 && n_exp > 0 && M < narrow_below * n_exp) {
+        bm = 16;
+        wm = 1;
+      }
     }
     if (const char* s = std::getenv("MLX_GATHER_QMM_BM")) {
       int v = atoi(s);
@@ -1468,6 +1483,11 @@ void gather_qmm_rhs(
     }
     if (wt) {
       constexpr int TG = 1024;
+      // ENGINE T-0082: tile sweep knobs for the work-table GEMM (JIT-instantiated, so any legal tuple works).
+      if (const char* e = std::getenv("MLX_GATHER_QMM_WT_BN")) { bn = atoi(e); }
+      if (const char* e = std::getenv("MLX_GATHER_QMM_WT_BK")) { bk = atoi(e); }
+      if (const char* e = std::getenv("MLX_GATHER_QMM_WT_WN")) { wn = atoi(e); }
+      if (const char* e = std::getenv("MLX_GATHER_QMM_WT_WM")) { wm = atoi(e); }
       const int NW = M / bm + n_experts + 1;
       auto& compute_encoder = metal::get_command_encoder(s);
       array work(Shape{NW * 3}, int32, nullptr, {});
@@ -1667,6 +1687,120 @@ void dispatch_qmv(
   qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
 }
 
+// ENGINE T-0112: upstream MLX's affine qmv_wide (#3764, row tiles widened to 8 by #4728) for 8-bit weights, compiled at
+// run time from this self-contained source: one threadgroup streams up to 8 input rows and reuses every decoded weight
+// sub-chunk across them, so the weights are read once for 2..8 rows (MLX's qmv reads them once per row; our policy then
+// moves to split-K qmm). ENGINE_QMV_WIDE=1 enables it for transposed, unbatched 8-bit affine matmuls with
+// 2 <= M <= ENGINE_QMV_WIDE_MAX (default 8). Not bit-identical to qmv/qmm (another K-reduction order).
+namespace {
+const char* engine_qmv_wide_source = R"MLXSRC(
+template <typename T, int group_size, int vecs_per_tg, int k_lanes>
+[[kernel]] void engine_qmv_wide8(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int bits = 8;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 32 / k_lanes;
+  constexpr int sub = 8;
+  typedef float U;
+  const short k_lane = simd_lid % k_lanes;
+  const short sg_row = simd_lid / k_lanes;
+  const int out_row = tid.y * (results_per_simdgroup * num_simdgroups) + results_per_simdgroup * simd_gid + sg_row;
+  const int vec0 = tid.x * vecs_per_tg;
+  const int row = min(out_row, out_vec_size - 1);
+  const int in_vec_size_w = in_vec_size * bits / 8;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
+  const device T* srow = scales + row * in_vec_size_g;
+  const device T* brow = biases + row * in_vec_size_g;
+  const device T* xv[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; v++) { xv[v] = x + min(vec0 + v, M - 1) * in_vec_size; }
+  U result[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; v++) { result[v] = 0; }
+  for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
+    U scale = srow[g];
+    U bias = brow[g];
+#pragma unroll
+    for (int sc = 0; sc < group_size / sub; sc++) {
+      const int k0 = g * group_size + sc * sub;
+      const device uint8_t* wc = wrow + k0 * bits / 8;
+      U w_dq[sub];
+      const float s = float(scale);
+      const float b = float(bias);
+      for (int i = 0; i < sub; i++) { w_dq[i] = static_cast<U>(s * wc[i] + b); }
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        const device T* xc = xv[v] + k0;
+        U acc = 0;
+#pragma unroll
+        for (int i = 0; i < sub; i++) { acc += static_cast<U>(xc[i]) * w_dq[i]; }
+        result[v] += acc;
+      }
+    }
+  }
+  for (int v = 0; v < vecs_per_tg; v++) {
+    if (k_lanes >= 32) { result[v] += simd_shuffle_down(result[v], 16); }
+    if (k_lanes >= 16) { result[v] += simd_shuffle_down(result[v], 8); }
+    if (k_lanes >= 8) { result[v] += simd_shuffle_down(result[v], 4); }
+    if (k_lanes >= 4) { result[v] += simd_shuffle_down(result[v], 2); }
+    if (k_lanes >= 2) { result[v] += simd_shuffle_down(result[v], 1); }
+  }
+  if (k_lane == 0 && out_row < out_vec_size) {
+    for (int v = 0; v < vecs_per_tg; v++) {
+      if (vec0 + v < M) { y[(vec0 + v) * out_vec_size + out_row] = static_cast<T>(result[v]); }
+    }
+  }
+}
+)MLXSRC";
+
+bool engine_try_qmv_wide(const array& x, const array& w, const array& scales, const std::optional<array>& biases,
+                         array& out, int group_size, int bits, int M, int N, int K, metal::Device& d, const Stream& s) {
+  static const bool on = [] { const char* e = std::getenv("ENGINE_QMV_WIDE"); return e && e[0] == '1'; }();
+  static const int maxm = [] { const char* e = std::getenv("ENGINE_QMV_WIDE_MAX"); return e ? std::atoi(e) : 8; }();
+  static const int kl = [] { const char* e = std::getenv("ENGINE_QMV_WIDE_KL"); return e ? std::atoi(e) : 8; }();
+  if (!on || bits != 8 || !biases || M < 2 || M > maxm || K % group_size != 0 || group_size % 8 != 0) return false;
+  if (x.dtype() != bfloat16 && x.dtype() != float16) return false;
+  if (out.size() != size_t(M) * size_t(N)) return false;   // unbatched only
+  int n_tiles = (M + 7) / 8;
+  int vecs = (M + n_tiles - 1) / n_tiles;
+  int rows_per_tg = (32 / kl) * 2;
+  std::string tname = get_type_string(x.dtype());
+  std::string kname = "engine_qmv_wide8_" + tname + "_gs_" + std::to_string(group_size) + "_nv_" + std::to_string(vecs) +
+      "_kl_" + std::to_string(kl);
+  auto lib = d.get_library(kname, [&]() {
+    std::string src;
+    concatenate(src, metal::utils(), engine_qmv_wide_source,
+                "\ntemplate [[host_name(\"", kname, "\")]] [[kernel]] void engine_qmv_wide8<", tname, ", ",
+                std::to_string(group_size), ", ", std::to_string(vecs), ", ", std::to_string(kl),
+                ">(const device uint32_t*, const device ", tname, "*, const device ", tname, "*, const device ", tname,
+                "*, device ", tname, "*, const constant int&, const constant int&, const constant int&, uint3, uint, uint);\n");
+    return src;
+  });
+  auto kernel = d.get_kernel(kname, lib);
+  auto& enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_input_array(w, 0);
+  enc.set_input_array(scales, 1);
+  enc.set_input_array(*biases, 2);
+  enc.set_input_array(x, 3);
+  enc.set_output_array(out, 4);
+  enc.set_bytes(K, 5);
+  enc.set_bytes(N, 6);
+  enc.set_bytes(M, 7);
+  enc.dispatch_threadgroups(MTL::Size((M + vecs - 1) / vecs, (N + rows_per_tg - 1) / rows_per_tg, 1), MTL::Size(32, 2, 1));
+  return true;
+}
+} // namespace
+
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& d = metal::device(s.device);
@@ -1689,6 +1823,10 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   int M = non_batched ? x.size() / K : x.shape(-2);
   int N = out.shape(-1);
 
+  if (transpose_ && non_batched && quantization_mode_to_string(mode_) == "affine" &&
+      engine_try_qmv_wide(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s)) {
+    return;
+  }
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   // ENGINE_QMV_LIMIT: rows from which a transposed quantized matmul with an output at least ENGINE_QMM_SMALL_MIN_N wide
   // leaves qmv (policy 5, MLX 0 = its table); ENGINE_QMV_LIMIT_NARROW: the same for narrower outputs (policy 9: qmv stays
@@ -1772,7 +1910,15 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   // matmuls and reuse reading x and w.
   //
   // TODO: Tune 16 and 4 here a bit better.
-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
+  // ENGINE T-0110: MLX_GATHER_RHS_MIN_RATIO (pairs per expert, default 4 = stock) -- below it a sorted gather falls to
+  // per-pair gather_qmv, which reads an expert's weights once PER PAIR. A batched MTP verify round has 1.25-2.5 pairs
+  // per expert (B16-B32 rows x 4 positions x top-10 over 512 experts), so its MoE cost grew faster than the rows; the
+  // expert-grouped work-table GEMM reads each distinct expert once for all of its rows.
+  static const double rhs_min_ratio = [] {
+    const char* e = std::getenv("MLX_GATHER_RHS_MIN_RATIO");
+    return e ? atof(e) : 4.0;
+  }();
+  if (M == 1 && B >= 16 && right_sorted_ == true && double(B) >= rhs_min_ratio * double(E)) {
     gather_qmm_rhs(
         x,
         w,

@@ -455,6 +455,28 @@ public enum Qwen3VLVision {
         return concatenated([-second, first], axis: -1)
     }
 
+    /// T-0191 (QC backlog): ENGINE_VISION_ROTARY = legacy (default: cos/sin of the freqs in every block, as before) |
+    /// hoist (the same fp32 cos/sin tables computed once per image -- the same elementwise ops, so bitwise the same) |
+    /// compiled (hoist + the rotation as one compiled elementwise graph, no fp32 temporaries in memory).
+    nonisolated(unsafe) public static var sdpa72: Bool = ProcessInfo.processInfo.environment["MLX_SDPA_FULL_D72"] == "1"
+    nonisolated(unsafe) public static var rotaryMode: String = ProcessInfo.processInfo.environment["ENGINE_VISION_ROTARY"] ?? "legacy"
+
+    /// the (1, N, 1, headDim) fp32 cos and sin tables of `freqs` (N, headDim/2), exactly as applyRotary builds them
+    public struct RotaryTables { public let cos: MLXArray; public let sin: MLXArray }
+    static func rotaryTables(_ freqs: MLXArray) -> RotaryTables {
+        func table(_ v: MLXArray) -> MLXArray {
+            expandedDimensions(tiled(expandedDimensions(v, axis: 1), repetitions: [1, 1, 2]), axis: 0)
+        }
+        return RotaryTables(cos: table(cos(freqs)), sin: table(sin(freqs)))
+    }
+    static func applyRotary(_ tensor: MLXArray, tables t: RotaryTables) -> MLXArray {
+        if rotaryMode == "compiled" { return rotaryCompiled(tensor, t.cos, t.sin) }
+        return ((tensor * t.cos) + (rotateHalf(tensor) * t.sin)).asType(tensor.dtype)
+    }
+    private static let rotaryCompiled: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(shapeless: false) { x, c, sn in
+        ((x * c) + (rotateHalf(x) * sn)).asType(x.dtype)
+    }
+
     static func applyRotary(_ tensor: MLXArray, freqs: MLXArray) -> MLXArray {
         var cosVals = cos(freqs)
         var sinVals = sin(freqs)
@@ -592,7 +614,8 @@ public enum Qwen3VLVision {
         func callAsFunction(
             _ x: MLXArray,
             cuSeqlens: MLXArray,
-            rotaryPosEmb: MLXArray
+            rotaryPosEmb: MLXArray,
+            rotaryTables: RotaryTables? = nil
         ) -> MLXArray {
             let sequenceLength = x.dim(0)
 
@@ -605,8 +628,13 @@ public enum Qwen3VLVision {
             var keys = parts[1][0, 0..., 0..., 0...]
             var values = parts[2][0, 0..., 0..., 0...]
 
-            queries = applyRotary(queries, freqs: rotaryPosEmb)
-            keys = applyRotary(keys, freqs: rotaryPosEmb)
+            if let t = rotaryTables {
+                queries = applyRotary(queries, tables: t)
+                keys = applyRotary(keys, tables: t)
+            } else {
+                queries = applyRotary(queries, freqs: rotaryPosEmb)
+                keys = applyRotary(keys, freqs: rotaryPosEmb)
+            }
 
             queries = queries.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
             keys = keys.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
@@ -634,7 +662,8 @@ public enum Qwen3VLVision {
             // explicitly, so it is unaffected.
             let bounds = cuSeqlens.asArray(Int.self)
             let cuts = bounds.count > 2 ? Array(bounds[1 ..< (bounds.count - 1)]) : []
-            let fusedTarget = [64, 80, 128].first { headDim <= $0 } ?? headDim
+            // T-0191: MLX_SDPA_FULL_D72=1 adds a native head_dim-72 fused kernel (no padding to 80)
+            let fusedTarget = (Qwen3VLVision.sdpa72 ? [64, 72, 80, 128] : [64, 80, 128]).first { headDim <= $0 } ?? headDim
             let padTo = fusedTarget - headDim
 
             func fusedAttend(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray) -> MLXArray {
@@ -727,11 +756,12 @@ public enum Qwen3VLVision {
         func callAsFunction(
             _ hiddenStates: MLXArray,
             cuSeqlens: MLXArray,
-            rotaryPosEmb: MLXArray
+            rotaryPosEmb: MLXArray,
+            rotaryTables: RotaryTables? = nil
         ) -> MLXArray {
             var states = hiddenStates
             states =
-                states + attention(norm1(states), cuSeqlens: cuSeqlens, rotaryPosEmb: rotaryPosEmb)
+                states + attention(norm1(states), cuSeqlens: cuSeqlens, rotaryPosEmb: rotaryPosEmb, rotaryTables: rotaryTables)
             states = states + mlp(norm2(states))
             return states
         }
@@ -1007,8 +1037,10 @@ public enum Qwen3VLVision {
 
             var deepstackOutputs: [MLXArray] = []
 
+            // T-0191: the cos/sin tables once per image instead of in each of the 27 blocks (ENGINE_VISION_ROTARY)
+            let tables: RotaryTables? = Qwen3VLVision.rotaryMode == "legacy" ? nil : Qwen3VLVision.rotaryTables(rotaryEmbeds)
             for (index, block) in blocks.enumerated() {
-                hiddenStates = block(hiddenStates, cuSeqlens: cuSeqlens, rotaryPosEmb: rotaryEmbeds)
+                hiddenStates = block(hiddenStates, cuSeqlens: cuSeqlens, rotaryPosEmb: rotaryEmbeds, rotaryTables: tables)
                 sink?(String(format: "block%02d", index), hiddenStates)
                 if let dsIndex = deepstackVisualIndexes.firstIndex(of: index) {
                     let feature = deepstackMergers[dsIndex](hiddenStates)

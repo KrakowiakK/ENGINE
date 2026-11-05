@@ -353,9 +353,18 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         self.freeze()
     }
 
+    /// ENGINE T-0110: a model may route SORTED quantized gathers to its own kernel (x, w, scales, biases, indices, groupSize,
+    /// bits) -> output or nil for the stock gather. Set once at model load, before any forward.
+    nonisolated(unsafe) public static var sortedGatherOverride:
+        ((MLXArray, MLXArray, MLXArray, MLXArray?, MLXArray, Int, Int) -> MLXArray?)? = nil
+
     override public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
+        if sortedIndices, self.bias == nil, let f = Self.sortedGatherOverride,
+           let r = f(x, self.weight, self.scales, self.biases, indices, self.groupSize, self.bits) {
+            return r
+        }
         var result = MLX.gatherQuantizedMM(
             x,
             self.weight,

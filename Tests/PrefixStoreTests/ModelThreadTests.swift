@@ -1143,3 +1143,96 @@ extension ModelThreadTests {
         XCTAssertEqual(buffer.dropped, 3, "flush must preserve the incomplete witness")
     }
 }
+
+/// T-0200: ENGINE_CONTROL_PASSES_DECODE. A control job that lands while a round's steps arrive ended the gathering and split
+/// the decode pool into two rounds; passing the queued steps keeps them one round.
+extension ModelThreadTests {
+    private func splitRound(passes: Bool) -> (batches: [Int], order: [String], passed: Int) {
+        let batches = Shared([Int]()), order = Shared([String]())
+        let mt = ModelThread(minBatch: 4, gatherWindow: 1.0, maxBatch: 8, controlPassesDecode: passes) { reqs in
+            batches.with { $0.append(reqs.count) }; order.with { $0.append("B\(reqs.count)") }
+            return reqs.map { $0.key }
+        }
+        defer { mt.shutdown() }
+        for _ in 0 ..< 4 { mt.enter() }
+        let done = expectation(description: "steps"); done.expectedFulfillmentCount = 5
+        Thread { _ = mt.step(key: 1, pending: 0, length: 4096); done.fulfill() }.start()
+        Thread.sleep(forTimeInterval: 0.05)
+        Thread { mt.exclusive { order.with { $0.append("X") } }; done.fulfill() }.start()
+        Thread.sleep(forTimeInterval: 0.05)
+        for k in 2 ... 4 { Thread { _ = mt.step(key: k, pending: 0, length: 4096); done.fulfill() }.start() }
+        wait(for: [done], timeout: 5)
+        return (batches.value, order.value, mt.controlPassedDecodeCount)
+    }
+
+    func testControlJobSplitsTheRoundWhenItIsABarrier() {
+        let r = splitRound(passes: false)
+        XCTAssertEqual(r.batches, [1, 3], "the shipped behaviour: the control job ends gathering after the first step")
+        XCTAssertEqual(r.order, ["B1", "X", "B3"])
+        XCTAssertEqual(r.passed, 0)
+    }
+
+    func testControlPassesQueuedStepsAndTheRoundStaysWhole() {
+        let r = splitRound(passes: true)
+        XCTAssertEqual(r.batches, [4], "the control job ran first and the four steps gathered as one round")
+        XCTAssertEqual(r.order, ["X", "B4"])
+        XCTAssertEqual(r.passed, 1, "witness: one control job passed queued decode steps")
+    }
+
+    /// a decode CLOSURE (a batch handover) stays a barrier for control jobs: only batched steps are passed
+    func testControlDoesNotPassADecodeClosure() {
+        let order = Shared([String]())
+        let mt = ModelThread(minBatch: 1, gatherWindow: 0, maxBatch: 8, controlPassesDecode: true) { $0.map(\.key) }
+        defer { mt.shutdown() }
+        let hold = DispatchSemaphore(value: 0), held = DispatchSemaphore(value: 0)
+        Thread { mt.exclusive { held.signal(); hold.wait() } }.start()
+        held.wait()
+        let done = expectation(description: "jobs"); done.expectedFulfillmentCount = 2
+        Thread { mt.decode { order.with { $0.append("D") } }; done.fulfill() }.start()
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while mt.phaseStats()["decode"]?.queued != 1 && ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.001) }
+        Thread { mt.exclusive { order.with { $0.append("X") } }; done.fulfill() }.start()
+        while mt.phaseStats()["control"]?.queued != 1 && ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.001) }
+        hold.signal()
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(order.value, ["D", "X"])
+        XCTAssertEqual(mt.controlPassedDecodeCount, 0)
+    }
+}
+
+/// T-0207: ENGINE_DECODE_CLOSURE_PASSES. A decode closure (a new row's serial round, a rung capture, a rearm) that lands while a
+/// round's steps arrive ended the gathering like a control job did before T-0200; passing the queued steps keeps one round.
+extension ModelThreadTests {
+    private func splitRoundByClosure(passes: Bool) -> (batches: [Int], order: [String], passed: Int) {
+        let batches = Shared([Int]()), order = Shared([String]())
+        let mt = ModelThread(minBatch: 4, gatherWindow: 1.0, maxBatch: 8, controlPassesDecode: true,
+                             decodeClosurePasses: passes) { reqs in
+            batches.with { $0.append(reqs.count) }; order.with { $0.append("B\(reqs.count)") }
+            return reqs.map { $0.key }
+        }
+        defer { mt.shutdown() }
+        for _ in 0 ..< 4 { mt.enter() }
+        let done = expectation(description: "steps"); done.expectedFulfillmentCount = 5
+        Thread { _ = mt.step(key: 1, pending: 0, length: 4096); done.fulfill() }.start()
+        Thread.sleep(forTimeInterval: 0.05)
+        Thread { mt.decode { order.with { $0.append("D") } }; done.fulfill() }.start()
+        Thread.sleep(forTimeInterval: 0.05)
+        for k in 2 ... 4 { Thread { _ = mt.step(key: k, pending: 0, length: 4096); done.fulfill() }.start() }
+        wait(for: [done], timeout: 5)
+        return (batches.value, order.value, mt.decodeClosurePassedCount)
+    }
+
+    func testDecodeClosureSplitsTheRoundWhenItIsABarrier() {
+        let r = splitRoundByClosure(passes: false)
+        XCTAssertEqual(r.batches, [1, 3], "the shipped behaviour: the decode closure ends gathering after the first step")
+        XCTAssertEqual(r.order, ["B1", "D", "B3"])
+        XCTAssertEqual(r.passed, 0)
+    }
+
+    func testDecodeClosurePassesQueuedStepsAndTheRoundStaysWhole() {
+        let r = splitRoundByClosure(passes: true)
+        XCTAssertEqual(r.batches, [4], "the closure ran first and the four steps gathered as one round")
+        XCTAssertEqual(r.order, ["D", "B4"])
+        XCTAssertEqual(r.passed, 1, "witness: one decode closure passed queued decode steps")
+    }
+}
